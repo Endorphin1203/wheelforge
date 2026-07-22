@@ -41,7 +41,9 @@ class JobPayloadContractTest {
         for (String fixture : List.of(
             "uppercase-uuid-v1.json",
             "schema-version-decimal-v1.json",
-            "lowercase-t-z-v1.json"
+            "lowercase-t-z-v1.json",
+            "max-colon-offset-v1.json",
+            "long-fraction-v1.json"
         )) {
             var payload = objectMapper.readValue(readValidFixture(fixture), JobPayload.class);
 
@@ -108,6 +110,7 @@ class JobPayloadContractTest {
             "basic-offset-v1.json",
             "leap-second-v1.json",
             "space-datetime-v1.json",
+            "year-zero-v1.json",
             "noncanonical-uuid-v1.json",
             "numeric-created-at-v1.json",
             "snake-case-keys-v1.json"

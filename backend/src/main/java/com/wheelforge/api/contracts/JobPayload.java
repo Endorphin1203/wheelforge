@@ -10,11 +10,13 @@ import tools.jackson.databind.cfg.CoercionAction;
 import tools.jackson.databind.cfg.CoercionInputShape;
 import tools.jackson.databind.type.LogicalType;
 
-import java.time.Instant;
+import java.time.DateTimeException;
+import java.time.LocalDate;
 import java.math.BigDecimal;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 @JsonIgnoreProperties(ignoreUnknown = false)
@@ -28,7 +30,7 @@ public record JobPayload(
     public static final int VERSION = 1;
     private static final Set<String> SUPPORTED_JOB_TYPES = Set.of("REQUIREMENT_PARSE", "BUILD");
     private static final Pattern RFC3339_DATE_TIME = Pattern.compile(
-        "^\\d{4}-\\d{2}-\\d{2}[Tt]\\d{2}:\\d{2}:[0-5]\\d(?:\\.\\d+)?(?:[Zz]|[+-]\\d{2}:\\d{2})$"
+        "^(?<year>\\d{4})-(?<month>\\d{2})-(?<day>\\d{2})[Tt](?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:[Zz]|[+-](?:[01]\\d|2[0-3]):[0-5]\\d)$"
     );
 
     public static ObjectMapper databaseWireMapper() {
@@ -71,10 +73,7 @@ public record JobPayload(
         if (!parsedSubjectId.toString().equalsIgnoreCase(subjectId)) {
             throw new IllegalArgumentException("subjectId must be a canonical UUID");
         }
-        if (!RFC3339_DATE_TIME.matcher(createdAt).matches()) {
-            throw new IllegalArgumentException("createdAt must be an RFC3339 date-time string with a timezone");
-        }
-        Instant.parse(createdAt);
+        validateCreatedAt(createdAt);
         if (!payload.isObject()) {
             throw new IllegalArgumentException("payload must be a JSON object");
         }
@@ -94,6 +93,26 @@ public record JobPayload(
             throw new IllegalArgumentException("Unsupported job payload schema version");
         }
         return VERSION;
+    }
+
+    private static void validateCreatedAt(String createdAt) {
+        Matcher matcher = RFC3339_DATE_TIME.matcher(createdAt);
+        if (!matcher.matches()) {
+            throw new IllegalArgumentException("createdAt must be an RFC3339 date-time string with a timezone");
+        }
+        int year = Integer.parseInt(matcher.group("year"));
+        if (year == 0) {
+            throw new IllegalArgumentException("createdAt year must be between 0001 and 9999");
+        }
+        try {
+            LocalDate.of(
+                year,
+                Integer.parseInt(matcher.group("month")),
+                Integer.parseInt(matcher.group("day"))
+            );
+        } catch (DateTimeException exception) {
+            throw new IllegalArgumentException("createdAt must contain a real calendar date", exception);
+        }
     }
 
 }
