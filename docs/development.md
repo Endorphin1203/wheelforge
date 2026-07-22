@@ -23,10 +23,13 @@ manager and start the MySQL service using that platform's service manager.
 
 ## MySQL Setup
 
-Create separate application and disposable-test databases. Use database-scoped
-users rather than `root`; the grants below are limited to the database each
-user owns. The test user needs schema privileges because Flyway creates the
-disposable schema during `make verify-mysql`.
+The MySQL operator creates the empty application and disposable-test databases
+before the application starts. Flyway does not create databases: it creates
+`flyway_schema_history` and the V1 tables and indexes inside the selected
+database. Use database-scoped users rather than `root`; the grants below are
+limited to the database each user owns. The test user needs schema privileges
+because Flyway creates the migration history and V1 schema inside the
+disposable database during `make verify-mysql`.
 
 ```sh
 mysql -u root -p <<'SQL'
@@ -36,19 +39,22 @@ CREATE DATABASE wheelforge_test CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci
 CREATE USER 'wheelforge'@'localhost' IDENTIFIED BY 'replace-with-a-local-password';
 CREATE USER 'wheelforge_test'@'localhost' IDENTIFIED BY 'replace-with-a-test-password';
 
-GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, INDEX, REFERENCES
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, REFERENCES
   ON wheelforge.* TO 'wheelforge'@'localhost';
-GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, INDEX, REFERENCES
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, REFERENCES
   ON wheelforge_test.* TO 'wheelforge_test'@'localhost';
 FLUSH PRIVILEGES;
 SQL
 ```
 
 The application user is scoped to `wheelforge`, and the disposable test user
-is scoped to `wheelforge_test`. Do not grant either user global privileges.
-Use matching passwords in the local environment file. If the databases or
-users already exist, use `ALTER USER` and `CREATE DATABASE ... IF NOT EXISTS`
-as appropriate for the local installation.
+is scoped to `wheelforge_test`. `CREATE`, `ALTER`, `INDEX`, and `REFERENCES`
+allow Flyway to create and maintain the current V1 migration objects; the
+DML privileges support the current runtime and Flyway history updates. Neither
+user has `DROP` or global privileges. Use matching passwords in the local
+environment file. If the databases or users already exist, use `ALTER USER`
+and `CREATE DATABASE ... IF NOT EXISTS` as appropriate for the local
+installation.
 
 ## Environment and Local Roots
 
