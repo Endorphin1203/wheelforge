@@ -157,7 +157,9 @@ class _DatabaseWirePayload(BaseModel):
 
 def validate_rfc3339_created_at(created_at: Any) -> str:
     if not isinstance(created_at, str) or not _RFC3339_DATE_TIME.fullmatch(created_at):
-        raise ValueError("createdAt must be an RFC3339 date-time string with a timezone")
+        raise ValueError(
+            "createdAt must be an RFC3339 date-time string with a timezone"
+        )
 
     normalized = f"{created_at[:10]}T{created_at[11:]}"
     if normalized.endswith(("Z", "z")):

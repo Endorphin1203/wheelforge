@@ -65,7 +65,13 @@ def test_serializes_database_wire_names() -> None:
 
     document = json.loads(payload.model_dump_json())
 
-    assert document.keys() == {"schemaVersion", "jobType", "subjectId", "createdAt", "payload"}
+    assert document.keys() == {
+        "schemaVersion",
+        "jobType",
+        "subjectId",
+        "createdAt",
+        "payload",
+    }
     assert document["jobType"] == "BUILD"
 
 
@@ -129,7 +135,9 @@ def test_rejects_malformed_subject_id() -> None:
 
 
 def test_rejects_created_at_without_timezone() -> None:
-    with pytest.raises(ValidationError, match="RFC3339 date-time string with a timezone"):
+    with pytest.raises(
+        ValidationError, match="RFC3339 date-time string with a timezone"
+    ):
         JobPayload.model_validate(
             {
                 "schemaVersion": 1,

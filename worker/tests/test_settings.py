@@ -51,9 +51,7 @@ def test_settings_reject_non_mysql_pymysql_database_url(
         Settings.from_env()
 
 
-def test_settings_reject_database_url_without_host(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_settings_reject_database_url_without_host(monkeypatch, tmp_path: Path) -> None:
     configure_environment(monkeypatch, tmp_path)
     monkeypatch.setenv("WF_DATABASE_URL", "mysql+pymysql:///wheelforge")
 
