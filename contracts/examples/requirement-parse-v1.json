@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "jobType": "REQUIREMENT_PARSE",
+  "subjectId": "2b0e75d6-c238-4f39-9bf9-5e246eb7c4cd",
+  "createdAt": "2026-07-22T10:00:00Z",
+  "payload": {
+    "originalObjectKey": "users/cae6ea8d-0afe-41df-aeea-fc0e5aceabfb/requirements/2b0e75d6-c238-4f39-9bf9-5e246eb7c4cd/original.txt",
+    "normalizedObjectKey": "users/cae6ea8d-0afe-41df-aeea-fc0e5aceabfb/requirements/2b0e75d6-c238-4f39-9bf9-5e246eb7c4cd/normalized.txt"
+  }
+}

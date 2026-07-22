@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WheelForge database job payload v1",
+  "type": "object",
+  "required": ["schemaVersion", "jobType", "subjectId", "createdAt", "payload"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "jobType": {"enum": ["REQUIREMENT_PARSE", "BUILD"]},
+    "subjectId": {"type": "string", "format": "uuid"},
+    "createdAt": {"type": "string", "format": "date-time"},
+    "payload": {"type": "object"}
+  },
+  "additionalProperties": false
+}
