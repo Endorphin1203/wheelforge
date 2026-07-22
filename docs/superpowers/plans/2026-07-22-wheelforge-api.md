@@ -4,9 +4,9 @@
 
 **Goal:** Deliver the authenticated Spring Boot API for uploads, target profiles, build lifecycle, logs, version comparisons, artifacts, and administration.
 
-**Architecture:** Controllers expose versioned REST resources, application services enforce ownership and state transitions, JPA repositories persist to the Flyway-owned MySQL schema, Redis publishes frozen job envelopes, and MinIO stores files behind authorization checks.
+**Architecture:** Controllers expose versioned REST resources, application services enforce ownership and state transitions, JPA repositories persist both business data and durable jobs to the Flyway-owned MySQL schema, and a rooted local-file adapter stores files behind authorization checks.
 
-**Tech Stack:** Java 21, Spring Boot 4.1.0, Spring Security, Spring Data JPA, Flyway, MySQL 8.4 LTS, Redis, MinIO Java SDK, JUnit 5, AssertJ, Testcontainers.
+**Tech Stack:** Java 21, Spring Boot 4.1.0, Spring Security, Spring Data JPA, Flyway, MySQL 8.4 LTS, Java NIO local storage, JUnit 5, AssertJ.
 
 ## Global Constraints
 
@@ -15,7 +15,9 @@
 - Build target fields are immutable after creation.
 - Deletes are soft deletes; retention jobs perform physical object cleanup.
 - API errors use one JSON shape: `code`, `message`, `fieldErrors`, `traceId`.
-- Redis publication occurs after the MySQL transaction commits.
+- Business records and corresponding `build_jobs` rows are inserted in the same MySQL transaction.
+- The API never exposes absolute host paths and never accepts a client-supplied storage key.
+- V1 has no Docker, Redis, MinIO, S3, presigned URL, or Testcontainers dependency.
 - Passwords use Argon2id; access tokens expire after 30 minutes.
 - Every build result reports `validationLevel: STATIC` and `installVerified: false`; no API copy claims that installation was verified.
 
@@ -29,7 +31,7 @@
 - `backend/src/main/java/com/wheelforge/api/build/`: task state machine and commands.
 - `backend/src/main/java/com/wheelforge/api/artifact/`: authorized artifact downloads.
 - `backend/src/main/java/com/wheelforge/api/admin/`: built-in source and system configuration.
-- `backend/src/main/java/com/wheelforge/api/common/`: errors, paging, clock, and object storage ports.
+- `backend/src/main/java/com/wheelforge/api/common/`: errors, paging, clock, durable jobs, and rooted local storage.
 - `backend/src/test/java/com/wheelforge/api/`: controller, service, repository, and integration tests.
 
 ### Task 1: Authentication and Ownership Context
@@ -102,14 +104,16 @@ git commit -m "feat(api): add token authentication"
 - Create: `backend/src/main/java/com/wheelforge/api/target/TargetProfileService.java`
 - Create: `backend/src/main/java/com/wheelforge/api/requirements/RequirementFileController.java`
 - Create: `backend/src/main/java/com/wheelforge/api/requirements/RequirementFileService.java`
-- Create: `backend/src/main/java/com/wheelforge/api/common/storage/ObjectStorage.java`
+- Create: `backend/src/main/java/com/wheelforge/api/common/storage/LocalFileStorage.java`
+- Create: `backend/src/main/java/com/wheelforge/api/common/jobs/BuildJobService.java`
 - Test: `backend/src/test/java/com/wheelforge/api/requirements/RequirementFileControllerTest.java`
 
 **Interfaces:**
 - Produces: `GET /api/target-profiles` returning enabled OS/architecture/CPython combinations.
 - Produces: `POST /api/requirement-files` accepting one file up to 512 KiB.
 - Produces: `GET /api/requirement-files/{id}` and `GET /api/requirement-files/{id}/items` with user ownership checks.
-- Produces: `ObjectStorage.put(key, InputStream, size, contentType)` and `open(key)`.
+- Produces: `LocalFileStorage.putAtomically(key, InputStream, size)` and `open(key)` with root-constrained generated keys.
+- Produces: `BuildJobService.enqueue(jobType, subjectId, payload)` inside the caller's transaction.
 
 - [ ] **Step 1: Write failing upload boundary tests**
 
@@ -137,15 +141,15 @@ Run: `./mvnw -q -pl backend -Dtest=RequirementFileControllerTest test`
 
 Expected: FAIL because the resource is absent.
 
-- [ ] **Step 3: Implement upload, hashing, ownership, and after-commit parse dispatch**
+- [ ] **Step 3: Implement upload, hashing, ownership, and transactional parse enqueue**
 
-Stream the upload once while computing SHA-256, write to object key `users/{userId}/requirements/{fileId}/original.txt`, persist `PENDING`, then publish `REQUIREMENT_PARSE` only after commit. Reject empty files, names other than `.txt`, NUL bytes, and oversized content.
+Stream the upload once while computing SHA-256, atomically write to generated object key `users/{userId}/requirements/{fileId}/original.txt`, then persist `PENDING` and a `READY` `REQUIREMENT_PARSE` row in one MySQL transaction. If persistence fails, delete the newly written unreferenced file. Resolve normalized paths and reject any key that escapes the configured data root. Reject empty files, names other than `.txt`, NUL bytes, and oversized content.
 
-- [ ] **Step 4: Run controller and MinIO adapter tests**
+- [ ] **Step 4: Run controller, local-storage, and job tests**
 
 Run: `./mvnw -q -pl backend -Dtest='RequirementFile*Test,TargetProfile*Test' test`
 
-Expected: upload, limit, target-profile filtering, and cross-user 404 tests pass.
+Expected: upload, limit, root confinement, atomic publication, transactional job creation, target-profile filtering, and cross-user 404 tests pass.
 
 - [ ] **Step 5: Commit**
 
@@ -191,7 +195,7 @@ Expected: FAIL because the state machine is missing.
 
 - [ ] **Step 3: Implement immutable target snapshots and commands**
 
-Allow creation only for a parsed, user-owned RequirementFile and enabled TargetProfile. Snapshot all target fields, persist `CREATED`, advance to `QUEUED`, and publish a `BUILD` envelope after commit. Cancellation sets `cancel_requested`; queued tasks transition immediately to `CANCELLED`. Retry creates a new UUID and `source_task_id`. Delete sets `deleted_at`.
+Allow creation only for a parsed, user-owned RequirementFile and enabled TargetProfile. Snapshot all target fields and persist the BuildTask plus one `READY` `BUILD` job payload in the same transaction, leaving the task in `QUEUED`. Cancellation sets `cancel_requested`; queued tasks and their unclaimed jobs transition immediately to `CANCELLED`. Retry creates a new task UUID, `source_task_id`, and job row in one transaction. Delete sets `deleted_at`.
 
 - [ ] **Step 4: Run lifecycle tests**
 
@@ -292,7 +296,7 @@ Expected: FAIL because download is not implemented.
 
 - [ ] **Step 3: Implement authorized streaming and admin-only configuration**
 
-Stream objects through the API or issue a five-minute presigned URL after ownership checks. Insert `download_records` before returning content and increment counts transactionally. Permit administrators to enable, disable, and reorder only the three built-in sources; reject URL changes. Retention marks expired artifacts, deletes the object, then records cleanup completion.
+After ownership checks, stream the Artifact from `LocalFileStorage` through the API with a fixed attachment filename and content length; never return an absolute path or redirect URL. Insert `download_records` before returning content and increment counts transactionally. Permit administrators to enable, disable, and reorder only the three built-in sources; reject URL changes. Retention claims expired rows, deletes the rooted local object idempotently, then records cleanup completion.
 
 Add administrator-only `POST /api/admin/users`, `PUT /api/admin/users/{id}/status`, and `GET /api/admin/users`. Require unique usernames, hash generated or submitted initial passwords with Argon2id, forbid an administrator from disabling their own account, and never return password hashes.
 

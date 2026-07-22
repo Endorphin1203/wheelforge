@@ -2,18 +2,20 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Create a bootable, tested monorepo foundation with MySQL, Redis, MinIO, database migrations, and a versioned Java/Python job contract.
+**Goal:** Create a bootable, tested monorepo foundation with MySQL, local filesystem storage, database migrations, and a versioned Java/Python database-job contract.
 
-**Architecture:** A Java 21 Spring Boot API and a Python 3.12 Worker share MySQL schema and versioned Redis JSON envelopes. Docker Compose supplies MySQL 8.4 LTS, Redis, and MinIO; Flyway is the only schema owner.
+**Architecture:** A Java 21 Spring Boot API and a Python 3.12 Worker share a MySQL schema, a versioned `build_jobs` contract, and a configured local data root. MySQL provides the durable queue; the filesystem stores uploaded Requirements and generated Artifacts; Flyway is the only schema owner.
 
-**Tech Stack:** Java 21, Spring Boot 4.1.0, Maven, Python 3.12, pytest, MySQL 8.4 LTS, Flyway, Redis, MinIO, Testcontainers.
+**Tech Stack:** Java 21, Spring Boot 4.1.0, Maven, Python 3.12, pytest, MySQL 8.4 LTS, Flyway, local filesystem storage.
 
 ## Global Constraints
 
-- MySQL 8.4 LTS, InnoDB, `utf8mb4`, UTC timestamps.
+- MySQL 8.4 LTS is the production baseline; native MySQL 8.4 or newer may be used for development and integration tests. Use InnoDB, `utf8mb4`, and UTC timestamps.
 - CPython Worker runtime is 3.12; target CPython versions are 3.9 through 3.13.
 - Business IDs are application-generated UUID strings stored as `char(36)`.
-- Redis messages contain identifiers and immutable snapshots, never file bytes or credentials.
+- Database job payloads contain identifiers and immutable snapshots, never file bytes or credentials.
+- V1 must run without Docker, Redis, or MinIO.
+- Persistent paths are system-generated object keys resolved beneath one absolute data root.
 - Flyway migrations are forward-only; Hibernate uses `ddl-auto: validate`.
 - No shell command concatenation and no arbitrary package-source URLs.
 - Every task follows red-green-refactor and ends with a focused commit.
@@ -30,10 +32,9 @@
 - `worker/pyproject.toml`: Python package, runtime dependencies, pytest, Ruff, and mypy settings.
 - `worker/src/wheelforge_worker/`: Worker package.
 - `worker/tests/`: Worker unit and contract tests.
-- `compose.yaml`: local MySQL, Redis, and MinIO services.
 - `.env.example`: non-secret local defaults.
 - `backend/src/main/resources/db/migration/V1__baseline.sql`: complete initial schema.
-- `contracts/job-envelope-v1.schema.json`: language-neutral queue contract.
+- `contracts/job-payload-v1.schema.json`: language-neutral database-job payload contract.
 - `contracts/examples/*.json`: cross-language contract fixtures.
 - `Makefile`: repeatable bootstrap, test, lint, and service commands.
 
@@ -144,18 +145,18 @@ git add pom.xml backend worker .gitignore Makefile mvnw mvnw.cmd .mvn
 git commit -m "build: scaffold WheelForge API and worker"
 ```
 
-### Task 2: Local Infrastructure and Typed Configuration
+### Task 2: Native MySQL and Local Storage Configuration
 
 **Files:**
-- Create: `compose.yaml`
+- Modify: `.gitignore`
 - Create: `.env.example`
 - Create: `backend/src/main/resources/application.yml`
 - Create: `worker/src/wheelforge_worker/settings.py`
 - Create: `worker/tests/test_settings.py`
 
 **Interfaces:**
-- Produces: MySQL at `localhost:3306`, Redis at `localhost:6379`, MinIO API at `localhost:9000`.
-- Produces: `Settings.from_env() -> Settings` with validated database, Redis, storage, and workspace values.
+- Consumes: a natively installed MySQL service at `localhost:3306` by default.
+- Produces: `Settings.from_env() -> Settings` with validated database, local data, workspace, polling, and lease values.
 
 - [ ] **Step 1: Write a failing Worker settings test**
 
@@ -167,13 +168,13 @@ from wheelforge_worker.settings import Settings
 
 def test_settings_require_absolute_workspace(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("WF_DATABASE_URL", "mysql+pymysql://wf:wf@localhost:3306/wheelforge")
-    monkeypatch.setenv("WF_REDIS_URL", "redis://localhost:6379/0")
-    monkeypatch.setenv("WF_STORAGE_ENDPOINT", "http://localhost:9000")
-    monkeypatch.setenv("WF_WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setenv("WF_DATA_ROOT", str(tmp_path / "data"))
+    monkeypatch.setenv("WF_WORKSPACE_ROOT", str(tmp_path / "work"))
 
     settings = Settings.from_env()
 
-    assert settings.workspace_root == tmp_path
+    assert settings.data_root == tmp_path / "data"
+    assert settings.workspace_root == tmp_path / "work"
     assert settings.database_url.startswith("mysql+pymysql://")
 ```
 
@@ -183,63 +184,41 @@ Run: `cd worker && .venv/bin/pytest tests/test_settings.py -q`
 
 Expected: FAIL with `ModuleNotFoundError: wheelforge_worker.settings`.
 
-- [ ] **Step 3: Implement configuration and Compose services**
+- [ ] **Step 3: Implement typed native configuration**
 
-Define an immutable `Settings` dataclass with `database_url`, `redis_url`, `storage_endpoint`, `storage_access_key`, `storage_secret_key`, `storage_bucket`, and absolute `workspace_root`. Reject a relative workspace path.
+Define an immutable `Settings` dataclass with `database_url`, absolute `data_root`, absolute `workspace_root`, `queue_poll_seconds`, `job_lease_seconds`, and `worker_id`. Reject relative roots, equal data/workspace roots, non-positive polling, and a lease shorter than 30 seconds. Do not create directories while parsing settings.
 
-Configure `compose.yaml` with:
+Set `.env.example` to:
 
-```yaml
-services:
-  mysql:
-    image: mysql:8.4.10
-    environment:
-      MYSQL_DATABASE: wheelforge
-      MYSQL_USER: wheelforge
-      MYSQL_PASSWORD: wheelforge_local
-      MYSQL_ROOT_PASSWORD: root_local
-      TZ: UTC
-    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_0900_ai_ci"]
-    ports: ["3306:3306"]
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-proot_local"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
-  redis:
-    image: redis:7.4-alpine
-    ports: ["6379:6379"]
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
-  minio:
-    image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
-    command: ["server", "/data", "--console-address", ":9001"]
-    environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin-local
-    ports: ["9000:9000", "9001:9001"]
+```dotenv
+WF_JDBC_URL=jdbc:mysql://localhost:3306/wheelforge?connectionTimeZone=UTC
+WF_DATABASE_URL=mysql+pymysql://wheelforge:wheelforge_local@localhost:3306/wheelforge
+WF_DATABASE_USER=wheelforge
+WF_DATABASE_PASSWORD=wheelforge_local
+WF_DATA_ROOT=/absolute/path/to/wheelforge-data
+WF_WORKSPACE_ROOT=/absolute/path/to/wheelforge-work
+WF_QUEUE_POLL_SECONDS=2
+WF_JOB_LEASE_SECONDS=60
+WF_WORKER_ID=wheelforge-worker-1
 ```
 
-Set Spring datasource URL to `jdbc:mysql://localhost:3306/wheelforge?connectionTimeZone=UTC`, Hibernate `ddl-auto: validate`, and Flyway enabled.
+Set Spring datasource URL, username, password, and `wheelforge.storage.data-root` from those environment variables. Keep Hibernate `ddl-auto: validate` and Flyway enabled. Ignore `.env`, `/data/`, and `/work/` in Git. No Redis, S3, MinIO, Docker, or Compose configuration may appear.
 
 - [ ] **Step 4: Run configuration checks**
 
-Run: `docker compose config -q`
-
-Expected: exit code `0`.
-
 Run: `cd worker && .venv/bin/pytest tests/test_settings.py -q`
 
-Expected: `1 passed`.
+Expected: absolute-root, relative-root, equal-root, polling, and lease tests pass.
+
+Run: `rg -n "redis|minio|docker|compose|s3" .env.example backend/src/main/resources/application.yml worker/src/wheelforge_worker/settings.py`
+
+Expected: no matches.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add compose.yaml .env.example backend/src/main/resources/application.yml worker/src/wheelforge_worker/settings.py worker/tests/test_settings.py
-git commit -m "build: add MySQL Redis and MinIO development services"
+git add .gitignore .env.example backend/src/main/resources/application.yml worker/src/wheelforge_worker/settings.py worker/tests/test_settings.py
+git commit -m "build: configure native MySQL and local storage"
 ```
 
 ### Task 3: Baseline MySQL Schema
@@ -248,37 +227,42 @@ git commit -m "build: add MySQL Redis and MinIO development services"
 - Modify: `backend/pom.xml`
 - Create: `backend/src/main/resources/db/migration/V1__baseline.sql`
 - Create: `backend/src/test/java/com/wheelforge/api/db/BaselineMigrationTest.java`
+- Create: `backend/src/test/java/com/wheelforge/api/db/BaselineMigrationSqlTest.java`
 
 **Interfaces:**
-- Produces: tables `users`, `requirement_files`, `requirement_items`, `target_profiles`, `build_tasks`, `resolved_packages`, `build_logs`, `package_sources`, `artifacts`, `download_records`, and `system_config`.
+- Produces: tables `users`, `requirement_files`, `requirement_items`, `target_profiles`, `build_tasks`, `build_jobs`, `resolved_packages`, `build_logs`, `package_sources`, `artifacts`, `download_records`, and `system_config`.
 - Produces: `version_no bigint not null default 0` on mutable aggregate tables.
 
-- [ ] **Step 1: Write a failing Testcontainers migration test**
+Add `spring-boot-starter-data-jpa`, `flyway-core`, `flyway-mysql`, and the MySQL Connector/J runtime dependency. Do not add Testcontainers or an embedded database that silently changes MySQL semantics.
+
+- [ ] **Step 1: Write a failing native-MySQL migration test**
 
 ```java
-@Testcontainers
+@EnabledIfEnvironmentVariable(named = "WF_TEST_JDBC_URL", matches = ".+")
 class BaselineMigrationTest {
-    @Container
-    static final MySQLContainer<?> MYSQL = new MySQLContainer<>("mysql:8.4.10");
-
     @Test
     void createsCoreTables() throws Exception {
         var flyway = Flyway.configure()
-            .dataSource(MYSQL.getJdbcUrl(), MYSQL.getUsername(), MYSQL.getPassword())
+            .dataSource(
+                System.getenv("WF_TEST_JDBC_URL"),
+                System.getenv("WF_TEST_DATABASE_USER"),
+                System.getenv("WF_TEST_DATABASE_PASSWORD"))
             .locations("classpath:db/migration")
             .load();
         flyway.migrate();
-        try (var connection = MYSQL.createConnection("");
-             var rows = connection.getMetaData().getTables(null, null, "build_tasks", null)) {
-            assertThat(rows.next()).isTrue();
+        try (var connection = flyway.getConfiguration().getDataSource().getConnection()) {
+            assertThat(tableExists(connection, "build_tasks")).isTrue();
+            assertThat(tableExists(connection, "build_jobs")).isTrue();
         }
     }
 }
 ```
 
+The test connects only to a disposable native MySQL database supplied through environment variables. It never starts a container. Add a separate always-on `BaselineMigrationSqlTest` that reads the migration resource and asserts the required table declarations and `engine=InnoDB default charset=utf8mb4`, so `make verify` still catches accidental migration removal when the integration database is unavailable.
+
 - [ ] **Step 2: Verify migration test fails**
 
-Run: `./mvnw -q -pl backend -Dtest=BaselineMigrationTest test`
+Run: `WF_TEST_JDBC_URL='jdbc:mysql://localhost:3306/wheelforge_test?connectionTimeZone=UTC' WF_TEST_DATABASE_USER=wheelforge WF_TEST_DATABASE_PASSWORD=wheelforge_local ./mvnw -q -pl backend -Dtest=BaselineMigrationTest,BaselineMigrationSqlTest test`
 
 Expected: FAIL because `V1__baseline.sql` does not exist.
 
@@ -352,9 +336,33 @@ create table build_tasks (
   constraint fk_build_file foreign key (requirement_file_id) references requirement_files(id),
   constraint fk_build_profile foreign key (target_profile_id) references target_profiles(id)
 ) engine=InnoDB default charset=utf8mb4;
+
+create table build_jobs (
+  id char(36) primary key,
+  job_type varchar(30) not null,
+  payload_version int not null,
+  subject_id char(36) not null,
+  payload_json json not null,
+  status varchar(20) not null,
+  priority_no int not null default 100,
+  available_at datetime(6) not null,
+  attempts int not null default 0,
+  max_attempts int not null default 3,
+  lease_owner varchar(100),
+  execution_id char(36),
+  lease_expires_at datetime(6),
+  heartbeat_at datetime(6),
+  last_error varchar(2000),
+  created_at datetime(6) not null,
+  started_at datetime(6),
+  finished_at datetime(6),
+  version_no bigint not null default 0,
+  index ix_job_ready (status, available_at, priority_no, created_at),
+  index ix_job_lease (status, lease_expires_at)
+) engine=InnoDB default charset=utf8mb4;
 ```
 
-Create these seven tables and their indexes in the same migration:
+Create these seven additional tables and their indexes in the same migration:
 
 ```sql
 create table requirement_items (
@@ -468,16 +476,15 @@ create table system_config (
 
 create index ix_requirement_file_user on requirement_files(user_id, created_at);
 create index ix_build_user_created on build_tasks(user_id, created_at);
-create index ix_build_queue on build_tasks(status, created_at);
 create index ix_build_file on build_tasks(requirement_file_id);
 create index ix_build_profile on build_tasks(target_profile_id);
 ```
 
 - [ ] **Step 4: Run migration tests**
 
-Run: `./mvnw -q -pl backend -Dtest=BaselineMigrationTest test`
+Run the always-on structural test, then run the native integration test with the `WF_TEST_*` variables shown above.
 
-Expected: PASS and Flyway reports schema version `1`.
+Expected: both pass and Flyway reports schema version `1`; no Docker process or Testcontainers dependency is involved.
 
 - [ ] **Step 5: Commit**
 
@@ -486,20 +493,20 @@ git add backend/pom.xml backend/src/main/resources/db/migration backend/src/test
 git commit -m "feat: add MySQL baseline schema"
 ```
 
-### Task 4: Versioned Queue and State Contracts
+### Task 4: Versioned Database Job and State Contracts
 
 **Files:**
-- Create: `contracts/job-envelope-v1.schema.json`
+- Create: `contracts/job-payload-v1.schema.json`
 - Create: `contracts/examples/requirement-parse-v1.json`
 - Create: `contracts/examples/build-v1.json`
-- Create: `backend/src/main/java/com/wheelforge/api/contracts/JobEnvelope.java`
+- Create: `backend/src/main/java/com/wheelforge/api/contracts/JobPayload.java`
 - Create: `backend/src/main/java/com/wheelforge/api/build/BuildStatus.java`
-- Create: `backend/src/test/java/com/wheelforge/api/contracts/JobEnvelopeContractTest.java`
+- Create: `backend/src/test/java/com/wheelforge/api/contracts/JobPayloadContractTest.java`
 - Create: `worker/src/wheelforge_worker/contracts.py`
 - Create: `worker/tests/test_contracts.py`
 
 **Interfaces:**
-- Produces: `JobEnvelope(schema_version, job_type, job_id, subject_id, created_at, payload)` in both languages.
+- Produces: `JobPayload(schema_version, job_type, subject_id, created_at, payload)` in both languages; the serialized value is stored in `build_jobs.payload_json`.
 - Produces: `BuildStatus` values exactly matching the approved state machine.
 
 - [ ] **Step 1: Add failing cross-language fixture tests**
@@ -507,43 +514,42 @@ git commit -m "feat: add MySQL baseline schema"
 ```python
 def test_build_fixture_round_trips() -> None:
     raw = Path("../contracts/examples/build-v1.json").read_text()
-    envelope = JobEnvelope.model_validate_json(raw)
-    assert envelope.schema_version == 1
-    assert envelope.job_type is JobType.BUILD
-    assert envelope.payload["executionId"]
+    payload = JobPayload.model_validate_json(raw)
+    assert payload.schema_version == 1
+    assert payload.job_type is JobType.BUILD
+    assert payload.payload["targetSnapshot"]["pythonVersion"] == "3.11"
 ```
 
 ```java
 @Test
 void readsBuildFixture() throws Exception {
     var json = Files.readString(Path.of("../contracts/examples/build-v1.json"));
-    var envelope = objectMapper.readValue(json, JobEnvelope.class);
-    assertThat(envelope.schemaVersion()).isEqualTo(1);
-    assertThat(envelope.jobType()).isEqualTo("BUILD");
+    var payload = objectMapper.readValue(json, JobPayload.class);
+    assertThat(payload.schemaVersion()).isEqualTo(1);
+    assertThat(payload.jobType()).isEqualTo("BUILD");
 }
 ```
 
 - [ ] **Step 2: Verify both tests fail**
 
-Run: `./mvnw -q -pl backend -Dtest=JobEnvelopeContractTest test`
+Run: `./mvnw -q -pl backend -Dtest=JobPayloadContractTest test`
 
-Expected: FAIL because `JobEnvelope` is missing.
+Expected: FAIL because `JobPayload` is missing.
 
 Run: `cd worker && .venv/bin/pytest tests/test_contracts.py -q`
 
 Expected: FAIL because `contracts.py` is missing.
 
-- [ ] **Step 3: Implement the frozen V1 envelope**
+- [ ] **Step 3: Implement the frozen V1 database payload**
 
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
-  "required": ["schemaVersion", "jobType", "jobId", "subjectId", "createdAt", "payload"],
+  "required": ["schemaVersion", "jobType", "subjectId", "createdAt", "payload"],
   "properties": {
     "schemaVersion": {"const": 1},
     "jobType": {"enum": ["REQUIREMENT_PARSE", "BUILD"]},
-    "jobId": {"type": "string", "format": "uuid"},
     "subjectId": {"type": "string", "format": "uuid"},
     "createdAt": {"type": "string", "format": "date-time"},
     "payload": {"type": "object"}
@@ -552,11 +558,11 @@ Expected: FAIL because `contracts.py` is missing.
 }
 ```
 
-Define states `CREATED`, `PARSING`, `QUEUED`, `RESOLVING`, `DOWNLOADING`, `VALIDATING`, `PACKAGING`, `SUCCESS`, `PARTIAL_SUCCESS`, `FAILED`, and `CANCELLED`. Reject unknown schema versions and job types in both languages.
+Define BuildTask states `CREATED`, `PARSING`, `QUEUED`, `RESOLVING`, `DOWNLOADING`, `VALIDATING`, `PACKAGING`, `SUCCESS`, `PARTIAL_SUCCESS`, `FAILED`, and `CANCELLED`; define database job states `READY`, `RUNNING`, `COMPLETED`, `FAILED`, and `CANCELLED`. Reject unknown schema versions and job types in both languages. The database row supplies job ID, lease, attempts, and execution ID; do not duplicate those mutable fields inside the immutable payload JSON.
 
 - [ ] **Step 4: Run contract tests**
 
-Run: `./mvnw -q -pl backend -Dtest=JobEnvelopeContractTest test && cd worker && .venv/bin/pytest tests/test_contracts.py -q`
+Run: `./mvnw -q -pl backend -Dtest=JobPayloadContractTest test && cd worker && .venv/bin/pytest tests/test_contracts.py -q`
 
 Expected: all contract fixture tests pass.
 
@@ -564,7 +570,7 @@ Expected: all contract fixture tests pass.
 
 ```bash
 git add contracts backend/src/main/java/com/wheelforge/api/contracts backend/src/main/java/com/wheelforge/api/build/BuildStatus.java backend/src/test/java/com/wheelforge/api/contracts worker/src/wheelforge_worker/contracts.py worker/tests/test_contracts.py
-git commit -m "feat: define versioned build job contracts"
+git commit -m "feat: define versioned database job contracts"
 ```
 
 ### Task 5: Foundation Verification
@@ -574,7 +580,7 @@ git commit -m "feat: define versioned build job contracts"
 - Create: `docs/development.md`
 
 **Interfaces:**
-- Produces: `make services`, `make verify`, and documented local startup sequence.
+- Produces: `make verify`, `make verify-mysql`, and a documented native startup sequence.
 
 - [ ] **Step 1: Add a failing repository verification target**
 
@@ -585,7 +591,6 @@ verify:
 	cd worker && .venv/bin/ruff check src tests
 	cd worker && .venv/bin/mypy src
 	cd worker && .venv/bin/pytest -q
-	docker compose config -q
 ```
 
 - [ ] **Step 2: Run the full verification target**
@@ -596,13 +601,15 @@ Expected: FAIL until formatting, typing, and all contract tests are clean.
 
 - [ ] **Step 3: Apply deterministic formatters and document setup**
 
-Run `./mvnw -q -pl backend spotless:apply` and `cd worker && .venv/bin/ruff format src tests`, then document exact prerequisites, `.env.example` usage, `docker compose up -d`, Java/Python dependency installation, `make verify`, and service ports in `docs/development.md`. Add Spotless to `backend/pom.xml` if Task 1 did not already include it.
+Run `./mvnw -q -pl backend spotless:apply` and `cd worker && .venv/bin/ruff format src tests`, then document exact prerequisites, native MySQL 8.4+ installation/startup, creation of `wheelforge` and disposable `wheelforge_test` databases, least-privilege users, `.env.example` usage, creation and permissions of the data/workspace roots, Java/Python dependency installation, `make verify`, and `make verify-mysql` in `docs/development.md`. Add Spotless to `backend/pom.xml` if Task 1 did not already include it.
+
+`make verify-mysql` must require explicit `WF_TEST_JDBC_URL`, `WF_TEST_DATABASE_USER`, and `WF_TEST_DATABASE_PASSWORD` variables and run `BaselineMigrationTest`; it must fail with a clear message if they are absent. Do not add Docker, Redis, MinIO, or Testcontainers setup.
 
 - [ ] **Step 4: Re-run verification**
 
 Run: `make verify`
 
-Expected: exit code `0` with Java tests, Python tests, lint, type checking, and Compose validation passing.
+Expected: exit code `0` with Java tests, Python tests, lint, and type checking passing. With a disposable native MySQL database configured, `make verify-mysql` also passes.
 
 - [ ] **Step 5: Commit**
 

@@ -2,7 +2,7 @@
 
 日期：2026-07-22
 
-状态：已完成方案讨论，待设计文档确认
+状态：已确认，V1 采用原生 MySQL 与本地文件存储
 范围：V1 后端、任务调度、Python Worker、依赖产物与验证
 
 ## 1. 项目概述
@@ -57,6 +57,7 @@ V1 不包含：
 | 下载源 | 清华、阿里云、PyPI 官方源白名单，自动切换 |
 | 部署形式 | V1 可在单机部署，组件可在后续横向扩展 |
 | 关系型数据库 | MySQL 8.4 LTS，使用 InnoDB 和 `utf8mb4` |
+| 队列与文件存储 | V1 使用 MySQL 持久化任务队列和受控本地文件目录，不依赖 Redis、MinIO 或 Docker |
 | 用户体系 | 普通用户资源隔离，管理员可查看全局任务和配置 |
 | 任务取消 | 支持取消排队和运行中的任务 |
 | 大模型 | 不进入 V1 核心链路，未来仅考虑辅助诊断 |
@@ -101,9 +102,8 @@ Linux + ARM64 + CPython + 3.11 + cp311/abi3/none + manylinux2014
 flowchart TD
     UI["Vue 3 + Element Plus"] --> API["Spring Boot API"]
     API --> DB["MySQL 8.4 LTS"]
-    API --> Redis["Redis 队列与任务信号"]
-    API --> Storage["MinIO 或本地兼容对象存储"]
-    Redis --> Worker["Python Worker"]
+    API --> Storage["受控本地文件目录"]
+    DB --> Worker["Python Worker 轮询任务表"]
     Worker --> Resolver["pip + packaging + 受控求解逻辑"]
     Resolver --> TUNA["清华镜像"]
     Resolver --> Ali["阿里云镜像"]
@@ -117,7 +117,7 @@ flowchart TD
 - 用户认证、权限和资源归属。
 - Requirements 文件上传和元数据管理。
 - 构建任务创建、查询、取消、重试和删除。
-- Redis 队列投递与任务状态管理。
+- 在 MySQL 事务中创建持久化任务并管理状态。
 - 构建日志、解析结果和版本变化查询。
 - 下载源和系统配置管理。
 - Artifact 授权下载、有效期和下载记录。
@@ -143,13 +143,14 @@ V1 可以在一台服务器上部署：
 
 - 一个 Spring Boot API 实例。
 - 一个 MySQL 8.4 LTS 实例。
-- 一个 Redis 实例。
-- 一个 MinIO 实例，开发环境可使用兼容的本地存储适配器。
 - 一个 Python Worker。
+- 一个仅由 API 和 Worker 访问的本地数据根目录。
 
-后续扩展时，API 保持无状态，Worker 按平台或队列横向扩容，对象存储替换为外部 MinIO 集群。
+V1 不依赖 Docker、Redis 或 MinIO。API 和 Worker 共享同一数据根目录，Requirements、临时下载和 Artifact 都写入系统生成的相对对象键。MySQL 中只保存对象键、大小和哈希，不保存大文件字节。
 
-Docker Compose 可以用于启动 MySQL、Redis、MinIO 等基础设施和开发测试环境，但 Python Worker 不创建依赖安装验证容器。V1 不要求 Docker/QEMU 参与 Wheel 校验，也不在服务端执行目标环境 `pip install` 或 `pip check`。
+任务队列存储在 MySQL 的 `build_jobs` 表中。Worker 通过短事务和 `SELECT ... FOR UPDATE SKIP LOCKED` 领取任务，写入租约持有者、执行 ID 和租约过期时间；运行期间续租，异常退出后由其他 Worker 在租约过期后重领。取消信号同样读取 MySQL，不依赖进程内消息或外部消息中间件。
+
+后续扩展为多机部署时，可在保持任务与存储端口接口不变的前提下，引入 Redis、MinIO 或共享文件系统；这些适配器不属于 V1。
 
 数据库表统一使用 InnoDB、`utf8mb4` 和 UTC 时间。业务主键采用应用生成的 UUID，状态和角色使用受控字符串并由应用枚举与数据库约束共同校验。任务领取、取消和状态推进使用事务内条件更新与乐观版本号，避免多个 Worker 重复执行同一任务；需要从表中领取待处理记录时可使用 `SELECT ... FOR UPDATE SKIP LOCKED`。
 
@@ -159,7 +160,7 @@ Docker Compose 可以用于启动 MySQL、Redis、MinIO 等基础设施和开发
 flowchart TD
     Upload["上传 requirements.txt"] --> Parse["解析与安全检查"]
     Parse --> Create["创建构建任务"]
-    Create --> Queue["进入 Redis 队列"]
+    Create --> Queue["写入 MySQL 持久化任务队列"]
     Queue --> Strict["严格版本求解"]
     Strict -->|成功| Download["下载目标 Wheel"]
     Strict -->|不可用| Compatible["兼容版本求解"]
@@ -168,7 +169,7 @@ flowchart TD
     Tag --> Closure["依赖闭包校验"]
     Closure --> Static["统一静态兼容性验证"]
     Static --> Package["生成报告、脚本和 ZIP"]
-    Package --> Artifact["上传 Artifact"]
+    Package --> Artifact["原子发布本地 Artifact"]
     Artifact --> Result["成功 / 部分成功 / 失败"]
 ```
 
@@ -192,7 +193,7 @@ flowchart TD
 
 ### 5.2 取消和重试
 
-- 排队任务取消后立即进入 `Cancelled`，消费者取到消息时忽略该任务。
+- 排队任务取消后立即进入 `Cancelled`，Worker 领取时忽略已取消记录。
 - 运行中任务在解析、求解、单包下载、验证和打包边界检查取消标志。
 - 取消后终止受控子进程，清理临时目录和未发布对象，不生成正式 ZIP。
 - 保留取消前日志、操作者和取消时间。
@@ -480,22 +481,30 @@ Windows 目标生成 `install.bat` 和 `verify.bat`，不生成 Linux 脚本。�
 ### 12.8 Artifact
 
 - BuildTask、Artifact 类型、文件名、大小和 SHA-256。
-- 对象存储路径、生成时间和过期时间。
+- 数据根目录下的系统生成对象键、生成时间和过期时间。
 - 构建状态快照、验证等级和下载次数。
 
-### 12.9 DownloadRecord
+### 12.9 BuildJob
+
+- 任务类型、载荷版本和只含业务 ID/不可变快照的 JSON 载荷。
+- `READY`、`RUNNING`、`COMPLETED`、`FAILED` 或 `CANCELLED` 状态。
+- 可执行时间、优先级、尝试次数和最大尝试次数。
+- 租约持有者、执行 ID、租约过期时间和最后心跳时间。
+- 创建、领取、完成时间和最后错误摘要。
+
+### 12.10 DownloadRecord
 
 - 用户、Artifact、下载时间、IP 和 User-Agent。
 - 下载是否完成，可用于审计和统计。
 
-### 12.10 SystemConfig
+### 12.11 SystemConfig
 
 - 最大上传大小、最大依赖行数和最大包数量。
 - 最大单包大小、总产物大小和磁盘空间阈值。
 - 任务超时、并发数、重试次数和候选版本上限。
 - Artifact 保留天数和自动清理策略。
 
-### 12.11 TargetProfile
+### 12.12 TargetProfile
 
 - 目标 OS、CPU 架构和 CPython 主次版本。
 - 系统绑定的 CPython 完整版本。
@@ -538,7 +547,7 @@ GET    /api/admin/system-config
 PUT    /api/admin/system-config
 ```
 
-V1 日志可以轮询获取，接口使用日志序号作为游标；后续增加 SSE 时沿用同一序号模型。下载接口在鉴权后签发短期地址或代理下载，不能直接暴露永久对象存储 URL。
+V1 日志可以轮询获取，接口使用日志序号作为游标；后续增加 SSE 时沿用同一序号模型。下载接口完成鉴权后由 Spring Boot 从受控本地目录流式响应，不能直接暴露宿主机绝对路径。
 
 任务删除采用业务软删除：普通列表不再展示，但任务、日志、Artifact 和下载审计记录按照保留策略继续存在。实际对象清理由后台保留期任务执行，不能由普通删除接口立即级联清除。
 
@@ -551,15 +560,16 @@ V1 日志可以轮询获取，接口使用日志序号作为游标；后续增�
 - 用户资源所有权检查和管理员权限检查。
 - 所有状态变更记录操作者和时间。
 - API 幂等键和 Worker 执行 ID，避免重复任务产生冲突 Artifact。
-- 日志中过滤认证信息、存储凭据和敏感请求头。
+- 日志中过滤认证信息、数据库凭据和敏感请求头。
 
 ### 14.2 进程与文件
 
 - 所有外部命令使用参数数组并关闭 Shell。
 - 每个任务使用不可预测的系统任务目录。
 - 不使用上传文件名构造宿主机路径。
+- 所有持久文件都通过数据根目录和系统生成对象键解析；解析后必须仍位于数据根目录内。
 - ZIP 条目由系统生成，禁止绝对路径和 `..`。
-- 发布 Artifact 前在临时对象名下完成上传和哈希核对，再执行原子发布。
+- 发布 Artifact 前在同一文件系统的临时路径完成写入和哈希核对，再原子重命名到正式对象键。
 
 ### 14.3 静态文件检查
 
@@ -623,6 +633,7 @@ V1 日志可以轮询获取，接口使用日志序号作为游标；后续增�
 21. ZIP 内的 Requirements、Wheel、哈希、Manifest 和版本对比保持一致。
 22. 非法 Requirements 在进入下载阶段前被拒绝。
 23. 成功、部分成功和失败结果均能查看版本对比数据。
+24. V1 在不安装 Docker、Redis 和 MinIO 的条件下，仅依赖 MySQL 与本地数据目录完成任务排队、构建和下载。
 
 ## 17. 主要风险与后续演进
 
@@ -644,6 +655,7 @@ V1 不使用大模型搜索和下载依赖。依赖解析必须基于可验证�
 
 ### 17.5 后续能力
 
+- Redis 队列、MinIO 对象存储和多机 Worker 适配器。
 - 可选的原生平台安装验证与客户端验证结果回传。
 - manylinux_2_28、macOS 和更多 Python 实现。
 - 私有 PyPI、Nexus 和 Artifactory。
