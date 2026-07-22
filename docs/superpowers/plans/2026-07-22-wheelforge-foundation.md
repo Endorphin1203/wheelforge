@@ -496,6 +496,7 @@ git commit -m "feat: add MySQL baseline schema"
 ### Task 4: Versioned Database Job and State Contracts
 
 **Files:**
+- Modify: `worker/pyproject.toml`
 - Create: `contracts/job-payload-v1.schema.json`
 - Create: `contracts/examples/requirement-parse-v1.json`
 - Create: `contracts/examples/build-v1.json`
@@ -508,6 +509,8 @@ git commit -m "feat: add MySQL baseline schema"
 **Interfaces:**
 - Produces: `JobPayload(schema_version, job_type, subject_id, created_at, payload)` in both languages; the serialized value is stored in `build_jobs.payload_json`.
 - Produces: `BuildStatus` values exactly matching the approved state machine.
+
+Add Pydantic `>=2,<3` as a Worker runtime dependency; do not rely on a globally installed package.
 
 - [ ] **Step 1: Add failing cross-language fixture tests**
 
@@ -569,7 +572,7 @@ Expected: all contract fixture tests pass.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add contracts backend/src/main/java/com/wheelforge/api/contracts backend/src/main/java/com/wheelforge/api/build/BuildStatus.java backend/src/test/java/com/wheelforge/api/contracts worker/src/wheelforge_worker/contracts.py worker/tests/test_contracts.py
+git add contracts backend/src/main/java/com/wheelforge/api/contracts backend/src/main/java/com/wheelforge/api/build/BuildStatus.java backend/src/test/java/com/wheelforge/api/contracts worker/pyproject.toml worker/src/wheelforge_worker/contracts.py worker/tests/test_contracts.py
 git commit -m "feat: define versioned database job contracts"
 ```
 
