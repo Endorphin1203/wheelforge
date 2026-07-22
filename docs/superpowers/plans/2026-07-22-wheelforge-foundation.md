@@ -580,6 +580,8 @@ git commit -m "feat: define versioned database job contracts"
 
 **Files:**
 - Modify: `Makefile`
+- Modify: `backend/src/test/java/com/wheelforge/api/WheelForgeApplicationTest.java`
+- Modify: `backend/pom.xml`
 - Create: `docs/development.md`
 
 **Interfaces:**
@@ -606,6 +608,8 @@ Expected: FAIL until formatting, typing, and all contract tests are clean.
 
 Run `./mvnw -q -pl backend spotless:apply` and `cd worker && .venv/bin/ruff format src tests`, then document exact prerequisites, native MySQL 8.4+ installation/startup, creation of `wheelforge` and disposable `wheelforge_test` databases, least-privilege users, `.env.example` usage, creation and permissions of the data/workspace roots, Java/Python dependency installation, `make verify`, and `make verify-mysql` in `docs/development.md`. Add Spotless to `backend/pom.xml` if Task 1 did not already include it.
 
+Keep the ordinary application smoke test database-independent by excluding JDBC and Hibernate auto-configuration in that test only. It must still load the web application context and must not change production auto-configuration. This allows `make verify` to run without a live service while `make verify-mysql` remains the explicit test of real MySQL and Flyway behavior.
+
 `make verify-mysql` must require explicit `WF_TEST_JDBC_URL`, `WF_TEST_DATABASE_USER`, and `WF_TEST_DATABASE_PASSWORD` variables and run `BaselineMigrationTest`; it must fail with a clear message if they are absent. Do not add Docker, Redis, MinIO, or Testcontainers setup.
 
 - [ ] **Step 4: Re-run verification**
@@ -617,6 +621,6 @@ Expected: exit code `0` with Java tests, Python tests, lint, and type checking p
 - [ ] **Step 5: Commit**
 
 ```bash
-git add Makefile docs/development.md
+git add Makefile backend/pom.xml backend/src/test/java/com/wheelforge/api/WheelForgeApplicationTest.java docs/development.md
 git commit -m "docs: add foundation verification workflow"
 ```
