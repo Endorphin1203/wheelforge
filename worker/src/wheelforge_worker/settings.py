@@ -45,8 +45,13 @@ class Settings:
     @classmethod
     def _database_url(cls) -> str:
         database_url = cls._required_value("WF_DATABASE_URL")
-        if urlparse(database_url).scheme != "mysql+pymysql":
+        parsed_url = urlparse(database_url)
+        if parsed_url.scheme != "mysql+pymysql":
             raise ValueError("WF_DATABASE_URL must use the mysql+pymysql scheme")
+        if not parsed_url.hostname:
+            raise ValueError("WF_DATABASE_URL must include a host")
+        if not parsed_url.path.strip("/"):
+            raise ValueError("WF_DATABASE_URL must include a database name")
         return database_url
 
     @classmethod
