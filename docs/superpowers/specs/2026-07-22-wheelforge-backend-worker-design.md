@@ -49,7 +49,7 @@ V1 不包含：
 | 实现范围 | 后端和 Python Worker 核心能力 |
 | 首要目标平台 | 国产 Linux ARM64 |
 | 其他目标平台 | Linux x86_64、Windows x64、Windows ARM64 |
-| Linux 验证 | 对目标架构执行真实离线安装和 `pip check` |
+| Linux 验证 | V1 仅执行静态验证，不创建目标架构安装环境 |
 | Windows 验证 | V1 仅执行静态验证，明确展示验证等级 |
 | 版本策略 | 默认允许兼容求解，原版本优先，可就近升级或降级 |
 | 兼容边界 | 不跨稳定版本的主版本；`0.x` 默认限制在同一 minor |
@@ -89,7 +89,7 @@ Linux + ARM64 + CPython + 3.11 + cp311/abi3/none + manylinux2014
 
 操作系统、CPU 架构和 CPython 主次版本是创建任务时的必填参数。任务创建后这些字段不可修改；用户需要更换任一目标参数时，应创建新任务。
 
-用户在 V1 选择 `3.9` 至 `3.13` 的主次版本，不直接选择补丁版本。系统维护平台能力表，为每个开放组合绑定经过验证的具体 CPython 补丁版本、容器镜像摘要、支持的 ABI 和验证能力。该补丁版本写入 Manifest 和构建报告，确保构建过程可复现。
+用户在 V1 选择 `3.9` 至 `3.13` 的主次版本，不直接选择补丁版本。系统维护平台能力表，为每个开放组合绑定用于 Marker 和 `Requires-Python` 求值的具体 CPython 补丁版本、支持的 ABI 和静态校验策略版本。该补丁版本写入 Manifest 和构建报告，确保求解过程可复现。
 
 平台能力表决定哪些组合可以创建任务。前端只能展示已启用组合，API 仍需独立校验，不能假设四种操作系统和架构组合与五个 Python 版本一定全部可用。
 
@@ -105,7 +105,6 @@ flowchart TD
     API --> Storage["MinIO 或本地兼容对象存储"]
     Redis --> Worker["Python Worker"]
     Worker --> Resolver["pip + packaging + 受控求解逻辑"]
-    Worker --> Container["Docker / QEMU 验证容器"]
     Resolver --> TUNA["清华镜像"]
     Resolver --> Ali["阿里云镜像"]
     Resolver --> PyPI["PyPI 官方源"]
@@ -133,8 +132,7 @@ Spring Boot 不自行实现 Python 依赖解析，也不拼装和执行复杂的
 - 目标平台 Wheel 下载和下载源切换。
 - Wheel 文件名、Python、ABI、平台标签和哈希校验。
 - 依赖闭包检查。
-- Linux 目标的容器化离线安装验证。
-- Windows 目标的静态验证。
+- 所有目标平台的 Wheel、Tag、元数据、依赖闭包和哈希静态验证。
 - 安装脚本、校验脚本、Manifest、报告和 ZIP 生成。
 - Artifact 上传以及任务日志、进度和结果回写。
 - 在各阶段响应取消信号并清理临时资源。
@@ -148,9 +146,10 @@ V1 可以在一台服务器上部署：
 - 一个 Redis 实例。
 - 一个 MinIO 实例，开发环境可使用兼容的本地存储适配器。
 - 一个 Python Worker。
-- Docker 及 Linux ARM64 验证所需的 QEMU/binfmt 支持。
 
 后续扩展时，API 保持无状态，Worker 按平台或队列横向扩容，对象存储替换为外部 MinIO 集群。
+
+Docker Compose 可以用于启动 MySQL、Redis、MinIO 等基础设施和开发测试环境，但 Python Worker 不创建依赖安装验证容器。V1 不要求 Docker/QEMU 参与 Wheel 校验，也不在服务端执行目标环境 `pip install` 或 `pip check`。
 
 数据库表统一使用 InnoDB、`utf8mb4` 和 UTC 时间。业务主键采用应用生成的 UUID，状态和角色使用受控字符串并由应用枚举与数据库约束共同校验。任务领取、取消和状态推进使用事务内条件更新与乐观版本号，避免多个 Worker 重复执行同一任务；需要从表中领取待处理记录时可使用 `SELECT ... FOR UPDATE SKIP LOCKED`。
 
@@ -167,11 +166,8 @@ flowchart TD
     Compatible --> Download
     Download --> Tag["Wheel Tag 与哈希校验"]
     Tag --> Closure["依赖闭包校验"]
-    Closure --> Linux{"Linux 目标?"}
-    Linux -->|是| Offline["容器内离线安装 + pip check"]
-    Linux -->|否| Static["Windows 静态验证"]
-    Offline --> Package["生成报告、脚本和 ZIP"]
-    Static --> Package
+    Closure --> Static["统一静态兼容性验证"]
+    Static --> Package["生成报告、脚本和 ZIP"]
     Package --> Artifact["上传 Artifact"]
     Artifact --> Result["成功 / 部分成功 / 失败"]
 ```
@@ -185,7 +181,7 @@ flowchart TD
 - `Queued`：已进入队列，等待 Worker。
 - `Resolving`：正在严格求解或兼容求解。
 - `Downloading`：正在下载最终版本对应的 Wheel。
-- `Validating`：正在执行标签、闭包或离线安装验证。
+- `Validating`：正在执行 Wheel 结构、标签、元数据、依赖闭包和哈希静态验证。
 - `Packaging`：正在生成报告和 ZIP。
 - `Success`：构建和规定级别的验证全部通过。
 - `PartialSuccess`：已产生部分有效结果，但存在缺失 Wheel、依赖冲突或验证失败。
@@ -341,35 +337,25 @@ Worker 使用 Wheel 文件名和 `packaging` 标签逻辑构造目标环境允�
 
 Linux ARM64 不接受 Windows、macOS 或 x86_64 Wheel。Windows ARM64 不接受 `win_amd64` Wheel。单个 Wheel 只要其任意一个 Tag 与目标允许集合相交，即可通过标签层校验。
 
-## 10. 离线验证
+## 10. 静态兼容性验证
 
-### 10.1 Linux 严格验证
+Linux x86_64、Linux ARM64、Windows x64 和 Windows ARM64 在 V1 使用同一验证等级。Worker 不创建虚拟环境或容器，不执行 `pip install`、`pip check`，也不导入第三方包。
 
-Linux x86_64 和 ARM64 使用与目标 Python 版本及 CPU 架构对应的容器：
+静态验证包括：
 
-1. 创建一次性临时容器和虚拟环境。
-2. 只读挂载 `packages/` 和解析后的 Requirements。
-3. 关闭容器网络。
-4. 执行 `pip install --no-index --find-links packages --require-hashes -r requirements-resolved.txt`。
-5. 执行 `pip check`。
-6. 收集退出码和日志。
-7. 销毁容器和临时数据。
+- Wheel 文件名、ZIP 结构和必要元数据检查。
+- 规范化包名和最终版本一致性检查。
+- Python、ABI、操作系统和 CPU 平台 Tag 校验。
+- `abi3` 与 `py3-none-any` 兼容性判断。
+- `Requires-Python` 针对目标 Python 的校验。
+- `Requires-Dist` 针对目标 Marker 环境的解析。
+- 最终依赖闭包、版本约束、缺失包和重复包检查。
+- Wheel 内 `RECORD` 条目格式、路径安全和文件哈希检查。
+- 安装脚本和校验脚本的目标环境保护检查。
 
-x86_64 构建主机验证 ARM64 时需要 QEMU/binfmt。生产环境可改为原生 ARM64 Worker，以获得更高性能和更接近真实部署环境的验证结果。
+验证过程只读取和解析 Wheel，不执行其中的代码。页面、API、Manifest 和离线报告必须显示“静态兼容性校验通过，未执行目标环境安装验证”，不能使用“已验证可安装”或“真实安装验证通过”等表述。
 
-V1 默认不导入第三方包，因为导入会执行不可信代码。未来如加入导入测试，应运行在无网络、无业务凭据、资源受限且可销毁的强化沙箱中。
-
-### 10.2 Windows 静态验证
-
-Windows x64 和 ARM64 在 V1 执行：
-
-- Wheel Tag 校验。
-- `Requires-Python` 校验。
-- 依赖闭包检查。
-- 文件哈希检查。
-- 安装和校验批处理脚本生成检查。
-
-结果必须显示“静态验证通过”，不能标识为“真实安装验证通过”。后续增加 Windows Worker 后，才可提供与 Linux 等价的目标环境安装验证。
+用户仍可在目标电脑运行生成的安装脚本和校验脚本，其中 `verify.sh` 或 `verify.bat` 可以执行本机环境检查和 `pip check`。客户端执行结果不参与服务端构建状态判定，V1 也不上传或采集该结果。
 
 ## 11. 产物结构
 
@@ -413,6 +399,7 @@ Windows 目标生成 `install.bat` 和 `verify.bat`，不生成 Linux 脚本。�
 - 版本变化方向、原因和原始约束。
 - Wheel 文件名、Tag、大小、SHA-256 和下载源。
 - 验证类型、验证状态和错误摘要。
+- 固定的 `validationLevel: STATIC` 和 `installVerified: false`。
 - 整体构建状态以及缺失包清单。
 
 ### 11.3 构建报告
@@ -513,11 +500,11 @@ Windows 目标生成 `install.bat` 和 `verify.bat`，不生成 Linux 脚本。�
 - 目标 OS、CPU 架构和 CPython 主次版本。
 - 系统绑定的 CPython 完整版本。
 - Python implementation、允许的 ABI 和平台 Tag 基线。
-- 验证容器镜像及不可变摘要。
-- 验证类型：严格验证或静态验证。
+- 静态校验策略版本。
+- 验证类型固定为静态验证。
 - 启用状态、排序和配置版本。
 
-BuildTask 在创建时保存 TargetProfile 的关键字段快照。后续管理员升级平台镜像或补丁版本时，不改变历史任务的目标定义和报告内容。
+BuildTask 在创建时保存 TargetProfile 的关键字段快照。后续管理员升级静态校验策略或 Python 补丁版本时，不改变历史任务的目标定义和报告内容。
 
 ## 13. 核心 API
 
@@ -574,15 +561,13 @@ V1 日志可以轮询获取，接口使用日志序号作为游标；后续增�
 - ZIP 条目由系统生成，禁止绝对路径和 `..`。
 - 发布 Artifact 前在临时对象名下完成上传和哈希核对，再执行原子发布。
 
-### 14.3 容器
+### 14.3 静态文件检查
 
-- 非 root 用户。
-- CPU、内存、PID、磁盘和执行时间限制。
-- 只读基础文件系统和最小写入目录。
-- 不挂载 Docker Socket、宿主凭据或业务数据目录。
-- 验证阶段无网络。
-- 无数据库、Redis、MinIO 等业务凭据。
-- 任务结束强制销毁一次性容器。
+- 不执行 Wheel 中的 Python、原生二进制、入口点或安装脚本。
+- ZIP 读取限制条目数量、单条目大小、展开后总大小和压缩比。
+- 拒绝绝对路径、`..`、符号链接和重复规范化路径。
+- 只解析允许的元数据文件和 `RECORD`，不将 Wheel 解压到共享目录。
+- 每个任务使用独立临时目录，结束后清理。
 
 ## 15. 结果判定
 
@@ -590,8 +575,9 @@ V1 日志可以轮询获取，接口使用日志序号作为游标；后续增�
 
 - 所有最终依赖 Wheel 均下载完成。
 - Wheel Tag、哈希和依赖闭包校验通过。
-- Linux 完成真实离线安装和 `pip check`；Windows 完成规定的静态验证。
+- 所有目标平台完成规定的静态兼容性验证。
 - Artifact 内容和 Manifest 一致。
+- Manifest 明确包含 `validationLevel: STATIC` 和 `installVerified: false`。
 
 ### PartialSuccess
 
@@ -625,17 +611,18 @@ V1 日志可以轮询获取，接口使用日志序号作为游标；后续增�
 9. 系统不下载、编译或打包源码包。
 10. 直接依赖和间接依赖全部进入最终清单。
 11. 下载源失败后按白名单切换，并记录实际来源和失败摘要。
-12. Linux ARM64 产物使用对应 Python 版本的目标架构容器，在无网络条件下安装并通过 `pip check`。
-13. 安装脚本在安装前检查目标机器的 Python 主次版本，不匹配时终止。
-14. Windows 构建结果明确显示静态验证等级。
-15. Wheel Tag 不匹配时不能进入成功 Artifact。
-16. 用户只能访问自己的文件、任务、日志和 Artifact。
-17. 管理员能够查看全局任务并管理内置来源和系统配置。
-18. 排队和运行中的任务均可取消，且不会发布正式 Artifact。
-19. 重试生成新任务并保留原任务记录。
-20. ZIP 内的 Requirements、Wheel、哈希、Manifest 和版本对比保持一致。
-21. 非法 Requirements 在进入下载阶段前被拒绝。
-22. 成功、部分成功和失败结果均能查看版本对比数据。
+12. Linux 和 Windows 所有目标组合均只执行静态兼容性验证。
+13. 服务端构建过程不创建验证容器、虚拟环境，不执行 `pip install`、`pip check` 或第三方包导入。
+14. 安装脚本在安装前检查目标机器的 Python 主次版本，不匹配时终止。
+15. 所有成功结果明确显示静态验证等级和“未执行目标环境安装验证”。
+16. Wheel Tag 不匹配时不能进入成功 Artifact。
+17. 用户只能访问自己的文件、任务、日志和 Artifact。
+18. 管理员能够查看全局任务并管理内置来源和系统配置。
+19. 排队和运行中的任务均可取消，且不会发布正式 Artifact。
+20. 重试生成新任务并保留原任务记录。
+21. ZIP 内的 Requirements、Wheel、哈希、Manifest 和版本对比保持一致。
+22. 非法 Requirements 在进入下载阶段前被拒绝。
+23. 成功、部分成功和失败结果均能查看版本对比数据。
 
 ## 17. 主要风险与后续演进
 
@@ -643,9 +630,9 @@ V1 日志可以轮询获取，接口使用日志序号作为游标；后续增�
 
 Windows ARM64 和部分国产 Linux 环境的 Wheel 生态弱于 Linux x86_64。WheelForge 可以提高发现、求解和交付效率，但不能凭空生成上游没有发布的 Wheel。缺失情况必须通过比较表和报告透明展示。
 
-### 17.2 架构仿真差异
+### 17.2 静态验证边界
 
-QEMU 上的 Linux ARM64 验证可覆盖安装和元数据一致性，但不能完全替代真实国产 ARM 机器的运行验证。后续应支持按平台部署原生 Worker，并可选增加企业内部目标机验证节点。
+静态验证可以证明 Wheel 标签、元数据、依赖闭包和文件完整性满足目标环境规则，但不能证明第三方包在目标机器上能够成功导入或运行。构建报告必须持续展示这一边界，用户仍需在目标环境完成应用级测试。未来如确有需求，可另行设计原生平台 Worker 或客户端验证结果回传，但不属于 V1。
 
 ### 17.3 版本变化的运行风险
 
@@ -657,7 +644,7 @@ V1 不使用大模型搜索和下载依赖。依赖解析必须基于可验证�
 
 ### 17.5 后续能力
 
-- Windows 原生 Worker 和真实安装验证。
+- 可选的原生平台安装验证与客户端验证结果回传。
 - manylinux_2_28、macOS 和更多 Python 实现。
 - 私有 PyPI、Nexus 和 Artifactory。
 - Poetry、Conda 和 lock 文件导入。
