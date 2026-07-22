@@ -1,9 +1,17 @@
+import json
+import re
 from datetime import datetime
+from decimal import Decimal
 from enum import StrEnum
 from typing import Any, Literal, Self
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
+
+
+_RFC3339_DATE_TIME = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}:(?:[0-5]\d|60)(?:\.\d+)?(?:[Zz]|[+-]\d{2}:?\d{2})$"
+)
 
 
 class JobType(StrEnum):
@@ -44,14 +52,22 @@ class JobPayload(BaseModel):
     schema_version: Literal[1] = Field(alias="schemaVersion")
     job_type: JobType = Field(alias="jobType")
     subject_id: UUID = Field(alias="subjectId")
-    created_at: datetime = Field(alias="createdAt")
+    created_at: str = Field(alias="createdAt")
     payload: dict[str, Any]
 
     @classmethod
     def model_validate_json(
         cls, json_data: str | bytes | bytearray, **kwargs: Any
     ) -> Self:
-        wire_payload = _DatabaseWirePayload.model_validate_json(json_data)
+        if any(value is not None for value in kwargs.values()):
+            raise ValueError("model_validate_json uses fixed database wire settings")
+        wire_payload = _DatabaseWirePayload.model_validate(
+            json.loads(
+                json_data,
+                parse_float=Decimal,
+                parse_constant=reject_non_standard_json_constant,
+            )
+        )
         return cls.model_validate(
             {
                 "schema_version": wire_payload.schema_version,
@@ -69,12 +85,10 @@ class JobPayload(BaseModel):
             raise ValueError("payload must be a JSON object")
         return payload
 
-    @field_validator("created_at")
+    @field_validator("created_at", mode="before")
     @classmethod
-    def require_timezone(cls, created_at: datetime) -> datetime:
-        if created_at.tzinfo is None or created_at.utcoffset() is None:
-            raise ValueError("createdAt must include a timezone")
-        return created_at
+    def require_rfc3339_created_at(cls, created_at: Any) -> str:
+        return validate_rfc3339_created_at(created_at)
 
 
 class _DatabaseWirePayload(BaseModel):
@@ -87,7 +101,7 @@ class _DatabaseWirePayload(BaseModel):
     schema_version: StrictInt = Field(alias="schemaVersion")
     job_type: JobType = Field(alias="jobType")
     subject_id: UUID = Field(alias="subjectId")
-    created_at: datetime = Field(alias="createdAt")
+    created_at: str = Field(alias="createdAt")
     payload: dict[str, Any]
 
     @field_validator("schema_version", mode="before")
@@ -97,7 +111,7 @@ class _DatabaseWirePayload(BaseModel):
             raise ValueError("schemaVersion must be a number equal to 1")
         if isinstance(schema_version, int):
             return schema_version
-        if isinstance(schema_version, float) and schema_version == 1.0:
+        if isinstance(schema_version, Decimal) and schema_version == Decimal(1):
             return 1
         raise ValueError("schemaVersion must be a number equal to 1")
 
@@ -130,17 +144,8 @@ class _DatabaseWirePayload(BaseModel):
 
     @field_validator("created_at", mode="before")
     @classmethod
-    def require_text_created_at(cls, created_at: Any) -> str:
-        if not isinstance(created_at, str):
-            raise ValueError("createdAt must be an RFC3339 date-time string")
-        return created_at
-
-    @field_validator("created_at")
-    @classmethod
-    def require_timezone(cls, created_at: datetime) -> datetime:
-        if created_at.tzinfo is None or created_at.utcoffset() is None:
-            raise ValueError("createdAt must include a timezone")
-        return created_at
+    def require_rfc3339_created_at(cls, created_at: Any) -> str:
+        return validate_rfc3339_created_at(created_at)
 
     @field_validator("payload", mode="before")
     @classmethod
@@ -148,3 +153,22 @@ class _DatabaseWirePayload(BaseModel):
         if not isinstance(payload, dict):
             raise ValueError("payload must be a JSON object")
         return payload
+
+
+def validate_rfc3339_created_at(created_at: Any) -> str:
+    if not isinstance(created_at, str) or not _RFC3339_DATE_TIME.fullmatch(created_at):
+        raise ValueError("createdAt must be an RFC3339 date-time string with a timezone")
+
+    normalized = f"{created_at[:10]}T{created_at[11:]}"
+    if normalized.endswith(("Z", "z")):
+        normalized = f"{normalized[:-1]}+00:00"
+    elif re.search(r"[+-]\d{4}$", normalized):
+        normalized = f"{normalized[:-2]}:{normalized[-2:]}"
+    if normalized[17:19] == "60":
+        normalized = f"{normalized[:17]}59{normalized[19:]}"
+    datetime.fromisoformat(normalized)
+    return created_at
+
+
+def reject_non_standard_json_constant(constant: str) -> None:
+    raise ValueError(f"non-standard JSON constant: {constant}")

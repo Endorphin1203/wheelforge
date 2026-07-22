@@ -15,6 +15,7 @@ import java.math.BigDecimal;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
+import java.util.regex.Pattern;
 
 @JsonIgnoreProperties(ignoreUnknown = false)
 public record JobPayload(
@@ -26,10 +27,12 @@ public record JobPayload(
 ) {
     public static final int VERSION = 1;
     private static final Set<String> SUPPORTED_JOB_TYPES = Set.of("REQUIREMENT_PARSE", "BUILD");
+    private static final Pattern BASIC_OFFSET = Pattern.compile("([+-]\\d{2})(\\d{2})$");
 
     public static ObjectMapper databaseWireMapper() {
         return new ObjectMapper().rebuild()
             .enable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
+            .enable(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS)
             .disable(DeserializationFeature.ACCEPT_FLOAT_AS_INT)
             .withCoercionConfig(LogicalType.Integer, config -> config
                 .setCoercion(CoercionInputShape.Boolean, CoercionAction.Fail)
@@ -66,7 +69,7 @@ public record JobPayload(
         if (!parsedSubjectId.toString().equalsIgnoreCase(subjectId)) {
             throw new IllegalArgumentException("subjectId must be a canonical UUID");
         }
-        Instant.parse(createdAt.replace(' ', 'T'));
+        Instant.parse(normalizeCreatedAt(createdAt));
         if (!payload.isObject()) {
             throw new IllegalArgumentException("payload must be a JSON object");
         }
@@ -86,5 +89,10 @@ public record JobPayload(
             throw new IllegalArgumentException("Unsupported job payload schema version");
         }
         return VERSION;
+    }
+
+    private static String normalizeCreatedAt(String createdAt) {
+        String normalized = createdAt.replace(' ', 'T');
+        return BASIC_OFFSET.matcher(normalized).replaceFirst("$1:$2");
     }
 }

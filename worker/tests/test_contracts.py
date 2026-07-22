@@ -1,4 +1,5 @@
 import json
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -68,6 +69,35 @@ def test_serializes_database_wire_names() -> None:
     assert document["jobType"] == "BUILD"
 
 
+def test_leap_second_preserves_created_at_wire_text() -> None:
+    payload = JobPayload.model_validate_json(
+        (VALID_FIXTURES / "leap-second-v1.json").read_text()
+    )
+
+    assert payload.created_at == "2016-12-31T23:59:60Z"
+    assert json.loads(payload.model_dump_json())["createdAt"] == "2016-12-31T23:59:60Z"
+
+
+def test_database_wire_parser_rejects_non_default_options() -> None:
+    with pytest.raises(ValueError, match="fixed database wire settings"):
+        JobPayload.model_validate_json(
+            (FIXTURES / "build-v1.json").read_text(), strict=True
+        )
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_database_wire_parser_rejects_non_standard_json_constants(
+    constant: str,
+) -> None:
+    with pytest.raises(ValueError, match="non-standard JSON constant"):
+        JobPayload.model_validate_json(
+            """
+            {"schemaVersion":1,"jobType":"BUILD","subjectId":"fe3b9a09-e696-4104-beb7-d8fd1fb85d24","createdAt":"2026-07-22T10:05:00Z","payload":{"value":%s}}
+            """
+            % constant
+        )
+
+
 def test_rejects_unsupported_schema_version() -> None:
     with pytest.raises(ValidationError, match="schemaVersion"):
         JobPayload.model_validate(
@@ -108,7 +138,7 @@ def test_rejects_malformed_subject_id() -> None:
 
 
 def test_rejects_created_at_without_timezone() -> None:
-    with pytest.raises(ValidationError, match="createdAt must include a timezone"):
+    with pytest.raises(ValidationError, match="RFC3339 date-time string with a timezone"):
         JobPayload.model_validate(
             {
                 "schemaVersion": 1,
@@ -135,14 +165,22 @@ def test_schema_accepts_valid_shared_fixtures() -> None:
     validator = Draft202012Validator(json.loads(SCHEMA.read_text()), format_checker=FormatChecker())
 
     for fixture in valid_shared_fixtures():
-        assert list(validator.iter_errors(json.loads(fixture.read_text()))) == []
+        assert list(validator.iter_errors(load_json_fixture(fixture))) == []
 
 
 def test_schema_rejects_invalid_shared_fixtures() -> None:
     validator = Draft202012Validator(json.loads(SCHEMA.read_text()), format_checker=FormatChecker())
 
     for fixture in sorted(INVALID_FIXTURES.glob("*.json")):
-        assert list(validator.iter_errors(json.loads(fixture.read_text())))
+        assert list(validator.iter_errors(load_json_fixture(fixture)))
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_schema_fixture_parser_rejects_non_standard_json_constants(
+    constant: str,
+) -> None:
+    with pytest.raises(ValueError, match="non-standard JSON constant"):
+        load_json_text('{"payload":{"value":%s}}' % constant)
 
 
 def test_fixture_payloads_exclude_mutable_database_row_fields() -> None:
@@ -154,6 +192,20 @@ def test_fixture_payloads_exclude_mutable_database_row_fields() -> None:
 
 def valid_shared_fixtures() -> list[Path]:
     return sorted([*FIXTURES.glob("*.json"), *VALID_FIXTURES.glob("*.json")])
+
+
+def load_json_fixture(fixture: Path) -> object:
+    return load_json_text(fixture.read_text())
+
+
+def load_json_text(value: str) -> object:
+    return json.loads(
+        value, parse_float=Decimal, parse_constant=reject_non_standard_json_constant
+    )
+
+
+def reject_non_standard_json_constant(constant: str) -> None:
+    raise ValueError(f"non-standard JSON constant: {constant}")
 
 
 def test_keeps_build_task_and_database_job_state_sets_separate() -> None:
