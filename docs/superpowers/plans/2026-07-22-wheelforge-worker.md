@@ -17,7 +17,7 @@
 - Force `--only-binary=:all:` and never accept sdist.
 - Dependency version compatibility may move up or down but never changes target Python.
 - Stable `1.x` candidates do not cross major; `0.x` candidates do not cross minor.
-- Default validation never imports third-party packages.
+- Server-side validation never creates a virtual environment or container, never installs dependencies, never runs `pip check`, and never imports third-party packages. pip `--dry-run` is permitted only for dependency resolution.
 
 ---
 
@@ -27,7 +27,7 @@
 - `worker/src/wheelforge_worker/target/`: target marker environment and accepted tags.
 - `worker/src/wheelforge_worker/resolver/`: pip report adapter and compatibility search.
 - `worker/src/wheelforge_worker/download/`: source fallback and Wheel acquisition.
-- `worker/src/wheelforge_worker/validation/`: static and Linux container validation.
+- `worker/src/wheelforge_worker/validation/`: target compatibility, dependency closure, Wheel ZIP, METADATA, RECORD, path, and hash validation.
 - `worker/src/wheelforge_worker/artifact/`: scripts, manifests, reports, hashes, and ZIP.
 - `worker/src/wheelforge_worker/jobs/`: consumer, claims, stage orchestration, cancellation.
 - `worker/tests/`: unit, contract, and pipeline tests with local fixtures.
@@ -265,46 +265,52 @@ git add worker/src/wheelforge_worker/download worker/src/wheelforge_worker/valid
 git commit -m "feat(worker): download and statically validate Wheel sets"
 ```
 
-### Task 6: Linux Offline Validator
+### Task 6: Wheel Archive Integrity Validator
 
 **Files:**
-- Create: `worker/src/wheelforge_worker/validation/linux.py`
-- Create: `worker/tests/validation/test_linux.py`
+- Create: `worker/src/wheelforge_worker/validation/archive.py`
+- Create: `worker/tests/validation/test_archive.py`
 
 **Interfaces:**
-- Produces: `LinuxValidator.validate(profile, wheelhouse, requirements, cancel) -> InstallValidationReport`.
+- Produces: `validate_wheel_archive(path: Path, expected: DownloadedWheel, limits: ArchiveLimits) -> ArchiveValidationReport`.
 
-- [ ] **Step 1: Write a failing command-policy test**
+- [ ] **Step 1: Write failing archive-safety and RECORD tests**
 
 ```python
-def test_validation_container_has_no_network_or_secrets(profile_cp311_arm64, tmp_path) -> None:
-    argv = validator.build_argv(profile_cp311_arm64, tmp_path)
-    assert "--network=none" in argv
-    assert "--read-only" in argv
-    assert "/var/run/docker.sock" not in " ".join(argv)
+def test_rejects_parent_path_without_extracting(tmp_path: Path, downloaded_wheel) -> None:
+    wheel = tmp_path / "demo-1.0-py3-none-any.whl"
+    with ZipFile(wheel, "w") as archive:
+        archive.writestr("../../escape.py", b"raise SystemExit")
+    with pytest.raises(UnsafeWheelArchive, match="parent path"):
+        validate_wheel_archive(wheel, downloaded_wheel, ArchiveLimits.defaults())
+
+
+def test_rejects_record_hash_mismatch(wheel_with_bad_record, downloaded_wheel) -> None:
+    with pytest.raises(WheelRecordMismatch):
+        validate_wheel_archive(wheel_with_bad_record, downloaded_wheel, ArchiveLimits.defaults())
 ```
 
 - [ ] **Step 2: Run and verify failure**
 
-Run: `cd worker && .venv/bin/pytest tests/validation/test_linux.py -q`
+Run: `cd worker && .venv/bin/pytest tests/validation/test_archive.py -q`
 
-Expected: FAIL because LinuxValidator is missing.
+Expected: FAIL because `validation.archive` is missing.
 
-- [ ] **Step 3: Implement restricted validation**
+- [ ] **Step 3: Implement read-only Wheel archive validation**
 
-Run the immutable TargetProfile image as non-root with no network, read-only root, PID/memory/CPU/time limits, read-only wheelhouse mount, and a temporary writable virtualenv volume. Execute `pip install --no-index --find-links /wheelhouse --require-hashes -r requirements-resolved.txt`, then `pip check`. Do not import packages.
+Open the Wheel with `zipfile.ZipFile` without extracting it. Limit archives to 20,000 entries, 2 GiB total uncompressed bytes, 512 MiB per entry, and compression ratio 200. Reject absolute paths, `..`, backslashes, NUL, duplicate normalized paths, encrypted entries, and Unix symlink mode bits. Require exactly one matching `.dist-info/METADATA`, `WHEEL`, and `RECORD`; parse METADATA as email headers; verify Name and Version against `DownloadedWheel`; parse every RECORD CSV row; require every non-RECORD file to be listed; decode `sha256=` URL-safe base64 digests and verify bytes by streaming from the ZIP. Return `validation_level="STATIC"` and `install_verified=False`. Never import modules, execute entry points, or invoke a subprocess.
 
-- [ ] **Step 4: Run validator tests**
+- [ ] **Step 4: Run archive validator tests**
 
-Run: `cd worker && .venv/bin/pytest tests/validation/test_linux.py -q`
+Run: `cd worker && .venv/bin/pytest tests/validation/test_archive.py -q`
 
-Expected: command-policy, success, missing Wheel, `pip check` failure, timeout, and cancellation tests pass.
+Expected: valid Wheel, missing metadata, path traversal, duplicate path, symlink, ZIP bomb limits, missing RECORD row, bad digest, Name mismatch, and Version mismatch tests pass.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add worker/src/wheelforge_worker/validation/linux.py worker/tests/validation/test_linux.py
-git commit -m "feat(worker): validate Linux Wheel sets offline"
+git add worker/src/wheelforge_worker/validation/archive.py worker/tests/validation/test_archive.py
+git commit -m "feat(worker): statically validate Wheel archives"
 ```
 
 ### Task 7: Artifact Builder
@@ -326,6 +332,8 @@ def test_build_contains_manifest_report_scripts_and_hashes(success_context, tmp_
     with ZipFile(artifact.path) as archive:
         names = set(archive.namelist())
     assert {"README.md", "manifest.json", "build-report.html", "version-comparison.csv", "checksums.sha256", "install.sh", "verify.sh"} <= names
+    assert artifact.manifest["validationLevel"] == "STATIC"
+    assert artifact.manifest["installVerified"] is False
     assert artifact.sha256 == sha256(artifact.path.read_bytes()).hexdigest()
 ```
 
@@ -337,7 +345,7 @@ Expected: FAIL because ArtifactBuilder is absent.
 
 - [ ] **Step 3: Implement deterministic target-specific artifacts**
 
-Generate exact hash-pinned Requirements, comparison CSV, escaped offline HTML report, Manifest, checksums, README, and only the target OS scripts. Scripts check OS/architecture/Python major-minor before using `--no-index --find-links --require-hashes`. Sort entries, use generated safe paths, fixed ZIP timestamps, and atomic rename after verification.
+Generate exact hash-pinned Requirements, comparison CSV, escaped offline HTML report, Manifest, checksums, README, and only the target OS scripts. Manifest and report always state `validationLevel: STATIC`, `installVerified: false`, and `Static compatibility checks passed; target installation was not verified.` Scripts check OS/architecture/Python major-minor before using `--no-index --find-links --require-hashes`. Sort entries, use generated safe paths, fixed ZIP timestamps, and atomic rename after verification.
 
 - [ ] **Step 4: Run artifact tests**
 
@@ -388,7 +396,7 @@ Expected: FAIL because job orchestration is absent.
 
 - [ ] **Step 3: Implement stage orchestration and terminal mapping**
 
-Consume version-1 envelopes and dispatch by `job_type`. For `REQUIREMENT_PARSE`, atomically change the owned RequirementFile from `PENDING` to `PARSING`, read the original object, call `parse_requirements`, write the UTF-8 normalized object and RequirementItem rows, then set `PARSED` or `FAILED`. For `BUILD`, conditionally claim `QUEUED` tasks with `execution_id` and `version_no`, append monotonic logs, and invoke resolution/download/validation/package stages. Poll Redis and MySQL cancellation flags at every boundary. Publish Artifact metadata only after object upload and hash confirmation. Map complete validation to `SUCCESS`, useful incomplete output to `PARTIAL_SUCCESS`, unrecoverable errors to `FAILED`, and requested cancellation to `CANCELLED`.
+Consume version-1 envelopes and dispatch by `job_type`. For `REQUIREMENT_PARSE`, atomically change the owned RequirementFile from `PENDING` to `PARSING`, read the original object, call `parse_requirements`, write the UTF-8 normalized object and RequirementItem rows, then set `PARSED` or `FAILED`. For `BUILD`, conditionally claim `QUEUED` tasks with `execution_id` and `version_no`, append monotonic logs, and invoke resolution/download/static-validation/package stages. Poll Redis and MySQL cancellation flags at every boundary. Publish Artifact metadata only after object upload and hash confirmation. Map complete static validation to `SUCCESS`, useful incomplete output to `PARTIAL_SUCCESS`, unrecoverable errors to `FAILED`, and requested cancellation to `CANCELLED`. No build stage creates a target container or virtual environment or executes dependency code.
 
 - [ ] **Step 4: Run all Worker verification**
 

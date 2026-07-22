@@ -4,17 +4,18 @@
 
 **Goal:** Prove the API and Worker operate as one secure offline-build system and package a reproducible single-machine deployment.
 
-**Architecture:** Black-box tests start MySQL, Redis, MinIO, API, Worker, a local PEP 503 fixture index, and controlled validator images. Tests drive only HTTP APIs and inspect downloadable artifacts, while failure injection verifies fallback, cancellation, ownership, and cleanup.
+**Architecture:** Black-box tests start MySQL, Redis, MinIO, API, Worker, and a local PEP 503 fixture index. Tests drive only HTTP APIs and inspect downloadable artifacts, while failure injection verifies static compatibility, archive safety, fallback, cancellation, ownership, and cleanup.
 
-**Tech Stack:** Docker Compose, MySQL 8.4 LTS, Redis, MinIO, Spring Boot, Python Worker, pytest, REST Assured, local Wheel fixtures, QEMU/binfmt for ARM64 validation.
+**Tech Stack:** Docker Compose for infrastructure, MySQL 8.4 LTS, Redis, MinIO, Spring Boot, Python Worker, pytest, REST Assured, local Wheel fixtures.
 
 ## Global Constraints
 
 - Execute the foundation, API, and Worker plans in that order first.
 - End-to-end tests use a local fixture index and never depend on public internet availability.
-- Linux success requires offline install plus `pip check`; Windows success is labeled static validation.
+- Linux and Windows success require the same static compatibility checks; every result states that target installation was not verified.
+- Worker tests prove no build stage creates a target container or virtual environment, installs dependencies, runs `pip check`, or imports third-party packages.
 - A partial artifact is never presented as a guaranteed-installable success artifact.
-- All runtime images and target profiles use explicit immutable image references in release configuration.
+- All infrastructure images use explicit immutable references in release configuration; TargetProfiles use a versioned static-validation policy.
 
 ---
 
@@ -24,9 +25,8 @@
 - `test-fixtures/projects/`: Requirements inputs for success, downgrade, conflict, missing, and malicious cases.
 - `integration-tests/`: API-driven end-to-end tests.
 - `deploy/compose.yaml`: single-machine production topology.
-- `deploy/validator-images/`: Linux x86_64 and ARM64 CPython validator definitions.
 - `scripts/bootstrap-target-profiles.sh`: idempotent profile/source bootstrap through admin API.
-- `docs/operations.md`: startup, QEMU, limits, backup, retention, and troubleshooting.
+- `docs/operations.md`: startup, static-validation limits, backup, retention, and troubleshooting.
 - `docs/v1-acceptance.md`: requirement-to-test traceability.
 
 ### Task 1: Deterministic Local Package Index
@@ -96,6 +96,8 @@ def test_linux_arm64_cp311_build(api, fixtures, artifact_reader) -> None:
     assert result["status"] == "SUCCESS"
     artifact = artifact_reader.open(api.download_artifact(result["artifactId"]))
     assert artifact.manifest["target"]["pythonVersion"] == "3.11"
+    assert artifact.manifest["validationLevel"] == "STATIC"
+    assert artifact.manifest["installVerified"] is False
     assert artifact.verify_checksums()
 ```
 
@@ -107,7 +109,7 @@ Expected: FAIL because the complete test stack is not connected.
 
 - [ ] **Step 3: Wire test Compose and seed profiles**
 
-Add API and Worker services, health-based dependencies, isolated credentials, test source codes, and a CPython 3.11 Linux ARM64 profile. Ensure the validation container has no network and receives only the wheelhouse and hash-pinned Requirements.
+Add API and Worker services, health-based dependencies, isolated credentials, test source codes, and a CPython 3.11 Linux ARM64 profile. Assert that the Worker service has no Docker socket mount and that no validator service exists in the test Compose model.
 
 - [ ] **Step 4: Run the happy path twice**
 
@@ -173,7 +175,7 @@ git commit -m "test: cover compatibility and terminal build outcomes"
 - Create: `integration-tests/test_resource_limits.py`
 
 **Interfaces:**
-- Verifies: cross-user isolation, admin boundaries, upload grammar, path safety, source whitelist, size/count/time limits, and no-network validation.
+- Verifies: cross-user isolation, admin boundaries, upload grammar, source whitelist, size/count/time limits, Wheel archive path safety, and absence of dependency code execution.
 
 - [ ] **Step 1: Write failing security matrix tests**
 
@@ -194,7 +196,7 @@ Expected: FAIL for every boundary not yet enforced end to end.
 
 - [ ] **Step 3: Wire every named boundary to its owning component**
 
-Set multipart 512 KiB limits in `application.yml`; enforce 2,000 lines in `parser/requirements.py`; read package/file/total byte and timeout limits from `system_config` in the Worker pipeline; add `user_id` predicates to artifact, task, file, and log repositories; reject `base_url` mutations in `AdminController`; generate object keys in `RequirementFileService` and `ArtifactService`; generate ZIP entry names in `ArtifactBuilder`; force validator `--network=none`; and add a log-scrubbing test for database, Redis, and MinIO credentials.
+Set multipart 512 KiB limits in `application.yml`; enforce 2,000 lines in `parser/requirements.py`; read package/file/total byte, archive-entry, expansion-ratio, and timeout limits from `system_config` in the Worker pipeline; add `user_id` predicates to artifact, task, file, and log repositories; reject `base_url` mutations in `AdminController`; generate object keys in `RequirementFileService` and `ArtifactService`; generate ZIP entry names in `ArtifactBuilder`; reject unsafe Wheel ZIP paths and RECORD hashes; assert no validation subprocess is invoked; and add a log-scrubbing test for database, Redis, and MinIO credentials.
 
 - [ ] **Step 4: Run security and full regression suites**
 
@@ -214,7 +216,6 @@ git commit -m "test: enforce end-to-end security boundaries"
 **Files:**
 - Create: `deploy/compose.yaml`
 - Create: `deploy/.env.example`
-- Create: `deploy/validator-images/linux/Dockerfile`
 - Create: `scripts/bootstrap-target-profiles.sh`
 - Create: `docs/operations.md`
 - Create: `docs/v1-acceptance.md`
@@ -240,7 +241,7 @@ Expected: FAIL because the production Compose stack is absent.
 
 - [ ] **Step 3: Add pinned deployment topology and operations guide**
 
-Run API and Worker as non-root, mount only dedicated data/work directories, configure health checks and restart policies, isolate the validator network, and document QEMU/binfmt installation, backup/restore, credential rotation, capacity limits, Artifact retention, cancellation cleanup, log inspection, and Windows static-verification wording. Map every design acceptance item to an automated test name or an explicit operator check in `docs/v1-acceptance.md`.
+Run API and Worker as non-root, mount only dedicated data/work directories, configure health checks and restart policies, and document backup/restore, credential rotation, static archive limits, Artifact retention, cancellation cleanup, log inspection, and the required static-validation wording for every platform. Do not mount the Docker socket into the Worker. Map every design acceptance item to an automated test name or an explicit operator check in `docs/v1-acceptance.md`.
 
 - [ ] **Step 4: Run final acceptance**
 

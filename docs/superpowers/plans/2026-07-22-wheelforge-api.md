@@ -17,6 +17,7 @@
 - API errors use one JSON shape: `code`, `message`, `fieldErrors`, `traceId`.
 - Redis publication occurs after the MySQL transaction commits.
 - Passwords use Argon2id; access tokens expire after 30 minutes.
+- Every build result reports `validationLevel: STATIC` and `installVerified: false`; no API copy claims that installation was verified.
 
 ---
 
@@ -214,7 +215,7 @@ git commit -m "feat(api): add build task lifecycle"
 
 **Interfaces:**
 - Produces: `GET /api/build-tasks/{id}/logs?afterSequence=N`.
-- Produces: resolved-package and version-comparison endpoints.
+- Produces: resolved-package and version-comparison endpoints plus the fixed static-validation result fields.
 
 - [ ] **Step 1: Write a failing comparison test**
 
@@ -223,6 +224,7 @@ git commit -m "feat(api): add build task lifecycle"
 void showsUpgradeDowngradeAndMissingRows() throws Exception {
     mvc.perform(get("/api/build-tasks/{id}/version-comparison", taskId).with(user("alice")))
         .andExpect(status().isOk())
+        .andExpect(header().string("X-WheelForge-Validation", "STATIC"))
         .andExpect(jsonPath("$[0].changeDirection").value("UNCHANGED"))
         .andExpect(jsonPath("$[1].changeDirection").value("DOWNGRADE"))
         .andExpect(jsonPath("$[2].wheelStatus").value("MISSING"));
@@ -237,7 +239,7 @@ Expected: FAIL with 404.
 
 - [ ] **Step 3: Implement cursor logs and structured comparison queries**
 
-Build rows from `requirement_items` plus `resolved_packages`, never by parsing log text. Return fields `packageName`, `dependencyType`, `originalConstraint`, `strictVersion`, `finalVersion`, `changeDirection`, `changeReason`, `wheelStatus`, and `packageSource`.
+Build rows from `requirement_items` plus `resolved_packages`, never by parsing log text. Return fields `packageName`, `dependencyType`, `originalConstraint`, `strictVersion`, `finalVersion`, `changeDirection`, `changeReason`, `wheelStatus`, and `packageSource`. Build detail and Artifact responses include `validationLevel: STATIC`, `installVerified: false`, and the user-facing message `Static compatibility checks passed; target installation was not verified.`
 
 - [ ] **Step 4: Run result tests**
 

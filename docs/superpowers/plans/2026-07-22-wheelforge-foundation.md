@@ -323,7 +323,7 @@ create table target_profiles (
   platform_tag varchar(100) not null,
   abi_tags json not null,
   validation_type varchar(20) not null,
-  validator_image varchar(512),
+  validation_policy_version varchar(50) not null,
   enabled boolean not null,
   version_no bigint not null default 0
 ) engine=InnoDB default charset=utf8mb4;
