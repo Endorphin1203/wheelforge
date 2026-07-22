@@ -10,3 +10,6 @@ worker/.ruff_cache/
 *.egg-info/
 __pycache__/
 *.py[cod]
+.env
+/data/
+/work/

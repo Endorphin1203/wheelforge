@@ -1,0 +1,14 @@
+spring:
+  datasource:
+    url: ${WF_JDBC_URL:jdbc:mysql://localhost:3306/wheelforge?connectionTimeZone=UTC}
+    username: ${WF_DATABASE_USER:wheelforge}
+    password: ${WF_DATABASE_PASSWORD:wheelforge_local}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+  flyway:
+    enabled: true
+
+wheelforge:
+  storage:
+    data-root: ${WF_DATA_ROOT}
