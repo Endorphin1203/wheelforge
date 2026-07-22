@@ -1,5 +1,6 @@
 package com.wheelforge.api.contracts;
 
+import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import tools.jackson.databind.DeserializationFeature;
@@ -10,6 +11,7 @@ import tools.jackson.databind.cfg.CoercionInputShape;
 import tools.jackson.databind.type.LogicalType;
 
 import java.time.Instant;
+import java.math.BigDecimal;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
@@ -39,6 +41,17 @@ public record JobPayload(
             .build();
     }
 
+    @JsonCreator
+    public static JobPayload fromDatabaseWire(
+        @JsonProperty("schemaVersion") JsonNode schemaVersion,
+        @JsonProperty("jobType") String jobType,
+        @JsonProperty("subjectId") String subjectId,
+        @JsonProperty("createdAt") String createdAt,
+        @JsonProperty("payload") JsonNode payload
+    ) {
+        return new JobPayload(parseSchemaVersion(schemaVersion), jobType, subjectId, createdAt, payload);
+    }
+
     public JobPayload {
         if (schemaVersion != VERSION) {
             throw new IllegalArgumentException("Unsupported job payload schema version: " + schemaVersion);
@@ -50,10 +63,10 @@ public record JobPayload(
         Objects.requireNonNull(createdAt, "createdAt must not be null");
         Objects.requireNonNull(payload, "payload must not be null");
         UUID parsedSubjectId = UUID.fromString(subjectId);
-        if (!parsedSubjectId.toString().equals(subjectId)) {
+        if (!parsedSubjectId.toString().equalsIgnoreCase(subjectId)) {
             throw new IllegalArgumentException("subjectId must be a canonical UUID");
         }
-        Instant.parse(createdAt);
+        Instant.parse(createdAt.replace(' ', 'T'));
         if (!payload.isObject()) {
             throw new IllegalArgumentException("payload must be a JSON object");
         }
@@ -65,5 +78,13 @@ public record JobPayload(
         COMPLETED,
         FAILED,
         CANCELLED
+    }
+
+    private static int parseSchemaVersion(JsonNode schemaVersion) {
+        if (schemaVersion == null || !schemaVersion.isNumber()
+            || schemaVersion.decimalValue().compareTo(BigDecimal.ONE) != 0) {
+            throw new IllegalArgumentException("Unsupported job payload schema version");
+        }
+        return VERSION;
     }
 }

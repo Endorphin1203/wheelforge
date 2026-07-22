@@ -1,7 +1,7 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 1.2,
   "jobType": "BUILD",
-  "subjectId": "fe3b9a09-e696-4104-beb7-d8fd1fb85d2",
+  "subjectId": "fe3b9a09-e696-4104-beb7-d8fd1fb85d24",
   "createdAt": "2026-07-22T10:05:00Z",
   "payload": {}
 }

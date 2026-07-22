@@ -38,6 +38,19 @@ class JobPayloadContractTest {
     }
 
     @Test
+    void readsSchemaValidEdgeFixtures() throws Exception {
+        for (String fixture : List.of(
+            "uppercase-uuid-v1.json",
+            "schema-version-decimal-v1.json",
+            "space-datetime-v1.json"
+        )) {
+            var payload = objectMapper.readValue(readValidFixture(fixture), JobPayload.class);
+
+            assertThat(payload.schemaVersion()).isEqualTo(1);
+        }
+    }
+
+    @Test
     void rejectsUnsupportedSchemaVersionDuringDeserialization() {
         assertThatThrownBy(() -> objectMapper.readValue("""
             {"schemaVersion":2,"jobType":"BUILD","subjectId":"fe3b9a09-e696-4104-beb7-d8fd1fb85d24","createdAt":"2026-07-22T10:05:00Z","payload":{}}
@@ -90,6 +103,7 @@ class JobPayloadContractTest {
             "extra-top-level-v1.json",
             "schema-version-string-v1.json",
             "schema-version-boolean-v1.json",
+            "schema-version-fraction-v1.json",
             "noncanonical-uuid-v1.json",
             "numeric-created-at-v1.json",
             "snake-case-keys-v1.json"
@@ -140,5 +154,9 @@ class JobPayloadContractTest {
 
     private String readInvalidFixture(String fileName) throws Exception {
         return Files.readString(Path.of("..", "contracts", "examples", "invalid", fileName));
+    }
+
+    private String readValidFixture(String fileName) throws Exception {
+        return Files.readString(Path.of("..", "contracts", "examples", "valid", fileName));
     }
 }

@@ -10,6 +10,7 @@ from wheelforge_worker.contracts import BuildStatus, JobPayload, JobStatus, JobT
 
 FIXTURES = Path(__file__).parents[2] / "contracts" / "examples"
 INVALID_FIXTURES = FIXTURES / "invalid"
+VALID_FIXTURES = FIXTURES / "valid"
 SCHEMA = Path(__file__).parents[2] / "contracts" / "job-payload-v1.schema.json"
 MUTABLE_ROW_FIELDS = {
     "id",
@@ -43,6 +44,19 @@ def test_requirement_parse_fixture_round_trips() -> None:
 
     assert payload.job_type is JobType.REQUIREMENT_PARSE
     assert str(payload.payload["originalObjectKey"]).endswith("/original.txt")
+
+
+def test_constructor_accepts_snake_case_fields() -> None:
+    payload = JobPayload(
+        schema_version=1,
+        job_type=JobType.BUILD,
+        subject_id="fe3b9a09-e696-4104-beb7-d8fd1fb85d24",
+        created_at="2026-07-22T10:05:00Z",
+        payload={},
+    )
+
+    assert payload.schema_version == 1
+    assert payload.job_type is JobType.BUILD
 
 
 def test_serializes_database_wire_names() -> None:
@@ -112,10 +126,15 @@ def test_rejects_invalid_shared_fixture(fixture: Path) -> None:
         JobPayload.model_validate_json(fixture.read_text())
 
 
+@pytest.mark.parametrize("fixture", sorted(VALID_FIXTURES.glob("*.json")))
+def test_database_wire_parser_accepts_valid_shared_fixture(fixture: Path) -> None:
+    assert JobPayload.model_validate_json(fixture.read_text()).schema_version == 1
+
+
 def test_schema_accepts_valid_shared_fixtures() -> None:
     validator = Draft202012Validator(json.loads(SCHEMA.read_text()), format_checker=FormatChecker())
 
-    for fixture in sorted(FIXTURES.glob("*.json")):
+    for fixture in valid_shared_fixtures():
         assert list(validator.iter_errors(json.loads(fixture.read_text()))) == []
 
 
@@ -127,10 +146,14 @@ def test_schema_rejects_invalid_shared_fixtures() -> None:
 
 
 def test_fixture_payloads_exclude_mutable_database_row_fields() -> None:
-    for fixture in FIXTURES.glob("*.json"):
+    for fixture in valid_shared_fixtures():
         document = json.loads(fixture.read_text())
 
         assert MUTABLE_ROW_FIELDS.isdisjoint(document)
+
+
+def valid_shared_fixtures() -> list[Path]:
+    return sorted([*FIXTURES.glob("*.json"), *VALID_FIXTURES.glob("*.json")])
 
 
 def test_keeps_build_task_and_database_job_state_sets_separate() -> None:
