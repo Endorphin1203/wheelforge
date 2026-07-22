@@ -56,6 +56,7 @@ V1 不包含：
 | 源码构建 | 禁止；缺少 Wheel 时报告部分成功或失败 |
 | 下载源 | 清华、阿里云、PyPI 官方源白名单，自动切换 |
 | 部署形式 | V1 可在单机部署，组件可在后续横向扩展 |
+| 关系型数据库 | MySQL 8.4 LTS，使用 InnoDB 和 `utf8mb4` |
 | 用户体系 | 普通用户资源隔离，管理员可查看全局任务和配置 |
 | 任务取消 | 支持取消排队和运行中的任务 |
 | 大模型 | 不进入 V1 核心链路，未来仅考虑辅助诊断 |
@@ -99,7 +100,7 @@ Linux + ARM64 + CPython + 3.11 + cp311/abi3/none + manylinux2014
 ```mermaid
 flowchart TD
     UI["Vue 3 + Element Plus"] --> API["Spring Boot API"]
-    API --> DB["PostgreSQL 或 MySQL"]
+    API --> DB["MySQL 8.4 LTS"]
     API --> Redis["Redis 队列与任务信号"]
     API --> Storage["MinIO 或本地兼容对象存储"]
     Redis --> Worker["Python Worker"]
@@ -143,13 +144,15 @@ Spring Boot 不自行实现 Python 依赖解析，也不拼装和执行复杂的
 V1 可以在一台服务器上部署：
 
 - 一个 Spring Boot API 实例。
-- 一个关系型数据库。
+- 一个 MySQL 8.4 LTS 实例。
 - 一个 Redis 实例。
 - 一个 MinIO 实例，开发环境可使用兼容的本地存储适配器。
 - 一个 Python Worker。
 - Docker 及 Linux ARM64 验证所需的 QEMU/binfmt 支持。
 
 后续扩展时，API 保持无状态，Worker 按平台或队列横向扩容，对象存储替换为外部 MinIO 集群。
+
+数据库表统一使用 InnoDB、`utf8mb4` 和 UTC 时间。业务主键采用应用生成的 UUID，状态和角色使用受控字符串并由应用枚举与数据库约束共同校验。任务领取、取消和状态推进使用事务内条件更新与乐观版本号，避免多个 Worker 重复执行同一任务；需要从表中领取待处理记录时可使用 `SELECT ... FOR UPDATE SKIP LOCKED`。
 
 ## 5. 构建业务流程
 
