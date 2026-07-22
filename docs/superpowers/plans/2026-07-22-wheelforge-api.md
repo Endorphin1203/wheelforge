@@ -38,13 +38,19 @@
 
 **Files:**
 - Modify: `backend/pom.xml`
+- Modify: `backend/src/main/resources/application.yml`
 - Create: `backend/src/main/java/com/wheelforge/api/security/SecurityConfig.java`
 - Create: `backend/src/main/java/com/wheelforge/api/security/AuthController.java`
 - Create: `backend/src/main/java/com/wheelforge/api/security/AuthService.java`
+- Create: `backend/src/main/java/com/wheelforge/api/security/TokenService.java`
+- Create: `backend/src/main/java/com/wheelforge/api/security/UserAccount.java`
+- Create: `backend/src/main/java/com/wheelforge/api/security/UserAccountRepository.java`
 - Create: `backend/src/main/java/com/wheelforge/api/security/CurrentUser.java`
 - Create: `backend/src/main/java/com/wheelforge/api/security/AdminBootstrap.java`
 - Create: `backend/src/main/java/com/wheelforge/api/common/ApiExceptionHandler.java`
 - Test: `backend/src/test/java/com/wheelforge/api/security/AuthControllerTest.java`
+- Test: `backend/src/test/java/com/wheelforge/api/security/AuthServiceTest.java`
+- Test: `backend/src/test/java/com/wheelforge/api/security/TokenServiceTest.java`
 
 **Interfaces:**
 - Produces: `POST /api/auth/login` with `LoginRequest(username, password)` and `TokenResponse(accessToken, expiresAt)`.
@@ -80,7 +86,7 @@ Expected: FAIL because `/api/auth/login` does not exist.
 
 - [ ] **Step 3: Implement Argon2id authentication and signed access tokens**
 
-Configure stateless security, permit only login and health endpoints anonymously, and map token claims `sub`, `role`, `iat`, and `exp` into `CurrentUser`. Return the same error for unknown users and bad passwords.
+Configure stateless security, permit only login and health endpoints anonymously, and map token claims `sub`, `role`, `iat`, and `exp` into `CurrentUser`. Return the same error for unknown users and bad passwords. Use an HMAC SHA-256 JWT signed with `WF_AUTH_TOKEN_SECRET`; require at least 32 UTF-8 bytes and provide no built-in default. Tests supply their own deterministic secret. The application must refuse startup when the secret is absent or too short in a production-configured context.
 
 On startup, `AdminBootstrap` creates the first administrator only when the users table is empty and `WF_BOOTSTRAP_ADMIN_USERNAME` plus `WF_BOOTSTRAP_ADMIN_PASSWORD` are present; hash the password immediately and never log either value. Refuse startup when only one bootstrap variable is present. Implement `ApiExceptionHandler` with the global `code`, `message`, `fieldErrors`, and `traceId` shape.
 
@@ -93,7 +99,7 @@ Expected: all login and unauthorized-resource tests pass.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add backend/pom.xml backend/src/main/java/com/wheelforge/api/security backend/src/test/java/com/wheelforge/api/security
+git add backend/pom.xml backend/src/main/resources/application.yml backend/src/main/java/com/wheelforge/api/security backend/src/test/java/com/wheelforge/api/security
 git commit -m "feat(api): add token authentication"
 ```
 
