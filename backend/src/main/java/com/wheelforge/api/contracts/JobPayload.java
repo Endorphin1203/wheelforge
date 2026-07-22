@@ -2,7 +2,12 @@ package com.wheelforge.api.contracts;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonProperty;
+import tools.jackson.databind.DeserializationFeature;
 import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.cfg.CoercionAction;
+import tools.jackson.databind.cfg.CoercionInputShape;
+import tools.jackson.databind.type.LogicalType;
 
 import java.time.Instant;
 import java.util.Objects;
@@ -20,6 +25,20 @@ public record JobPayload(
     public static final int VERSION = 1;
     private static final Set<String> SUPPORTED_JOB_TYPES = Set.of("REQUIREMENT_PARSE", "BUILD");
 
+    public static ObjectMapper databaseWireMapper() {
+        return new ObjectMapper().rebuild()
+            .enable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
+            .disable(DeserializationFeature.ACCEPT_FLOAT_AS_INT)
+            .withCoercionConfig(LogicalType.Integer, config -> config
+                .setCoercion(CoercionInputShape.Boolean, CoercionAction.Fail)
+                .setCoercion(CoercionInputShape.String, CoercionAction.Fail))
+            .withCoercionConfig(LogicalType.Textual, config -> config
+                .setCoercion(CoercionInputShape.Boolean, CoercionAction.Fail)
+                .setCoercion(CoercionInputShape.Float, CoercionAction.Fail)
+                .setCoercion(CoercionInputShape.Integer, CoercionAction.Fail))
+            .build();
+    }
+
     public JobPayload {
         if (schemaVersion != VERSION) {
             throw new IllegalArgumentException("Unsupported job payload schema version: " + schemaVersion);
@@ -30,7 +49,10 @@ public record JobPayload(
         Objects.requireNonNull(subjectId, "subjectId must not be null");
         Objects.requireNonNull(createdAt, "createdAt must not be null");
         Objects.requireNonNull(payload, "payload must not be null");
-        UUID.fromString(subjectId);
+        UUID parsedSubjectId = UUID.fromString(subjectId);
+        if (!parsedSubjectId.toString().equals(subjectId)) {
+            throw new IllegalArgumentException("subjectId must be a canonical UUID");
+        }
         Instant.parse(createdAt);
         if (!payload.isObject()) {
             throw new IllegalArgumentException("payload must be a JSON object");

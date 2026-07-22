@@ -2,12 +2,15 @@ import json
 from pathlib import Path
 
 import pytest
+from jsonschema import Draft202012Validator, FormatChecker
 from pydantic import ValidationError
 
 from wheelforge_worker.contracts import BuildStatus, JobPayload, JobStatus, JobType
 
 
 FIXTURES = Path(__file__).parents[2] / "contracts" / "examples"
+INVALID_FIXTURES = FIXTURES / "invalid"
+SCHEMA = Path(__file__).parents[2] / "contracts" / "job-payload-v1.schema.json"
 MUTABLE_ROW_FIELDS = {
     "id",
     "jobId",
@@ -101,6 +104,26 @@ def test_rejects_created_at_without_timezone() -> None:
                 "payload": {},
             }
         )
+
+
+@pytest.mark.parametrize("fixture", sorted(INVALID_FIXTURES.glob("*.json")))
+def test_rejects_invalid_shared_fixture(fixture: Path) -> None:
+    with pytest.raises(ValidationError):
+        JobPayload.model_validate_json(fixture.read_text())
+
+
+def test_schema_accepts_valid_shared_fixtures() -> None:
+    validator = Draft202012Validator(json.loads(SCHEMA.read_text()), format_checker=FormatChecker())
+
+    for fixture in sorted(FIXTURES.glob("*.json")):
+        assert list(validator.iter_errors(json.loads(fixture.read_text()))) == []
+
+
+def test_schema_rejects_invalid_shared_fixtures() -> None:
+    validator = Draft202012Validator(json.loads(SCHEMA.read_text()), format_checker=FormatChecker())
+
+    for fixture in sorted(INVALID_FIXTURES.glob("*.json")):
+        assert list(validator.iter_errors(json.loads(fixture.read_text())))
 
 
 def test_fixture_payloads_exclude_mutable_database_row_fields() -> None:

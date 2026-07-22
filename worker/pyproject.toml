@@ -12,6 +12,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "jsonschema>=4,<5",
     "pytest",
     "pytest-cov",
     "ruff",

@@ -6,7 +6,11 @@
   "properties": {
     "schemaVersion": {"const": 1},
     "jobType": {"enum": ["REQUIREMENT_PARSE", "BUILD"]},
-    "subjectId": {"type": "string", "format": "uuid"},
+    "subjectId": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
     "createdAt": {"type": "string", "format": "date-time"},
     "payload": {"type": "object"}
   },

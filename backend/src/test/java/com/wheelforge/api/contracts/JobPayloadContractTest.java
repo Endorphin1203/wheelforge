@@ -13,7 +13,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class JobPayloadContractTest {
-    private final ObjectMapper objectMapper = new ObjectMapper();
+    private final ObjectMapper objectMapper = JobPayload.databaseWireMapper();
 
     @Test
     void readsBuildFixture() throws Exception {
@@ -85,6 +85,21 @@ class JobPayloadContractTest {
     }
 
     @Test
+    void rejectsInvalidSharedFixturesDuringDeserialization() throws Exception {
+        for (String fixture : List.of(
+            "extra-top-level-v1.json",
+            "schema-version-string-v1.json",
+            "schema-version-boolean-v1.json",
+            "noncanonical-uuid-v1.json",
+            "numeric-created-at-v1.json",
+            "snake-case-keys-v1.json"
+        )) {
+            assertThatThrownBy(() -> objectMapper.readValue(readInvalidFixture(fixture), JobPayload.class))
+                .isInstanceOf(Exception.class);
+        }
+    }
+
+    @Test
     void fixturePayloadsExcludeMutableDatabaseRowFields() throws Exception {
         for (String fixture : List.of("requirement-parse-v1.json", "build-v1.json")) {
             var document = objectMapper.readTree(readFixture(fixture));
@@ -121,5 +136,9 @@ class JobPayloadContractTest {
 
     private String readFixture(String fileName) throws Exception {
         return Files.readString(Path.of("..", "contracts", "examples", fileName));
+    }
+
+    private String readInvalidFixture(String fileName) throws Exception {
+        return Files.readString(Path.of("..", "contracts", "examples", "invalid", fileName));
     }
 }
