@@ -1,3 +1,12 @@
 .worktrees/
 .superpowers/sdd/
-
+.mvn/timing.properties
+.mvn/wrapper/maven-wrapper.jar
+target/
+worker/.venv/
+worker/.pytest_cache/
+worker/.mypy_cache/
+worker/.ruff_cache/
+*.egg-info/
+__pycache__/
+*.py[cod]
