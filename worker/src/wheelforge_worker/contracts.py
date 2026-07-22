@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 
 _RFC3339_DATE_TIME = re.compile(
-    r"^\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}:(?:[0-5]\d|60)(?:\.\d+)?(?:[Zz]|[+-]\d{2}:?\d{2})$"
+    r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:[0-5]\d(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})$"
 )
 
 
@@ -162,10 +162,6 @@ def validate_rfc3339_created_at(created_at: Any) -> str:
     normalized = f"{created_at[:10]}T{created_at[11:]}"
     if normalized.endswith(("Z", "z")):
         normalized = f"{normalized[:-1]}+00:00"
-    elif re.search(r"[+-]\d{4}$", normalized):
-        normalized = f"{normalized[:-2]}:{normalized[-2:]}"
-    if normalized[17:19] == "60":
-        normalized = f"{normalized[:17]}59{normalized[19:]}"
     datetime.fromisoformat(normalized)
     return created_at
 

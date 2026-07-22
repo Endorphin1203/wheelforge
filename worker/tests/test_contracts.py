@@ -69,15 +69,6 @@ def test_serializes_database_wire_names() -> None:
     assert document["jobType"] == "BUILD"
 
 
-def test_leap_second_preserves_created_at_wire_text() -> None:
-    payload = JobPayload.model_validate_json(
-        (VALID_FIXTURES / "leap-second-v1.json").read_text()
-    )
-
-    assert payload.created_at == "2016-12-31T23:59:60Z"
-    assert json.loads(payload.model_dump_json())["createdAt"] == "2016-12-31T23:59:60Z"
-
-
 def test_database_wire_parser_rejects_non_default_options() -> None:
     with pytest.raises(ValueError, match="fixed database wire settings"):
         JobPayload.model_validate_json(
@@ -162,17 +153,27 @@ def test_database_wire_parser_accepts_valid_shared_fixture(fixture: Path) -> Non
 
 
 def test_schema_accepts_valid_shared_fixtures() -> None:
-    validator = Draft202012Validator(json.loads(SCHEMA.read_text()), format_checker=FormatChecker())
+    validator = schema_validator()
 
     for fixture in valid_shared_fixtures():
         assert list(validator.iter_errors(load_json_fixture(fixture))) == []
 
 
 def test_schema_rejects_invalid_shared_fixtures() -> None:
-    validator = Draft202012Validator(json.loads(SCHEMA.read_text()), format_checker=FormatChecker())
+    validator = schema_validator()
 
     for fixture in sorted(INVALID_FIXTURES.glob("*.json")):
         assert list(validator.iter_errors(load_json_fixture(fixture)))
+
+
+def test_schema_date_time_format_checking_is_active() -> None:
+    document = load_json_fixture(VALID_FIXTURES / "lowercase-t-z-v1.json")
+    assert isinstance(document, dict)
+    document["createdAt"] = "not-a-date-time"
+
+    errors = list(schema_validator().iter_errors(document))
+
+    assert any(list(error.path) == ["createdAt"] for error in errors)
 
 
 @pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
@@ -206,6 +207,12 @@ def load_json_text(value: str) -> object:
 
 def reject_non_standard_json_constant(constant: str) -> None:
     raise ValueError(f"non-standard JSON constant: {constant}")
+
+
+def schema_validator() -> Draft202012Validator:
+    return Draft202012Validator(
+        json.loads(SCHEMA.read_text()), format_checker=FormatChecker()
+    )
 
 
 def test_keeps_build_task_and_database_job_state_sets_separate() -> None:

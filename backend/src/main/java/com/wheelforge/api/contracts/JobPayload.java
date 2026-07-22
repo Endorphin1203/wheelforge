@@ -27,7 +27,9 @@ public record JobPayload(
 ) {
     public static final int VERSION = 1;
     private static final Set<String> SUPPORTED_JOB_TYPES = Set.of("REQUIREMENT_PARSE", "BUILD");
-    private static final Pattern BASIC_OFFSET = Pattern.compile("([+-]\\d{2})(\\d{2})$");
+    private static final Pattern RFC3339_DATE_TIME = Pattern.compile(
+        "^\\d{4}-\\d{2}-\\d{2}[Tt]\\d{2}:\\d{2}:[0-5]\\d(?:\\.\\d+)?(?:[Zz]|[+-]\\d{2}:\\d{2})$"
+    );
 
     public static ObjectMapper databaseWireMapper() {
         return new ObjectMapper().rebuild()
@@ -69,7 +71,10 @@ public record JobPayload(
         if (!parsedSubjectId.toString().equalsIgnoreCase(subjectId)) {
             throw new IllegalArgumentException("subjectId must be a canonical UUID");
         }
-        Instant.parse(normalizeCreatedAt(createdAt));
+        if (!RFC3339_DATE_TIME.matcher(createdAt).matches()) {
+            throw new IllegalArgumentException("createdAt must be an RFC3339 date-time string with a timezone");
+        }
+        Instant.parse(createdAt);
         if (!payload.isObject()) {
             throw new IllegalArgumentException("payload must be a JSON object");
         }
@@ -91,8 +96,4 @@ public record JobPayload(
         return VERSION;
     }
 
-    private static String normalizeCreatedAt(String createdAt) {
-        String normalized = createdAt.replace(' ', 'T');
-        return BASIC_OFFSET.matcher(normalized).replaceFirst("$1:$2");
-    }
 }

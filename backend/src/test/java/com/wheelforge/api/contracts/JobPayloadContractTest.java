@@ -6,7 +6,6 @@ import tools.jackson.databind.ObjectMapper;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.time.format.DateTimeParseException;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -42,9 +41,6 @@ class JobPayloadContractTest {
         for (String fixture : List.of(
             "uppercase-uuid-v1.json",
             "schema-version-decimal-v1.json",
-            "space-datetime-v1.json",
-            "basic-offset-v1.json",
-            "leap-second-v1.json",
             "lowercase-t-z-v1.json"
         )) {
             var payload = objectMapper.readValue(readValidFixture(fixture), JobPayload.class);
@@ -97,7 +93,7 @@ class JobPayloadContractTest {
             "2026-07-22T10:05:00",
             objectMapper.createObjectNode()
         ))
-            .isInstanceOf(DateTimeParseException.class);
+            .isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test
@@ -109,6 +105,9 @@ class JobPayloadContractTest {
             "schema-version-fraction-v1.json",
             "schema-version-below-one-v1.json",
             "schema-version-above-one-v1.json",
+            "basic-offset-v1.json",
+            "leap-second-v1.json",
+            "space-datetime-v1.json",
             "noncanonical-uuid-v1.json",
             "numeric-created-at-v1.json",
             "snake-case-keys-v1.json"
