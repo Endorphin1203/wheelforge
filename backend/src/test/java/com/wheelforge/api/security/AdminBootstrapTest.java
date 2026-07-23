@@ -3,6 +3,7 @@ package com.wheelforge.api.security;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.BDDMockito.given;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 
@@ -19,17 +20,27 @@ class AdminBootstrapTest {
   void createsAnArgon2idAdministratorWhenTheUsersTableIsEmpty() throws Exception {
     UserAccountRepository repository = Mockito.mock(UserAccountRepository.class);
     PasswordEncoder passwordEncoder = Argon2PasswordEncoder.defaultsForSpringSecurity_v5_8();
+    AdminBootstrapCoordinator coordinator = Mockito.mock(AdminBootstrapCoordinator.class);
+    doAnswer(
+            invocation -> {
+              invocation.getArgument(0, Runnable.class).run();
+              return null;
+            })
+        .when(coordinator)
+        .runWithInitializationLock(org.mockito.ArgumentMatchers.any());
     given(repository.count()).willReturn(0L);
     AdminBootstrap bootstrap =
         bootstrap(
             repository,
             passwordEncoder,
+            coordinator,
             environment("bootstrap-admin", "correct horse battery staple"));
 
     bootstrap.run(new DefaultApplicationArguments());
 
     ArgumentCaptor<UserAccount> account = ArgumentCaptor.forClass(UserAccount.class);
-    verify(repository).save(account.capture());
+    verify(coordinator).runWithInitializationLock(org.mockito.ArgumentMatchers.any());
+    verify(repository).saveAndFlush(account.capture());
     assertThat(account.getValue().getId()).matches("[0-9a-f-]{36}");
     assertThat(account.getValue().getUsername()).isEqualTo("bootstrap-admin");
     assertThat(account.getValue().getRole()).isEqualTo("ADMIN");
@@ -45,9 +56,18 @@ class AdminBootstrapTest {
   void doesNothingWhenAUserAlreadyExists() throws Exception {
     UserAccountRepository repository = Mockito.mock(UserAccountRepository.class);
     PasswordEncoder passwordEncoder = Mockito.mock(PasswordEncoder.class);
+    AdminBootstrapCoordinator coordinator = Mockito.mock(AdminBootstrapCoordinator.class);
+    doAnswer(
+            invocation -> {
+              invocation.getArgument(0, Runnable.class).run();
+              return null;
+            })
+        .when(coordinator)
+        .runWithInitializationLock(org.mockito.ArgumentMatchers.any());
     given(repository.count()).willReturn(1L);
     AdminBootstrap bootstrap =
-        bootstrap(repository, passwordEncoder, environment("bootstrap-admin", "password"));
+        bootstrap(
+            repository, passwordEncoder, coordinator, environment("bootstrap-admin", "password"));
 
     bootstrap.run(new DefaultApplicationArguments());
 
@@ -62,6 +82,7 @@ class AdminBootstrapTest {
         bootstrap(
             repository,
             Mockito.mock(PasswordEncoder.class),
+            Mockito.mock(AdminBootstrapCoordinator.class),
             new MockEnvironment().withProperty("WF_BOOTSTRAP_ADMIN_USERNAME", "bootstrap-admin"));
 
     assertThatThrownBy(() -> bootstrap.run(new DefaultApplicationArguments()))
@@ -74,8 +95,17 @@ class AdminBootstrapTest {
   void refusesBlankBootstrapCredentials() {
     UserAccountRepository repository = Mockito.mock(UserAccountRepository.class);
     PasswordEncoder passwordEncoder = Mockito.mock(PasswordEncoder.class);
+    AdminBootstrapCoordinator coordinator = Mockito.mock(AdminBootstrapCoordinator.class);
+    doAnswer(
+            invocation -> {
+              invocation.getArgument(0, Runnable.class).run();
+              return null;
+            })
+        .when(coordinator)
+        .runWithInitializationLock(org.mockito.ArgumentMatchers.any());
     given(repository.count()).willReturn(0L);
-    AdminBootstrap bootstrap = bootstrap(repository, passwordEncoder, environment(" ", " "));
+    AdminBootstrap bootstrap =
+        bootstrap(repository, passwordEncoder, coordinator, environment(" ", " "));
 
     assertThatThrownBy(() -> bootstrap.run(new DefaultApplicationArguments()))
         .isInstanceOf(IllegalStateException.class)
@@ -87,8 +117,9 @@ class AdminBootstrapTest {
   private AdminBootstrap bootstrap(
       UserAccountRepository repository,
       PasswordEncoder passwordEncoder,
+      AdminBootstrapCoordinator coordinator,
       MockEnvironment environment) {
-    AdminBootstrap bootstrap = new AdminBootstrap(repository, passwordEncoder);
+    AdminBootstrap bootstrap = new AdminBootstrap(repository, passwordEncoder, coordinator);
     bootstrap.setEnvironment(environment);
     return bootstrap;
   }

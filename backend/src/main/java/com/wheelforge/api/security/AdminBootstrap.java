@@ -3,6 +3,9 @@ package com.wheelforge.api.security;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.UUID;
+import java.util.function.Supplier;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
 import org.springframework.context.EnvironmentAware;
@@ -18,12 +21,34 @@ public class AdminBootstrap implements ApplicationRunner, EnvironmentAware {
 
   private final UserAccountRepository userAccountRepository;
   private final PasswordEncoder passwordEncoder;
+  private final Supplier<AdminBootstrapCoordinator> coordinatorSupplier;
   private Environment environment;
 
+  @Autowired
   public AdminBootstrap(
-      UserAccountRepository userAccountRepository, PasswordEncoder passwordEncoder) {
+      UserAccountRepository userAccountRepository,
+      PasswordEncoder passwordEncoder,
+      ObjectProvider<AdminBootstrapCoordinator> coordinatorProvider) {
+    this(
+        userAccountRepository,
+        passwordEncoder,
+        (Supplier<AdminBootstrapCoordinator>) coordinatorProvider::getIfAvailable);
+  }
+
+  private AdminBootstrap(
+      UserAccountRepository userAccountRepository,
+      PasswordEncoder passwordEncoder,
+      Supplier<AdminBootstrapCoordinator> coordinatorSupplier) {
     this.userAccountRepository = userAccountRepository;
     this.passwordEncoder = passwordEncoder;
+    this.coordinatorSupplier = coordinatorSupplier;
+  }
+
+  AdminBootstrap(
+      UserAccountRepository userAccountRepository,
+      PasswordEncoder passwordEncoder,
+      AdminBootstrapCoordinator coordinator) {
+    this(userAccountRepository, passwordEncoder, () -> coordinator);
   }
 
   @Override
@@ -39,7 +64,7 @@ public class AdminBootstrap implements ApplicationRunner, EnvironmentAware {
       throw new IllegalStateException(
           "WF_BOOTSTRAP_ADMIN_USERNAME and WF_BOOTSTRAP_ADMIN_PASSWORD must be configured together");
     }
-    if (!hasUsername || userAccountRepository.count() != 0) {
+    if (!hasUsername) {
       return;
     }
 
@@ -48,13 +73,24 @@ public class AdminBootstrap implements ApplicationRunner, EnvironmentAware {
     if (!StringUtils.hasText(username) || !StringUtils.hasText(password)) {
       throw new IllegalStateException("Bootstrap administrator credentials must not be blank");
     }
-    userAccountRepository.save(
-        new UserAccount(
-            UUID.randomUUID().toString(),
-            username,
-            passwordEncoder.encode(password),
-            "ADMIN",
-            "ACTIVE",
-            LocalDateTime.now(ZoneOffset.UTC)));
+    AdminBootstrapCoordinator coordinator = coordinatorSupplier.get();
+    if (coordinator == null) {
+      throw new IllegalStateException(
+          "Bootstrap administrator initialization requires MySQL locking");
+    }
+    coordinator.runWithInitializationLock(
+        () -> {
+          if (userAccountRepository.count() != 0) {
+            return;
+          }
+          userAccountRepository.saveAndFlush(
+              new UserAccount(
+                  UUID.randomUUID().toString(),
+                  username,
+                  passwordEncoder.encode(password),
+                  "ADMIN",
+                  "ACTIVE",
+                  LocalDateTime.now(ZoneOffset.UTC)));
+        });
   }
 }

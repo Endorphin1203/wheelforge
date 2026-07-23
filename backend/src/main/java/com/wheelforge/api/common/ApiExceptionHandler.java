@@ -16,9 +16,14 @@ import org.springframework.security.web.AuthenticationEntryPoint;
 import org.springframework.security.web.access.AccessDeniedHandler;
 import org.springframework.stereotype.Component;
 import org.springframework.validation.FieldError;
+import org.springframework.web.HttpMediaTypeNotSupportedException;
+import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.servlet.NoHandlerFoundException;
+import org.springframework.web.servlet.resource.NoResourceFoundException;
 import tools.jackson.databind.ObjectMapper;
 
 @Component
@@ -73,6 +78,68 @@ public class ApiExceptionHandler implements AuthenticationEntryPoint, AccessDeni
         HttpStatus.BAD_REQUEST,
         "VALIDATION_FAILED",
         "Request validation failed",
+        Map.of());
+  }
+
+  @ExceptionHandler({NoHandlerFoundException.class, NoResourceFoundException.class})
+  public void handleNotFound(
+      Exception exception, HttpServletRequest request, HttpServletResponse response)
+      throws IOException {
+    write(
+        response, HttpStatus.NOT_FOUND, "NOT_FOUND", "Requested resource was not found", Map.of());
+  }
+
+  @ExceptionHandler(HttpRequestMethodNotSupportedException.class)
+  public void handleMethodNotAllowed(
+      HttpRequestMethodNotSupportedException exception,
+      HttpServletRequest request,
+      HttpServletResponse response)
+      throws IOException {
+    write(
+        response,
+        HttpStatus.METHOD_NOT_ALLOWED,
+        "METHOD_NOT_ALLOWED",
+        "Request method is not supported",
+        Map.of());
+  }
+
+  @ExceptionHandler(HttpMediaTypeNotSupportedException.class)
+  public void handleUnsupportedMediaType(
+      HttpMediaTypeNotSupportedException exception,
+      HttpServletRequest request,
+      HttpServletResponse response)
+      throws IOException {
+    write(
+        response,
+        HttpStatus.UNSUPPORTED_MEDIA_TYPE,
+        "UNSUPPORTED_MEDIA_TYPE",
+        "Request content type is not supported",
+        Map.of());
+  }
+
+  @ExceptionHandler(MissingServletRequestParameterException.class)
+  public void handleMissingParameter(
+      MissingServletRequestParameterException exception,
+      HttpServletRequest request,
+      HttpServletResponse response)
+      throws IOException {
+    write(
+        response,
+        HttpStatus.BAD_REQUEST,
+        "VALIDATION_FAILED",
+        "Request validation failed",
+        Map.of());
+  }
+
+  @ExceptionHandler(Exception.class)
+  public void handleUnexpectedFailure(
+      Exception exception, HttpServletRequest request, HttpServletResponse response)
+      throws IOException {
+    write(
+        response,
+        HttpStatus.INTERNAL_SERVER_ERROR,
+        "INTERNAL_ERROR",
+        "An unexpected error occurred",
         Map.of());
   }
 

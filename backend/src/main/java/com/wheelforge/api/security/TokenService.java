@@ -20,6 +20,7 @@ import tools.jackson.databind.ObjectMapper;
 public class TokenService {
   private static final String HEADER = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
   private static final Duration TOKEN_TTL = Duration.ofMinutes(30);
+  private static final long TOKEN_TTL_SECONDS = TOKEN_TTL.toSeconds();
   private static final Base64.Encoder BASE64_URL_ENCODER = Base64.getUrlEncoder().withoutPadding();
   private static final Base64.Decoder BASE64_URL_DECODER = Base64.getUrlDecoder();
 
@@ -76,7 +77,11 @@ public class TokenService {
       }
       TokenClaims claims =
           objectMapper.readValue(BASE64_URL_DECODER.decode(segments[1]), TokenClaims.class);
-      if (claims.exp() <= clock.instant().getEpochSecond()) {
+      long now = clock.instant().getEpochSecond();
+      if (claims.iat() > now
+          || claims.exp() <= claims.iat()
+          || claims.exp() > claims.iat() + TOKEN_TTL_SECONDS
+          || claims.exp() <= now) {
         return Optional.empty();
       }
       return Optional.of(new CurrentUser(java.util.UUID.fromString(claims.sub()), claims.role()));
