@@ -85,12 +85,22 @@ public class MySqlAdminBootstrapCoordinator implements AdminBootstrapCoordinator
           throw new IllegalStateException("Could not release MySQL bootstrap administrator lock");
         }
       } catch (RuntimeException exception) {
+        invalidateLockConnection(lockConnection, exception);
         if (initializationFailure != null) {
           initializationFailure.addSuppressed(exception);
         } else {
           throw exception;
         }
       }
+    }
+  }
+
+  private void invalidateLockConnection(
+      Connection lockConnection, RuntimeException releaseFailure) {
+    try {
+      lockConnection.abort(Runnable::run);
+    } catch (SQLException | RuntimeException abortFailure) {
+      releaseFailure.addSuppressed(abortFailure);
     }
   }
 

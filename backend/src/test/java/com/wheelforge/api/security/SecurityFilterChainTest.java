@@ -1,5 +1,6 @@
 package com.wheelforge.api.security;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -14,13 +15,20 @@ import java.util.Map;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.boot.webmvc.test.autoconfigure.WebMvcTest;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpHeaders;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.MvcResult;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -102,14 +110,68 @@ class SecurityFilterChainTest {
         .andExpect(jsonPath("$.traceId").isString());
   }
 
+  @Test
+  void returnsGlobalErrorsForAuthorizationAndAdditionalMvcFailures() throws Exception {
+    String authorization = bearer(validToken());
+
+    mvc.perform(get("/api/test/forbidden").header(HttpHeaders.AUTHORIZATION, authorization))
+        .andExpect(status().isForbidden())
+        .andExpect(jsonPath("$.code").value("FORBIDDEN"))
+        .andExpect(jsonPath("$.message").isString())
+        .andExpect(jsonPath("$.fieldErrors").isMap())
+        .andExpect(jsonPath("$.traceId").isString());
+    mvc.perform(
+            get("/api/test/method-admin")
+                .header(HttpHeaders.AUTHORIZATION, bearer(validToken("USER"))))
+        .andExpect(status().isForbidden())
+        .andExpect(jsonPath("$.code").value("FORBIDDEN"))
+        .andExpect(jsonPath("$.message").isString())
+        .andExpect(jsonPath("$.fieldErrors").isMap())
+        .andExpect(jsonPath("$.traceId").isString());
+    mvc.perform(get("/api/test/typed/not-a-uuid").header(HttpHeaders.AUTHORIZATION, authorization))
+        .andExpect(status().isBadRequest())
+        .andExpect(jsonPath("$.code").value("VALIDATION_FAILED"))
+        .andExpect(jsonPath("$.message").isString())
+        .andExpect(jsonPath("$.fieldErrors").isMap())
+        .andExpect(jsonPath("$.traceId").isString());
+    mvc.perform(
+            get("/api/test/produces-json")
+                .header(HttpHeaders.AUTHORIZATION, authorization)
+                .header(HttpHeaders.ACCEPT, "text/plain"))
+        .andExpect(status().isNotAcceptable())
+        .andExpect(jsonPath("$.code").value("NOT_ACCEPTABLE"))
+        .andExpect(jsonPath("$.message").isString())
+        .andExpect(jsonPath("$.fieldErrors").isMap())
+        .andExpect(jsonPath("$.traceId").isString());
+  }
+
+  @Test
+  @ExtendWith(OutputCaptureExtension.class)
+  void logsTheSameTraceIdForUnexpectedFailuresWithoutExposingTheException(CapturedOutput output)
+      throws Exception {
+    MvcResult result =
+        mvc.perform(get("/api/test/boom").header(HttpHeaders.AUTHORIZATION, bearer(validToken())))
+            .andExpect(status().isInternalServerError())
+            .andReturn();
+
+    String response = result.getResponse().getContentAsString();
+    String traceId = new ObjectMapper().readTree(response).get("traceId").asString();
+    assertThat(response).doesNotContain("sensitive original failure");
+    assertThat(output).contains(traceId).contains("sensitive original failure");
+  }
+
   private String validToken() {
+    return validToken("ADMIN");
+  }
+
+  private String validToken(String role) {
     return tokenService
         .issue(
             new UserAccount(
                 USER_ID,
                 "admin",
                 "$argon2id$encoded",
-                "ADMIN",
+                role,
                 "ACTIVE",
                 LocalDateTime.now(ZoneOffset.UTC)))
         .accessToken();
@@ -156,7 +218,24 @@ class SecurityFilterChainTest {
 
     @GetMapping("/boom")
     void boom() {
-      throw new IllegalStateException("unexpected");
+      throw new IllegalStateException("sensitive original failure");
+    }
+
+    @GetMapping("/forbidden")
+    void forbidden() {
+      throw new AccessDeniedException("controller authorization failure");
+    }
+
+    @PreAuthorize("hasRole('ADMIN')")
+    @GetMapping("/method-admin")
+    void methodAdmin() {}
+
+    @GetMapping("/typed/{id}")
+    void typed(@PathVariable java.util.UUID id) {}
+
+    @GetMapping(value = "/produces-json", produces = "application/json")
+    Map<String, String> producesJson() {
+      return Map.of("status", "ok");
     }
   }
 }

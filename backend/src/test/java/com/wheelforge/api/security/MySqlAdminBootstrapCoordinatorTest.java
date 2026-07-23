@@ -1,5 +1,6 @@
 package com.wheelforge.api.security;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.Mockito.doThrow;
@@ -10,6 +11,7 @@ import static org.mockito.Mockito.verify;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.Test;
 import org.mockito.InOrder;
@@ -35,6 +37,7 @@ class MySqlAdminBootstrapCoordinatorTest {
     order.verify(transactionTemplate).execute(Mockito.any(TransactionCallback.class));
     order.verify(initialization).run();
     order.verify(lockConnection.connection).prepareStatement("SELECT RELEASE_LOCK(?)");
+    verify(lockConnection.connection, never()).abort(Mockito.any());
   }
 
   @Test
@@ -69,6 +72,59 @@ class MySqlAdminBootstrapCoordinatorTest {
         .isInstanceOf(IllegalStateException.class)
         .hasMessage("save failed");
     verify(lockConnection.connection).prepareStatement("SELECT RELEASE_LOCK(?)");
+  }
+
+  @Test
+  void abortsTheLockConnectionWhenReleaseReturnsFailure() throws Exception {
+    JdbcTemplate jdbcTemplate = Mockito.mock(JdbcTemplate.class);
+    TransactionTemplate transactionTemplate = Mockito.mock(TransactionTemplate.class);
+    Runnable initialization = Mockito.mock(Runnable.class);
+    LockConnection lockConnection = lockConnection(jdbcTemplate, transactionTemplate, 1, 0);
+
+    assertThatThrownBy(
+            () ->
+                new MySqlAdminBootstrapCoordinator(jdbcTemplate, transactionTemplate)
+                    .runWithInitializationLock(initialization))
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessageContaining("Could not release");
+
+    verify(lockConnection.connection).abort(Mockito.any());
+  }
+
+  @Test
+  void abortsTheLockConnectionWhenReleaseThrowsSqlException() throws Exception {
+    JdbcTemplate jdbcTemplate = Mockito.mock(JdbcTemplate.class);
+    TransactionTemplate transactionTemplate = Mockito.mock(TransactionTemplate.class);
+    Runnable initialization = Mockito.mock(Runnable.class);
+    LockConnection lockConnection = lockConnection(jdbcTemplate, transactionTemplate, 1, 1);
+    doThrow(new SQLException("release failed")).when(lockConnection.release).executeQuery();
+
+    assertThatThrownBy(
+            () ->
+                new MySqlAdminBootstrapCoordinator(jdbcTemplate, transactionTemplate)
+                    .runWithInitializationLock(initialization))
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessageContaining("lock query");
+
+    verify(lockConnection.connection).abort(Mockito.any());
+  }
+
+  @Test
+  void suppressesAnAbortFailureOnTheOriginalReleaseFailure() throws Exception {
+    JdbcTemplate jdbcTemplate = Mockito.mock(JdbcTemplate.class);
+    TransactionTemplate transactionTemplate = Mockito.mock(TransactionTemplate.class);
+    LockConnection lockConnection = lockConnection(jdbcTemplate, transactionTemplate, 1, 0);
+    SQLException abortFailure = new SQLException("abort failed");
+    doThrow(abortFailure).when(lockConnection.connection).abort(Mockito.any());
+
+    assertThatThrownBy(
+            () ->
+                new MySqlAdminBootstrapCoordinator(jdbcTemplate, transactionTemplate)
+                    .runWithInitializationLock(() -> {}))
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessageContaining("Could not release")
+        .satisfies(
+            exception -> assertThat(exception.getSuppressed()).containsExactly(abortFailure));
   }
 
   @SuppressWarnings({"unchecked", "rawtypes"})
@@ -118,8 +174,8 @@ class MySqlAdminBootstrapCoordinatorTest {
                 transactionFinished.set(true);
               }
             });
-    return new LockConnection(connection);
+    return new LockConnection(connection, release);
   }
 
-  private record LockConnection(Connection connection) {}
+  private record LockConnection(Connection connection, PreparedStatement release) {}
 }
