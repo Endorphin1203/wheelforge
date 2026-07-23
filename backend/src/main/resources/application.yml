@@ -10,5 +10,7 @@ spring:
     enabled: true
 
 wheelforge:
+  auth:
+    token-secret: ${WF_AUTH_TOKEN_SECRET}
   storage:
     data-root: ${WF_DATA_ROOT}
