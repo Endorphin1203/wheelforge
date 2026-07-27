@@ -36,6 +36,26 @@ def test_build_fixture_round_trips() -> None:
     assert payload.payload["targetSnapshot"]["platformTag"] == "manylinux2014_aarch64"
     assert payload.payload["targetSnapshot"]["abiTags"] == ["cp311", "abi3", "none"]
     assert payload.payload["targetSnapshot"]["pythonVersion"] == "3.11"
+    assert payload.payload.keys() == {
+        "requirementFileId",
+        "normalizedObjectKey",
+        "solveMode",
+        "targetSnapshot",
+    }
+    assert payload.payload["targetSnapshot"].keys() == {
+        "profileId",
+        "profileCode",
+        "os",
+        "architecture",
+        "pythonImplementation",
+        "pythonVersion",
+        "pythonFullVersion",
+        "platformTag",
+        "abiTags",
+        "validationType",
+        "validationPolicyVersion",
+        "profileVersion",
+    }
 
 
 def test_requirement_parse_fixture_round_trips() -> None:
@@ -45,15 +65,46 @@ def test_requirement_parse_fixture_round_trips() -> None:
 
     assert payload.job_type is JobType.REQUIREMENT_PARSE
     assert str(payload.payload["originalObjectKey"]).endswith("/original.txt")
+    assert payload.payload.keys() == {"originalObjectKey", "normalizedObjectKey"}
+
+
+def test_rejects_missing_unknown_mutable_and_mistyped_inner_payload_fields() -> None:
+    build = load_json_fixture(FIXTURES / "build-v1.json")
+    requirement_parse = load_json_fixture(FIXTURES / "requirement-parse-v1.json")
+    assert isinstance(build, dict)
+    assert isinstance(requirement_parse, dict)
+
+    invalid_documents: list[dict[str, object]] = []
+    for mutation in (
+        lambda payload: payload.pop("normalizedObjectKey", None),
+        lambda payload: payload.update({"unknown": True}),
+        lambda payload: payload.update({"attempts": 1}),
+        lambda payload: payload["targetSnapshot"].pop("profileId", None),
+        lambda payload: payload["targetSnapshot"].update({"leaseOwner": "worker-1"}),
+        lambda payload: payload["targetSnapshot"].update({"profileVersion": "1"}),
+    ):
+        candidate = json.loads(json.dumps(build))
+        mutation(candidate["payload"])
+        invalid_documents.append(candidate)
+    requirement_candidate = json.loads(json.dumps(requirement_parse))
+    requirement_candidate["payload"]["status"] = "READY"
+    invalid_documents.append(requirement_candidate)
+
+    for invalid in invalid_documents:
+        with pytest.raises(ValidationError):
+            JobPayload.model_validate_json(json.dumps(invalid))
+        assert list(schema_validator().iter_errors(invalid))
 
 
 def test_constructor_accepts_snake_case_fields() -> None:
+    build = load_json_fixture(FIXTURES / "build-v1.json")
+    assert isinstance(build, dict)
     payload = JobPayload(
         schema_version=1,
         job_type=JobType.BUILD,
         subject_id="fe3b9a09-e696-4104-beb7-d8fd1fb85d24",
         created_at="2026-07-22T10:05:00Z",
-        payload={},
+        payload=build["payload"],
     )
 
     assert payload.schema_version == 1

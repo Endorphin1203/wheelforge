@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "jobType": "BUILD",
+  "jobType": "REQUIREMENT_PARSE",
   "subjectId": "fe3b9a09-e696-4104-beb7-d8fd1fb85d24",
   "createdAt": "2026-07-22T10:05:00+23:59",
-  "payload": {}
+  "payload": {"originalObjectKey": "original", "normalizedObjectKey": "normalized"}
 }

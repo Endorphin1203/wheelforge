@@ -6,6 +6,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 
 import com.wheelforge.api.common.ApiException;
 import com.wheelforge.api.common.jobs.BuildJobEntity;
@@ -26,6 +27,8 @@ import java.util.UUID;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -124,7 +127,7 @@ class BuildTaskServiceTest {
     assertThat(view.id()).isEqualTo(TASK_ID);
     assertThat(view.status()).isEqualTo(BuildStatus.QUEUED);
     assertThat(view.solveMode()).isEqualTo(SolveMode.COMPATIBLE);
-    assertThat(view.targetSnapshot().profileCode()).isEqualTo("linux-aarch64-cp311");
+    assertThat(view.targetSnapshot()).isEqualTo(expectedSnapshot());
     var jobCaptor = ArgumentCaptor.forClass(BuildJobEntity.class);
     verify(jobRepository).save(jobCaptor.capture());
     JobPayload wire =
@@ -137,7 +140,22 @@ class BuildTaskServiceTest {
         .isEqualTo("users/alice/normalized.txt");
     assertThat(wire.payload().path("targetSnapshot").path("profileVersion").asLong()).isEqualTo(0);
     assertThat(wire.payload().propertyNames())
-        .doesNotContain("attempts", "leaseOwner", "executionId", "status");
+        .containsExactlyInAnyOrder(
+            "requirementFileId", "normalizedObjectKey", "solveMode", "targetSnapshot");
+    assertThat(wire.payload().path("targetSnapshot").propertyNames())
+        .containsExactlyInAnyOrder(
+            "profileId",
+            "profileCode",
+            "os",
+            "architecture",
+            "pythonImplementation",
+            "pythonVersion",
+            "pythonFullVersion",
+            "platformTag",
+            "abiTags",
+            "validationType",
+            "validationPolicyVersion",
+            "profileVersion");
   }
 
   @Test
@@ -207,13 +225,14 @@ class BuildTaskServiceTest {
   @Test
   void cancelsReadyQueuedTaskAndBuildJobTogether() {
     var task = task(BuildStatus.QUEUED, null, null);
-    var job = readyBuildJob();
     given(
-            taskRepository.findByIdAndUserIdAndDeletedAtIsNull(
+            taskRepository.findByIdAndUserIdAndDeletedAtIsNullForUpdate(
                 TASK_ID.toString(), USER_ID.toString()))
         .willReturn(Optional.of(task));
-    given(jobRepository.findBySubjectIdAndJobType(TASK_ID.toString(), "BUILD"))
-        .willReturn(Optional.of(job));
+    given(
+            jobRepository.cancelReadyBuildJob(
+                TASK_ID.toString(), NOW.atOffset(ZoneOffset.UTC).toLocalDateTime()))
+        .willReturn(1);
     var service = service();
 
     service.cancel(USER_ID, TASK_ID);
@@ -221,20 +240,37 @@ class BuildTaskServiceTest {
     assertThat(task.getStatus()).isEqualTo(BuildStatus.CANCELLED.name());
     assertThat(task.isCancelRequested()).isTrue();
     assertThat(task.getFinishedAt()).isEqualTo(NOW.atOffset(ZoneOffset.UTC).toLocalDateTime());
-    assertThat(job.getStatus()).isEqualTo("CANCELLED");
-    assertThat(job.getFinishedAt()).isEqualTo(NOW.atOffset(ZoneOffset.UTC).toLocalDateTime());
+  }
+
+  @Test
+  void preservesCancellationFlagWhenWorkerClaimWinsTheReadyJobCas() {
+    var task = task(BuildStatus.QUEUED, null, null);
+    given(
+            taskRepository.findByIdAndUserIdAndDeletedAtIsNullForUpdate(
+                TASK_ID.toString(), USER_ID.toString()))
+        .willReturn(Optional.of(task));
+    given(
+            jobRepository.cancelReadyBuildJob(
+                TASK_ID.toString(), NOW.atOffset(ZoneOffset.UTC).toLocalDateTime()))
+        .willReturn(0);
+    var service = service();
+
+    service.cancel(USER_ID, TASK_ID);
+
+    assertThat(task.getStatus()).isEqualTo(BuildStatus.QUEUED.name());
+    assertThat(task.isCancelRequested()).isTrue();
+    assertThat(task.getFinishedAt()).isNull();
   }
 
   @Test
   void marksRunningTaskForCancellationWithoutChangingItsStatus() {
     var task = task(BuildStatus.RESOLVING, null, null);
     given(
-            taskRepository.findByIdAndUserIdAndDeletedAtIsNull(
+            taskRepository.findByIdAndUserIdAndDeletedAtIsNullForUpdate(
                 TASK_ID.toString(), USER_ID.toString()))
         .willReturn(Optional.of(task));
-    var service = service();
 
-    service.cancel(USER_ID, TASK_ID);
+    service().cancel(USER_ID, TASK_ID);
 
     assertThat(task.getStatus()).isEqualTo(BuildStatus.RESOLVING.name());
     assertThat(task.isCancelRequested()).isTrue();
@@ -246,7 +282,7 @@ class BuildTaskServiceTest {
     var task = task(BuildStatus.VALIDATING, null, null);
     task.transitionTo(BuildStatus.FAILED, finishedAt);
     given(
-            taskRepository.findByIdAndUserIdAndDeletedAtIsNull(
+            taskRepository.findByIdAndUserIdAndDeletedAtIsNullForUpdate(
                 TASK_ID.toString(), USER_ID.toString()))
         .willReturn(Optional.of(task));
 
@@ -257,10 +293,14 @@ class BuildTaskServiceTest {
     assertThat(task.getFinishedAt()).isEqualTo(finishedAt);
   }
 
-  @Test
-  void retriesEligibleTerminalTaskUsingHistoricalSnapshot() throws Exception {
+  @ParameterizedTest
+  @EnumSource(
+      value = BuildStatus.class,
+      names = {"FAILED", "PARTIAL_SUCCESS", "CANCELLED"})
+  void retriesEligibleTerminalTaskUsingHistoricalSnapshot(BuildStatus retryableStatus)
+      throws Exception {
     TransactionSynchronizationManager.setActualTransactionActive(true);
-    var source = task(BuildStatus.FAILED, null, null);
+    var source = task(retryableStatus, null, null);
     given(
             taskRepository.findByIdAndUserIdAndDeletedAtIsNull(
                 TASK_ID.toString(), USER_ID.toString()))
@@ -276,40 +316,64 @@ class BuildTaskServiceTest {
     assertThat(retry.id()).isNotEqualTo(TASK_ID);
     assertThat(retry.sourceTaskId()).isEqualTo(TASK_ID);
     assertThat(retry.targetSnapshot()).isEqualTo(source.snapshot());
+    verifyNoInteractions(profileRepository);
     var jobCaptor = ArgumentCaptor.forClass(BuildJobEntity.class);
     verify(jobRepository).save(jobCaptor.capture());
     JobPayload wire =
         JobPayload.databaseWireMapper()
             .readValue(jobCaptor.getValue().getPayloadJson(), JobPayload.class);
-    assertThat(wire.payload().path("targetSnapshot").path("profileCode").asText())
-        .isEqualTo("linux-aarch64-cp311");
+    assertThat(wire.payload().propertyNames())
+        .containsExactlyInAnyOrder(
+            "requirementFileId", "normalizedObjectKey", "solveMode", "targetSnapshot");
+    assertThat(wire.payload().path("targetSnapshot").toString())
+        .isEqualTo(objectMapperSnapshot(source).toString());
   }
 
-  @Test
-  void rejectsRetryOfActiveDeletedAndSuccessfulTasks() {
+  @ParameterizedTest
+  @EnumSource(
+      value = BuildStatus.class,
+      names = {
+        "CREATED",
+        "PARSING",
+        "QUEUED",
+        "RESOLVING",
+        "DOWNLOADING",
+        "VALIDATING",
+        "PACKAGING",
+        "SUCCESS"
+      })
+  void rejectsRetryOfEveryActiveStatusAndSuccess(BuildStatus rejectedStatus) {
     var service = service();
     given(
             taskRepository.findByIdAndUserIdAndDeletedAtIsNull(
                 TASK_ID.toString(), USER_ID.toString()))
-        .willReturn(Optional.of(task(BuildStatus.QUEUED, null, null)));
+        .willReturn(Optional.of(task(rejectedStatus, null, null)));
+
     assertThatThrownBy(() -> service.retry(USER_ID, TASK_ID))
         .isInstanceOf(ApiException.class)
         .extracting(exception -> ((ApiException) exception).status())
         .isEqualTo(HttpStatus.CONFLICT);
+    verifyNoInteractions(fileRepository, profileRepository, jobRepository);
+  }
+
+  @Test
+  void retryTreatsDeletedOrCrossUserTaskAsNotFound() {
     given(
             taskRepository.findByIdAndUserIdAndDeletedAtIsNull(
                 TASK_ID.toString(), USER_ID.toString()))
-        .willReturn(Optional.of(task(BuildStatus.SUCCESS, null, null)));
-    assertThatThrownBy(() -> service.retry(USER_ID, TASK_ID))
+        .willReturn(Optional.empty());
+
+    assertThatThrownBy(() -> service().retry(USER_ID, TASK_ID))
         .isInstanceOf(ApiException.class)
         .extracting(exception -> ((ApiException) exception).status())
-        .isEqualTo(HttpStatus.CONFLICT);
+        .isEqualTo(HttpStatus.NOT_FOUND);
+    verifyNoInteractions(fileRepository, profileRepository, jobRepository);
   }
 
   @Test
   void softDeletesTaskIdempotently() {
     var task = task(BuildStatus.QUEUED, null, null);
-    given(taskRepository.findByIdAndUserId(TASK_ID.toString(), USER_ID.toString()))
+    given(taskRepository.findByIdAndUserIdForUpdate(TASK_ID.toString(), USER_ID.toString()))
         .willReturn(Optional.of(task));
     var service = service();
 
@@ -392,6 +456,26 @@ class BuildTaskServiceTest {
         enabled);
   }
 
+  private BuildTaskEntity.TargetSnapshot expectedSnapshot() {
+    return new BuildTaskEntity.TargetSnapshot(
+        PROFILE_ID.toString(),
+        "linux-aarch64-cp311",
+        "LINUX",
+        "AARCH64",
+        "CPYTHON",
+        "3.11",
+        "3.11.9",
+        "manylinux2014_aarch64",
+        List.of("cp311", "abi3", "none"),
+        "STATIC",
+        "wheel-tags-v1",
+        0);
+  }
+
+  private tools.jackson.databind.JsonNode objectMapperSnapshot(BuildTaskEntity source) {
+    return JobPayload.databaseWireMapper().valueToTree(source.snapshot());
+  }
+
   private BuildTaskEntity task(
       BuildStatus status, String sourceTaskId, java.time.LocalDateTime deletedAt) {
     return new BuildTaskEntity(
@@ -405,15 +489,5 @@ class BuildTaskServiceTest {
         BuildTaskEntity.TargetSnapshot.from(enabledProfile(), 0),
         NOW.atOffset(ZoneOffset.UTC).toLocalDateTime(),
         deletedAt);
-  }
-
-  private BuildJobEntity readyBuildJob() {
-    return new BuildJobEntity(
-        "5d3f75c3-49e0-493a-9443-b60800a90709",
-        "BUILD",
-        1,
-        TASK_ID.toString(),
-        "{}",
-        NOW.atOffset(ZoneOffset.UTC).toLocalDateTime());
   }
 }

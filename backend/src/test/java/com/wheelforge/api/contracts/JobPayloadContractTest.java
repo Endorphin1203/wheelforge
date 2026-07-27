@@ -7,8 +7,10 @@ import com.wheelforge.api.build.BuildStatus;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Set;
 import org.junit.jupiter.api.Test;
 import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.node.ObjectNode;
 
 class JobPayloadContractTest {
   private final ObjectMapper objectMapper = JobPayload.databaseWireMapper();
@@ -28,6 +30,24 @@ class JobPayloadContractTest {
         .isEqualTo("[\"cp311\",\"abi3\",\"none\"]");
     assertThat(payload.payload().path("targetSnapshot").path("pythonVersion").asText())
         .isEqualTo("3.11");
+    assertThat(payload.payload().propertyNames())
+        .containsExactlyInAnyOrder(
+            "requirementFileId", "normalizedObjectKey", "solveMode", "targetSnapshot");
+    assertThat(payload.payload().path("targetSnapshot").propertyNames())
+        .containsExactlyInAnyOrderElementsOf(
+            Set.of(
+                "profileId",
+                "profileCode",
+                "os",
+                "architecture",
+                "pythonImplementation",
+                "pythonVersion",
+                "pythonFullVersion",
+                "platformTag",
+                "abiTags",
+                "validationType",
+                "validationPolicyVersion",
+                "profileVersion"));
   }
 
   @Test
@@ -37,6 +57,46 @@ class JobPayloadContractTest {
 
     assertThat(payload.jobType()).isEqualTo("REQUIREMENT_PARSE");
     assertThat(payload.payload().path("originalObjectKey").asText()).endsWith("/original.txt");
+    assertThat(payload.payload().propertyNames())
+        .containsExactlyInAnyOrder("originalObjectKey", "normalizedObjectKey");
+  }
+
+  @Test
+  void rejectsMissingUnknownMutableAndMistypedInnerPayloadFields() throws Exception {
+    ObjectNode build = (ObjectNode) objectMapper.readTree(readFixture("build-v1.json"));
+    ObjectNode missingBuildField = build.deepCopy();
+    ((ObjectNode) missingBuildField.path("payload")).remove("normalizedObjectKey");
+    ObjectNode unknownBuildField = build.deepCopy();
+    ((ObjectNode) unknownBuildField.path("payload")).put("unknown", true);
+    ObjectNode mutableBuildField = build.deepCopy();
+    ((ObjectNode) mutableBuildField.path("payload")).put("attempts", 1);
+    ObjectNode missingSnapshotField = build.deepCopy();
+    ((ObjectNode) missingSnapshotField.path("payload").path("targetSnapshot")).remove("profileId");
+    ObjectNode unknownSnapshotField = build.deepCopy();
+    ((ObjectNode) unknownSnapshotField.path("payload").path("targetSnapshot"))
+        .put("leaseOwner", "worker-1");
+    ObjectNode mistypedSnapshotField = build.deepCopy();
+    ((ObjectNode) mistypedSnapshotField.path("payload").path("targetSnapshot"))
+        .put("profileVersion", "1");
+    ObjectNode requirementParse =
+        (ObjectNode) objectMapper.readTree(readFixture("requirement-parse-v1.json"));
+    ((ObjectNode) requirementParse.path("payload")).put("status", "READY");
+
+    for (ObjectNode invalid :
+        List.of(
+            missingBuildField,
+            unknownBuildField,
+            mutableBuildField,
+            missingSnapshotField,
+            unknownSnapshotField,
+            mistypedSnapshotField,
+            requirementParse)) {
+      assertThatThrownBy(
+              () ->
+                  objectMapper.readValue(
+                      objectMapper.writeValueAsString(invalid), JobPayload.class))
+          .isInstanceOf(Exception.class);
+    }
   }
 
   @Test

@@ -63,9 +63,7 @@ public class BuildJobService {
         .put("normalizedObjectKey", normalizedObjectKey);
   }
 
-  public java.util.Optional<BuildJobEntity> findReadyBuildJob(String subjectId) {
-    return repository
-        .findBySubjectIdAndJobType(subjectId, "BUILD")
-        .filter(job -> "READY".equals(job.getStatus()));
+  public int cancelReadyBuildJob(String subjectId, LocalDateTime finishedAt) {
+    return repository.cancelReadyBuildJob(subjectId, finishedAt);
   }
 }

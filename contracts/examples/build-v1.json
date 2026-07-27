@@ -5,8 +5,11 @@
   "createdAt": "2026-07-22T10:05:00Z",
   "payload": {
     "requirementFileId": "2b0e75d6-c238-4f39-9bf9-5e246eb7c4cd",
+    "normalizedObjectKey": "users/cae6ea8d-0afe-41df-aeea-fc0e5aceabfb/requirements/2b0e75d6-c238-4f39-9bf9-5e246eb7c4cd/normalized.txt",
     "solveMode": "COMPATIBLE",
     "targetSnapshot": {
+      "profileId": "d29ec24f-095c-45f6-ac96-acdef0e7d8ad",
+      "profileCode": "linux-aarch64-cp311",
       "os": "LINUX",
       "architecture": "AARCH64",
       "pythonImplementation": "CPYTHON",
@@ -15,7 +18,8 @@
       "platformTag": "manylinux2014_aarch64",
       "abiTags": ["cp311", "abi3", "none"],
       "validationType": "STATIC",
-      "validationPolicyVersion": "v1"
+      "validationPolicyVersion": "v1",
+      "profileVersion": 0
     }
   }
 }

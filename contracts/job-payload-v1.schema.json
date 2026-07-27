@@ -14,5 +14,92 @@
     "createdAt": {"type": "string", "format": "date-time"},
     "payload": {"type": "object"}
   },
-  "additionalProperties": false
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {"jobType": {"const": "REQUIREMENT_PARSE"}},
+        "required": ["jobType"]
+      },
+      "then": {"properties": {"payload": {"$ref": "#/$defs/requirementParsePayload"}}}
+    },
+    {
+      "if": {
+        "properties": {"jobType": {"const": "BUILD"}},
+        "required": ["jobType"]
+      },
+      "then": {"properties": {"payload": {"$ref": "#/$defs/buildPayload"}}}
+    }
+  ],
+  "$defs": {
+    "requirementParsePayload": {
+      "type": "object",
+      "required": ["originalObjectKey", "normalizedObjectKey"],
+      "properties": {
+        "originalObjectKey": {"type": "string", "minLength": 1},
+        "normalizedObjectKey": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "buildPayload": {
+      "type": "object",
+      "required": [
+        "requirementFileId",
+        "normalizedObjectKey",
+        "solveMode",
+        "targetSnapshot"
+      ],
+      "properties": {
+        "requirementFileId": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        },
+        "normalizedObjectKey": {"type": "string", "minLength": 1},
+        "solveMode": {"const": "COMPATIBLE"},
+        "targetSnapshot": {"$ref": "#/$defs/targetSnapshot"}
+      },
+      "additionalProperties": false
+    },
+    "targetSnapshot": {
+      "type": "object",
+      "required": [
+        "profileId",
+        "profileCode",
+        "os",
+        "architecture",
+        "pythonImplementation",
+        "pythonVersion",
+        "pythonFullVersion",
+        "platformTag",
+        "abiTags",
+        "validationType",
+        "validationPolicyVersion",
+        "profileVersion"
+      ],
+      "properties": {
+        "profileId": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        },
+        "profileCode": {"type": "string", "minLength": 1},
+        "os": {"type": "string", "minLength": 1},
+        "architecture": {"type": "string", "minLength": 1},
+        "pythonImplementation": {"type": "string", "minLength": 1},
+        "pythonVersion": {"type": "string", "minLength": 1},
+        "pythonFullVersion": {"type": "string", "minLength": 1},
+        "platformTag": {"type": "string", "minLength": 1},
+        "abiTags": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "validationType": {"type": "string", "minLength": 1},
+        "validationPolicyVersion": {"type": "string", "minLength": 1},
+        "profileVersion": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    }
+  }
 }

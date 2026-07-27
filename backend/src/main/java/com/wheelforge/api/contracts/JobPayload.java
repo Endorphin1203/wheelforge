@@ -6,6 +6,7 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import java.math.BigDecimal;
 import java.time.DateTimeException;
 import java.time.LocalDate;
+import java.util.HashSet;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
@@ -83,6 +84,7 @@ public record JobPayload(
     if (!payload.isObject()) {
       throw new IllegalArgumentException("payload must be a JSON object");
     }
+    validateInnerPayload(jobType, payload);
   }
 
   public enum JobStatus {
@@ -100,6 +102,95 @@ public record JobPayload(
       throw new IllegalArgumentException("Unsupported job payload schema version");
     }
     return VERSION;
+  }
+
+  private static void validateInnerPayload(String jobType, JsonNode payload) {
+    if ("REQUIREMENT_PARSE".equals(jobType)) {
+      requireExactKeys(payload, Set.of("originalObjectKey", "normalizedObjectKey"), "payload");
+      requireText(payload, "originalObjectKey");
+      requireText(payload, "normalizedObjectKey");
+      return;
+    }
+
+    requireExactKeys(
+        payload,
+        Set.of("requirementFileId", "normalizedObjectKey", "solveMode", "targetSnapshot"),
+        "payload");
+    requireCanonicalUuid(requireText(payload, "requirementFileId"), "requirementFileId");
+    requireText(payload, "normalizedObjectKey");
+    if (!"COMPATIBLE".equals(requireText(payload, "solveMode"))) {
+      throw new IllegalArgumentException("solveMode must be COMPATIBLE");
+    }
+    JsonNode snapshot = payload.path("targetSnapshot");
+    requireExactKeys(
+        snapshot,
+        Set.of(
+            "profileId",
+            "profileCode",
+            "os",
+            "architecture",
+            "pythonImplementation",
+            "pythonVersion",
+            "pythonFullVersion",
+            "platformTag",
+            "abiTags",
+            "validationType",
+            "validationPolicyVersion",
+            "profileVersion"),
+        "targetSnapshot");
+    requireCanonicalUuid(requireText(snapshot, "profileId"), "profileId");
+    for (String field :
+        Set.of(
+            "profileCode",
+            "os",
+            "architecture",
+            "pythonImplementation",
+            "pythonVersion",
+            "pythonFullVersion",
+            "platformTag",
+            "validationType",
+            "validationPolicyVersion")) {
+      requireText(snapshot, field);
+    }
+    JsonNode abiTags = snapshot.path("abiTags");
+    if (!abiTags.isArray() || abiTags.isEmpty()) {
+      throw new IllegalArgumentException("abiTags must be a non-empty array");
+    }
+    for (JsonNode abiTag : abiTags) {
+      if (!abiTag.isTextual() || abiTag.asText().isBlank()) {
+        throw new IllegalArgumentException("abiTags must contain non-empty strings");
+      }
+    }
+    JsonNode profileVersion = snapshot.path("profileVersion");
+    if (!profileVersion.isIntegralNumber() || profileVersion.asLong() < 0) {
+      throw new IllegalArgumentException("profileVersion must be a non-negative integer");
+    }
+  }
+
+  private static void requireExactKeys(JsonNode object, Set<String> expected, String field) {
+    if (!object.isObject()) {
+      throw new IllegalArgumentException(field + " must be a JSON object");
+    }
+    Set<String> actual = new HashSet<>();
+    object.propertyNames().forEach(actual::add);
+    if (!actual.equals(expected)) {
+      throw new IllegalArgumentException(field + " must contain exactly the V1 fields");
+    }
+  }
+
+  private static String requireText(JsonNode object, String field) {
+    JsonNode value = object.path(field);
+    if (!value.isTextual() || value.asText().isBlank()) {
+      throw new IllegalArgumentException(field + " must be a non-empty string");
+    }
+    return value.asText();
+  }
+
+  private static void requireCanonicalUuid(String value, String field) {
+    UUID parsed = UUID.fromString(value);
+    if (!parsed.toString().equalsIgnoreCase(value)) {
+      throw new IllegalArgumentException(field + " must be a canonical UUID");
+    }
   }
 
   private static void validateCreatedAt(String createdAt) {

@@ -6,7 +6,14 @@ from enum import StrEnum
 from typing import Any, Literal, Self
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 
 _RFC3339_DATE_TIME = re.compile(
@@ -39,6 +46,62 @@ class BuildStatus(StrEnum):
     PARTIAL_SUCCESS = "PARTIAL_SUCCESS"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
+
+
+class _StrictPayloadModel(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        strict=True,
+        serialize_by_alias=True,
+        validate_by_alias=True,
+        validate_by_name=True,
+    )
+
+
+class RequirementParsePayload(_StrictPayloadModel):
+    original_object_key: str = Field(alias="originalObjectKey", min_length=1)
+    normalized_object_key: str = Field(alias="normalizedObjectKey", min_length=1)
+
+
+class TargetSnapshot(_StrictPayloadModel):
+    profile_id: str = Field(alias="profileId", min_length=1)
+    profile_code: str = Field(alias="profileCode", min_length=1)
+    os: str = Field(min_length=1)
+    architecture: str = Field(min_length=1)
+    python_implementation: str = Field(alias="pythonImplementation", min_length=1)
+    python_version: str = Field(alias="pythonVersion", min_length=1)
+    python_full_version: str = Field(alias="pythonFullVersion", min_length=1)
+    platform_tag: str = Field(alias="platformTag", min_length=1)
+    abi_tags: list[str] = Field(alias="abiTags", min_length=1)
+    validation_type: str = Field(alias="validationType", min_length=1)
+    validation_policy_version: str = Field(
+        alias="validationPolicyVersion", min_length=1
+    )
+    profile_version: StrictInt = Field(alias="profileVersion", ge=0)
+
+    @field_validator("profile_id")
+    @classmethod
+    def require_canonical_profile_id(cls, profile_id: str) -> str:
+        return validate_canonical_uuid(profile_id, "profileId")
+
+    @field_validator("abi_tags")
+    @classmethod
+    def require_non_empty_abi_tags(cls, abi_tags: list[str]) -> list[str]:
+        if any(not value for value in abi_tags):
+            raise ValueError("abiTags must contain non-empty strings")
+        return abi_tags
+
+
+class BuildPayload(_StrictPayloadModel):
+    requirement_file_id: str = Field(alias="requirementFileId", min_length=1)
+    normalized_object_key: str = Field(alias="normalizedObjectKey", min_length=1)
+    solve_mode: Literal["COMPATIBLE"] = Field(alias="solveMode")
+    target_snapshot: TargetSnapshot = Field(alias="targetSnapshot")
+
+    @field_validator("requirement_file_id")
+    @classmethod
+    def require_canonical_requirement_file_id(cls, requirement_file_id: str) -> str:
+        return validate_canonical_uuid(requirement_file_id, "requirementFileId")
 
 
 class JobPayload(BaseModel):
@@ -84,6 +147,17 @@ class JobPayload(BaseModel):
         if not isinstance(payload, dict):
             raise ValueError("payload must be a JSON object")
         return payload
+
+    @model_validator(mode="after")
+    def require_job_type_payload(self) -> Self:
+        payload_type: type[RequirementParsePayload] | type[BuildPayload]
+        if self.job_type is JobType.REQUIREMENT_PARSE:
+            payload_type = RequirementParsePayload
+        else:
+            payload_type = BuildPayload
+        validated = payload_type.model_validate(self.payload)
+        self.payload = validated.model_dump(by_alias=True)
+        return self
 
     @field_validator("created_at", mode="before")
     @classmethod
@@ -166,6 +240,16 @@ def validate_rfc3339_created_at(created_at: Any) -> str:
         normalized = f"{normalized[:-1]}+00:00"
     datetime.fromisoformat(normalized)
     return created_at
+
+
+def validate_canonical_uuid(value: str, field: str) -> str:
+    try:
+        parsed = UUID(value)
+    except ValueError as error:
+        raise ValueError(f"{field} must be a canonical UUID") from error
+    if str(parsed).lower() != value.lower():
+        raise ValueError(f"{field} must be a canonical UUID")
+    return value
 
 
 def reject_non_standard_json_constant(constant: str) -> None:

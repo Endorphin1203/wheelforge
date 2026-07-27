@@ -105,21 +105,15 @@ public class BuildTaskService {
 
   @Transactional
   public BuildTaskView cancel(UUID userId, UUID taskId) {
-    BuildTaskEntity task = activeOwnedTask(userId, taskId);
+    BuildTaskEntity task = lockedActiveOwnedTask(userId, taskId);
     BuildStatus status = BuildStatus.valueOf(task.getStatus());
     if (isTerminal(status)) {
       return view(task);
     }
     task.requestCancellation();
-    if (status == BuildStatus.QUEUED) {
-      jobService
-          .findReadyBuildJob(task.getId())
-          .ifPresent(
-              job -> {
-                LocalDateTime now = now();
-                task.transitionTo(BuildStatus.CANCELLED, now);
-                job.cancel(now);
-              });
+    LocalDateTime now = now();
+    if (status == BuildStatus.QUEUED && jobService.cancelReadyBuildJob(task.getId(), now) == 1) {
+      task.transitionTo(BuildStatus.CANCELLED, now);
     }
     return view(task);
   }
@@ -158,7 +152,7 @@ public class BuildTaskService {
   public void delete(UUID userId, UUID taskId) {
     BuildTaskEntity task =
         taskRepository
-            .findByIdAndUserId(taskId.toString(), userId.toString())
+            .findByIdAndUserIdForUpdate(taskId.toString(), userId.toString())
             .orElseThrow(() -> ApiException.notFound("Build task was not found"));
     task.softDelete(now());
   }
@@ -182,6 +176,12 @@ public class BuildTaskService {
   private BuildTaskEntity activeOwnedTask(UUID userId, UUID taskId) {
     return taskRepository
         .findByIdAndUserIdAndDeletedAtIsNull(taskId.toString(), userId.toString())
+        .orElseThrow(() -> ApiException.notFound("Build task was not found"));
+  }
+
+  private BuildTaskEntity lockedActiveOwnedTask(UUID userId, UUID taskId) {
+    return taskRepository
+        .findByIdAndUserIdAndDeletedAtIsNullForUpdate(taskId.toString(), userId.toString())
         .orElseThrow(() -> ApiException.notFound("Build task was not found"));
   }
 

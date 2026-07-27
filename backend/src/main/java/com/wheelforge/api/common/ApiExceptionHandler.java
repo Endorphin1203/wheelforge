@@ -9,6 +9,7 @@ import java.util.Map;
 import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -186,6 +187,20 @@ public class ApiExceptionHandler implements AuthenticationEntryPoint, AccessDeni
         HttpStatus.NOT_ACCEPTABLE,
         "NOT_ACCEPTABLE",
         "Requested response content type is not acceptable",
+        Map.of());
+  }
+
+  @ExceptionHandler(OptimisticLockingFailureException.class)
+  public void handleConcurrentModification(
+      OptimisticLockingFailureException exception,
+      HttpServletRequest request,
+      HttpServletResponse response)
+      throws IOException {
+    write(
+        response,
+        HttpStatus.CONFLICT,
+        "CONCURRENT_MODIFICATION",
+        "The resource was modified concurrently",
         Map.of());
   }
 

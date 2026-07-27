@@ -6,6 +6,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
 
+import com.wheelforge.api.common.ApiException;
 import com.wheelforge.api.common.jobs.BuildJobRepository;
 import com.wheelforge.api.common.jobs.BuildJobService;
 import com.wheelforge.api.requirements.RequirementFileEntity;
@@ -22,6 +23,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.http.HttpStatus;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
@@ -39,6 +42,7 @@ class TaskThreeMySqlIntegrationTest {
   @Autowired private UserAccountRepository userRepository;
   @Autowired private RequirementFileRepository requirementFileRepository;
   @Autowired private TargetProfileRepository targetProfileRepository;
+  @Autowired private JdbcTemplate jdbcTemplate;
   @MockitoSpyBean private BuildJobService buildJobService;
 
   @DynamicPropertySource
@@ -86,6 +90,99 @@ class TaskThreeMySqlIntegrationTest {
             buildTaskRepository.findAllByUserIdAndDeletedAtIsNullOrderByCreatedAtDesc(
                 input.userId().toString()))
         .isEmpty();
+  }
+
+  @Test
+  void cancelFirstPreventsAWorkerClaimAndFinishesBothRows() {
+    TestInput input = seedParsedInput();
+    var created = create(input);
+
+    buildTaskService.cancel(input.userId(), created.id());
+    int claimed = claimReadyBuildJob(created.id());
+
+    assertThat(claimed).isZero();
+    BuildTaskEntity task = buildTaskRepository.findById(created.id().toString()).orElseThrow();
+    assertThat(task.getStatus()).isEqualTo(BuildStatus.CANCELLED.name());
+    assertThat(task.isCancelRequested()).isTrue();
+    assertThat(task.getFinishedAt()).isNotNull();
+    var job =
+        buildJobRepository
+            .findBySubjectIdAndJobType(created.id().toString(), "BUILD")
+            .orElseThrow();
+    assertThat(job.getStatus()).isEqualTo("CANCELLED");
+  }
+
+  @Test
+  void claimFirstPreservesCancellationFlagWithoutCancellingRunningJob() {
+    TestInput input = seedParsedInput();
+    var created = create(input);
+
+    assertThat(claimReadyBuildJob(created.id())).isOne();
+    buildTaskService.cancel(input.userId(), created.id());
+
+    BuildTaskEntity task = buildTaskRepository.findById(created.id().toString()).orElseThrow();
+    assertThat(task.getStatus()).isEqualTo(BuildStatus.QUEUED.name());
+    assertThat(task.isCancelRequested()).isTrue();
+    assertThat(task.getFinishedAt()).isNull();
+    var job =
+        buildJobRepository
+            .findBySubjectIdAndJobType(created.id().toString(), "BUILD")
+            .orElseThrow();
+    assertThat(job.getStatus()).isEqualTo("RUNNING");
+  }
+
+  @Test
+  void ownerQueriesHideCrossUserAndDeletedTasksAndListNewestFirst() {
+    TestInput input = seedParsedInput();
+    var first = create(input);
+    jdbcTemplate.update(
+        "update build_tasks set created_at = date_sub(created_at, interval 1 second) where id = ?",
+        first.id().toString());
+    var second = create(input);
+
+    assertThat(buildTaskService.get(input.userId(), first.id()).id()).isEqualTo(first.id());
+    assertThatThrownBy(() -> buildTaskService.get(UUID.randomUUID(), first.id()))
+        .isInstanceOf(ApiException.class)
+        .extracting(exception -> ((ApiException) exception).status())
+        .isEqualTo(HttpStatus.NOT_FOUND);
+    assertThat(buildTaskService.list(input.userId()))
+        .extracting(BuildTaskService.BuildTaskView::id)
+        .containsExactly(second.id(), first.id());
+
+    buildTaskService.delete(input.userId(), second.id());
+
+    assertThatThrownBy(() -> buildTaskService.get(input.userId(), second.id()))
+        .isInstanceOf(ApiException.class)
+        .extracting(exception -> ((ApiException) exception).status())
+        .isEqualTo(HttpStatus.NOT_FOUND);
+    assertThatThrownBy(() -> buildTaskService.retry(input.userId(), second.id()))
+        .isInstanceOf(ApiException.class)
+        .extracting(exception -> ((ApiException) exception).status())
+        .isEqualTo(HttpStatus.NOT_FOUND);
+    assertThat(buildTaskService.list(input.userId()))
+        .extracting(BuildTaskService.BuildTaskView::id)
+        .containsExactly(first.id());
+  }
+
+  private BuildTaskService.BuildTaskView create(TestInput input) {
+    return buildTaskService.create(
+        input.userId(),
+        new BuildTaskService.CreateBuildTaskRequest(
+            input.fileId(), input.profileId(), "COMPATIBLE"));
+  }
+
+  private int claimReadyBuildJob(UUID taskId) {
+    return jdbcTemplate.update(
+        """
+        update build_jobs
+           set status = 'RUNNING',
+               started_at = current_timestamp(6),
+               version_no = version_no + 1
+         where subject_id = ?
+           and job_type = 'BUILD'
+           and status = 'READY'
+        """,
+        taskId.toString());
   }
 
   private TestInput seedParsedInput() {
