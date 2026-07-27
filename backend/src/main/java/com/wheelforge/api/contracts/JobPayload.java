@@ -189,10 +189,14 @@ public record JobPayload(
   }
 
   private static boolean isUnicodeBlank(String value) {
+    // Python/ECMA-style contract whitespace adds only U+0085 to the Character API union.
     return value
         .codePoints()
         .allMatch(
-            codePoint -> Character.isWhitespace(codePoint) || Character.isSpaceChar(codePoint));
+            codePoint ->
+                codePoint == 0x0085
+                    || Character.isWhitespace(codePoint)
+                    || Character.isSpaceChar(codePoint));
   }
 
   private static void requireCanonicalUuid(String value, String field) {
