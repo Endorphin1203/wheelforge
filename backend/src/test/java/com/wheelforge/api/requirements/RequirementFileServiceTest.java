@@ -203,6 +203,49 @@ class RequirementFileServiceTest {
   }
 
   @Test
+  void cleansUpWhenTheMultipartStreamThrowsWhileClosingAfterPublication() throws Exception {
+    beginTransactionSynchronization();
+    byte[] content = "requests==2.32.4\n".getBytes(UTF_8);
+    var stream = new CloseFailingInputStream(content);
+    var upload =
+        new MockMultipartFile("file", "requirements.txt", "text/plain", content) {
+          @Override
+          public InputStream getInputStream() {
+            return stream;
+          }
+        };
+
+    assertThatThrownBy(() -> service.upload(USER_ID, upload))
+        .isInstanceOf(ApiException.class)
+        .extracting("status")
+        .isEqualTo(org.springframework.http.HttpStatus.BAD_REQUEST);
+    assertThat(stream.synchronizationWasRegisteredBeforeClose).isTrue();
+
+    TransactionSynchronizationManager.getSynchronizations()
+        .forEach(sync -> sync.afterCompletion(TransactionSynchronization.STATUS_ROLLED_BACK));
+
+    assertThat(Files.walk(tempDir).filter(Files::isRegularFile)).isEmpty();
+    verify(fileRepository, never()).save(any());
+    verify(buildJobService, never()).enqueue(any(), any(), any());
+  }
+
+  @Test
+  void deletesPublishedObjectImmediatelyWhenRollbackCleanupCannotBeRegistered() throws Exception {
+    TransactionSynchronizationManager.setActualTransactionActive(true);
+    var upload =
+        new MockMultipartFile(
+            "file", "requirements.txt", "text/plain", "requests==2.32.4\n".getBytes(UTF_8));
+
+    assertThatThrownBy(() -> service.upload(USER_ID, upload))
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessageContaining("synchronization is not active");
+
+    assertThat(Files.walk(tempDir).filter(Files::isRegularFile)).isEmpty();
+    verify(fileRepository, never()).save(any());
+    verify(buildJobService, never()).enqueue(any(), any(), any());
+  }
+
+  @Test
   void acceptsAnOriginalFilenameOfExactly255JavaCharacters() throws Exception {
     beginTransactionSynchronization();
     String filename = "a".repeat(251) + ".txt";
@@ -250,6 +293,22 @@ class RequirementFileServiceTest {
     public void close() throws IOException {
       closed = true;
       super.close();
+    }
+  }
+
+  private static final class CloseFailingInputStream extends ByteArrayInputStream {
+    private boolean synchronizationWasRegisteredBeforeClose;
+
+    private CloseFailingInputStream(byte[] content) {
+      super(content);
+    }
+
+    @Override
+    public void close() throws IOException {
+      synchronizationWasRegisteredBeforeClose =
+          !TransactionSynchronizationManager.getSynchronizations().isEmpty();
+      super.close();
+      throw new IOException("close failed after complete read");
     }
   }
 }

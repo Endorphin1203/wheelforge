@@ -38,6 +38,7 @@ class LocalFileStorageTest {
         .isEqualTo(content);
 
     storage.deleteIfExists("users/user-id/requirements/file-id/original.txt");
+    storage.deleteIfExists("users/user-id/requirements/file-id/original.txt");
 
     assertThat(tempDir.resolve("users/user-id/requirements/file-id/original.txt")).doesNotExist();
   }
@@ -299,6 +300,51 @@ class LocalFileStorageTest {
     try (var files = Files.list(object.getParent())) {
       assertThat(files.map(path -> path.getFileName().toString())).containsExactly("original.txt");
     }
+  }
+
+  @Test
+  void secureProviderRejectsSymbolicLinkObjectsForEveryOperation() throws Exception {
+    Path root = Files.createDirectory(tempDir.resolve("secure-object-root"));
+    String key = "users/user-id/requirements/file-id/original.txt";
+    Path object = root.resolve(key);
+    Files.createDirectories(object.getParent());
+    Path outside = Files.writeString(tempDir.resolve("secure-outside-object.txt"), "must remain");
+    Files.createSymbolicLink(object, outside);
+
+    try (var storage = secureStorage(root.toAbsolutePath())) {
+      assertThatThrownBy(
+              () ->
+                  storage.putAtomically(
+                      key, new ByteArrayInputStream("replacement".getBytes(UTF_8)), 11))
+          .isInstanceOf(IllegalArgumentException.class);
+      assertThatThrownBy(() -> storage.open(key)).isInstanceOf(IllegalArgumentException.class);
+      assertThatThrownBy(() -> storage.deleteIfExists(key))
+          .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    assertThat(object).isSymbolicLink();
+    assertThat(outside).hasContent("must remain");
+  }
+
+  @Test
+  void secureProviderRejectsNonRegularObjectsForEveryOperation() throws Exception {
+    Path root = Files.createDirectory(tempDir.resolve("secure-directory-object-root"));
+    String key = "users/user-id/requirements/file-id/original.txt";
+    Path object = root.resolve(key);
+    Files.createDirectories(object);
+
+    try (var storage = secureStorage(root.toAbsolutePath())) {
+      assertThatThrownBy(
+              () ->
+                  storage.putAtomically(
+                      key, new ByteArrayInputStream("replacement".getBytes(UTF_8)), 11))
+          .isInstanceOf(IllegalArgumentException.class);
+      assertThatThrownBy(() -> storage.open(key)).isInstanceOf(IllegalArgumentException.class);
+      assertThatThrownBy(() -> storage.deleteIfExists(key))
+          .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    assertThat(object).isDirectory();
   }
 
   @Test

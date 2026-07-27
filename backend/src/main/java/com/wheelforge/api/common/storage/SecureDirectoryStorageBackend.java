@@ -48,6 +48,7 @@ final class SecureDirectoryStorageBackend implements LocalStorageBackend {
       try {
         StorageObjectWriter.WriteResult result =
             StorageObjectWriter.write(temporary.channel(), input, expectedSize);
+        requireRegularObjectIfPresent(parent.directory(), objectKey.fileName());
         parent.directory().move(temporary.name(), parent.directory(), objectKey.fileName());
         published = true;
         return new LocalFileStorage.StoredObject(key, result.sizeBytes(), result.sha256());
@@ -73,6 +74,7 @@ final class SecureDirectoryStorageBackend implements LocalStorageBackend {
     StorageObjectKey objectKey = StorageObjectKey.parse(key);
     SeekableByteChannel channel;
     try (OpenedDirectory parent = openDirectory(objectKey.parent())) {
+      requireRegularObject(parent.directory(), objectKey.fileName());
       channel = parent.directory().newByteChannel(objectKey.fileName(), READ_OPTIONS);
     } catch (IllegalArgumentException exception) {
       throw exception;
@@ -86,11 +88,10 @@ final class SecureDirectoryStorageBackend implements LocalStorageBackend {
   public void deleteIfExists(String key) {
     StorageObjectKey objectKey = StorageObjectKey.parse(key);
     try (OpenedDirectory parent = openDirectory(objectKey.parent())) {
-      try {
-        parent.directory().deleteFile(objectKey.fileName());
-      } catch (NoSuchFileException ignored) {
+      if (!requireRegularObjectIfPresent(parent.directory(), objectKey.fileName())) {
         return;
       }
+      parent.directory().deleteFile(objectKey.fileName());
     } catch (NoSuchFileException ignored) {
       return;
     } catch (IllegalArgumentException exception) {
@@ -150,6 +151,29 @@ final class SecureDirectoryStorageBackend implements LocalStorageBackend {
     } catch (IOException | RuntimeException exception) {
       closeOpenedDirectories(opened);
       throw exception;
+    }
+  }
+
+  private void requireRegularObject(SecureDirectoryStream<Path> parent, Path fileName)
+      throws IOException {
+    if (!requireRegularObjectIfPresent(parent, fileName)) {
+      throw new NoSuchFileException(fileName.toString());
+    }
+  }
+
+  private boolean requireRegularObjectIfPresent(SecureDirectoryStream<Path> parent, Path fileName)
+      throws IOException {
+    BasicFileAttributeView view =
+        parent.getFileAttributeView(
+            fileName, BasicFileAttributeView.class, LinkOption.NOFOLLOW_LINKS);
+    try {
+      BasicFileAttributes attributes = view.readAttributes();
+      if (attributes.isSymbolicLink() || !attributes.isRegularFile()) {
+        throw new IllegalArgumentException("Object key refers to an unsafe object");
+      }
+      return true;
+    } catch (NoSuchFileException ignored) {
+      return false;
     }
   }
 

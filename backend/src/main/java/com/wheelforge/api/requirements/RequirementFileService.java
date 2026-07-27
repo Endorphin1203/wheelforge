@@ -72,18 +72,28 @@ public class RequirementFileService {
     String originalKey = baseKey + "/original.txt";
     String normalizedKey = baseKey + "/normalized.txt";
     LocalFileStorage.StoredObject stored;
+    boolean published = false;
+    boolean rollbackCleanupRegistered = false;
     try (InputStream input = new NulRejectingInputStream(upload.getInputStream())) {
       stored = storage.putAtomically(originalKey, input, upload.getSize());
+      published = true;
+      registerRollbackCleanup(originalKey);
+      rollbackCleanupRegistered = true;
     } catch (NulByteException exception) {
+      cleanupBeforeRegistration(originalKey, published, rollbackCleanupRegistered, exception);
       throw ApiException.badRequest(
           "INVALID_REQUIREMENT_FILE", "Requirements files must not contain NUL bytes");
     } catch (LocalFileStorage.SizeMismatchException exception) {
+      cleanupBeforeRegistration(originalKey, published, rollbackCleanupRegistered, exception);
       throw ApiException.payloadTooLarge("Requirements file exceeds 512 KiB");
     } catch (IOException exception) {
+      cleanupBeforeRegistration(originalKey, published, rollbackCleanupRegistered, exception);
       throw ApiException.badRequest(
           "INVALID_REQUIREMENT_FILE", "Requirements file could not be read");
+    } catch (RuntimeException | Error exception) {
+      cleanupBeforeRegistration(originalKey, published, rollbackCleanupRegistered, exception);
+      throw exception;
     }
-    registerRollbackCleanup(originalKey);
 
     LocalDateTime createdAt = LocalDateTime.ofInstant(clock.instant(), ZoneOffset.UTC);
     var entity =
@@ -145,7 +155,6 @@ public class RequirementFileService {
 
   private void registerRollbackCleanup(String objectKey) {
     if (!TransactionSynchronizationManager.isSynchronizationActive()) {
-      storage.deleteIfExists(objectKey);
       throw new IllegalStateException("Upload transaction synchronization is not active");
     }
     TransactionSynchronizationManager.registerSynchronization(
@@ -157,6 +166,18 @@ public class RequirementFileService {
             }
           }
         });
+  }
+
+  private void cleanupBeforeRegistration(
+      String objectKey, boolean published, boolean cleanupRegistered, Throwable originalFailure) {
+    if (!published || cleanupRegistered) {
+      return;
+    }
+    try {
+      storage.deleteIfExists(objectKey);
+    } catch (RuntimeException cleanupFailure) {
+      originalFailure.addSuppressed(cleanupFailure);
+    }
   }
 
   private void requireActiveTransaction() {
