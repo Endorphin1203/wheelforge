@@ -62,4 +62,10 @@ public class BuildJobService {
         .put("originalObjectKey", originalObjectKey)
         .put("normalizedObjectKey", normalizedObjectKey);
   }
+
+  public java.util.Optional<BuildJobEntity> findReadyBuildJob(String subjectId) {
+    return repository
+        .findBySubjectIdAndJobType(subjectId, "BUILD")
+        .filter(job -> "READY".equals(job.getStatus()));
+  }
 }

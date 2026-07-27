@@ -137,4 +137,13 @@ public class BuildJobEntity {
   public LocalDateTime getCreatedAt() {
     return createdAt;
   }
+
+  public LocalDateTime getFinishedAt() {
+    return finishedAt;
+  }
+
+  public void cancel(LocalDateTime finishedAt) {
+    this.status = "CANCELLED";
+    this.finishedAt = finishedAt;
+  }
 }

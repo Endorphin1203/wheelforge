@@ -130,4 +130,8 @@ public class TargetProfileEntity {
   public boolean isEnabled() {
     return enabled;
   }
+
+  public long getVersionNo() {
+    return versionNo;
+  }
 }

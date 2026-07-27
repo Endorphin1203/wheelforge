@@ -28,6 +28,7 @@ class WheelForgeApplicationTest {
   private com.wheelforge.api.requirements.RequirementItemRepository requirementItemRepository;
 
   @MockitoBean private com.wheelforge.api.target.TargetProfileRepository targetProfileRepository;
+  @MockitoBean private com.wheelforge.api.build.BuildTaskRepository buildTaskRepository;
   @MockitoBean private com.wheelforge.api.common.storage.LocalFileStorage localFileStorage;
 
   @Test
