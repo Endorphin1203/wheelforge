@@ -215,14 +215,14 @@ def test_schema_accepts_valid_shared_fixtures() -> None:
     validator = schema_validator()
 
     for fixture in valid_shared_fixtures():
-        assert list(validator.iter_errors(load_json_fixture(fixture))) == []
+        assert list(validator.iter_errors(load_schema_fixture(fixture))) == []
 
 
 def test_schema_rejects_invalid_shared_fixtures() -> None:
     validator = schema_validator()
 
     for fixture in sorted(INVALID_FIXTURES.glob("*.json")):
-        assert list(validator.iter_errors(load_json_fixture(fixture)))
+        assert list(validator.iter_errors(load_schema_fixture(fixture)))
 
 
 def test_schema_date_time_format_checking_is_active() -> None:
@@ -256,6 +256,12 @@ def valid_shared_fixtures() -> list[Path]:
 
 def load_json_fixture(fixture: Path) -> object:
     return load_json_text(fixture.read_text())
+
+
+def load_schema_fixture(fixture: Path) -> object:
+    return json.loads(
+        fixture.read_text(), parse_constant=reject_non_standard_json_constant
+    )
 
 
 def load_json_text(value: str) -> object:

@@ -101,13 +101,7 @@ class JobPayloadContractTest {
 
   @Test
   void readsSchemaValidEdgeFixtures() throws Exception {
-    for (String fixture :
-        List.of(
-            "uppercase-uuid-v1.json",
-            "schema-version-decimal-v1.json",
-            "lowercase-t-z-v1.json",
-            "max-colon-offset-v1.json",
-            "long-fraction-v1.json")) {
+    for (String fixture : listFixtureNames("valid")) {
       var payload = objectMapper.readValue(readValidFixture(fixture), JobPayload.class);
 
       assertThat(payload.schemaVersion()).isEqualTo(1);
@@ -170,21 +164,7 @@ class JobPayloadContractTest {
 
   @Test
   void rejectsInvalidSharedFixturesDuringDeserialization() throws Exception {
-    for (String fixture :
-        List.of(
-            "extra-top-level-v1.json",
-            "schema-version-string-v1.json",
-            "schema-version-boolean-v1.json",
-            "schema-version-fraction-v1.json",
-            "schema-version-below-one-v1.json",
-            "schema-version-above-one-v1.json",
-            "basic-offset-v1.json",
-            "leap-second-v1.json",
-            "space-datetime-v1.json",
-            "year-zero-v1.json",
-            "noncanonical-uuid-v1.json",
-            "numeric-created-at-v1.json",
-            "snake-case-keys-v1.json")) {
+    for (String fixture : listFixtureNames("invalid")) {
       assertThatThrownBy(
               () -> objectMapper.readValue(readInvalidFixture(fixture), JobPayload.class))
           .isInstanceOf(Exception.class);
@@ -242,5 +222,15 @@ class JobPayloadContractTest {
 
   private String readValidFixture(String fileName) throws Exception {
     return Files.readString(Path.of("..", "contracts", "examples", "valid", fileName));
+  }
+
+  private List<String> listFixtureNames(String directory) throws Exception {
+    try (var fixtures = Files.list(Path.of("..", "contracts", "examples", directory))) {
+      return fixtures
+          .filter(path -> path.getFileName().toString().endsWith(".json"))
+          .map(path -> path.getFileName().toString())
+          .sorted()
+          .toList();
+    }
   }
 }

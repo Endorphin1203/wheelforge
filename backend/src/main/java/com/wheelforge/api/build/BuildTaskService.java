@@ -105,14 +105,23 @@ public class BuildTaskService {
 
   @Transactional
   public BuildTaskView cancel(UUID userId, UUID taskId) {
+    String initialStatus =
+        taskRepository
+            .findStatusByIdAndUserIdAndDeletedAtIsNull(taskId.toString(), userId.toString())
+            .orElseThrow(() -> ApiException.notFound("Build task was not found"));
+    LocalDateTime now = now();
+    int cancelledReadyJob =
+        BuildStatus.QUEUED.name().equals(initialStatus)
+            ? jobService.cancelReadyBuildJob(taskId.toString(), now)
+            : 0;
+
     BuildTaskEntity task = lockedActiveOwnedTask(userId, taskId);
     BuildStatus status = BuildStatus.valueOf(task.getStatus());
     if (isTerminal(status)) {
       return view(task);
     }
     task.requestCancellation();
-    LocalDateTime now = now();
-    if (status == BuildStatus.QUEUED && jobService.cancelReadyBuildJob(task.getId(), now) == 1) {
+    if (status == BuildStatus.QUEUED && cancelledReadyJob == 1) {
       task.transitionTo(BuildStatus.CANCELLED, now);
     }
     return view(task);

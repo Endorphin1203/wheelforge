@@ -23,6 +23,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.webmvc.test.autoconfigure.WebMvcTest;
 import org.springframework.context.annotation.Import;
 import org.springframework.dao.OptimisticLockingFailureException;
+import org.springframework.dao.PessimisticLockingFailureException;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
@@ -112,6 +113,19 @@ class BuildTaskControllerTest {
   void mapsConcurrentModificationToStableConflictResponse() throws Exception {
     given(service.cancel(USER_ID, TASK_ID))
         .willThrow(new OptimisticLockingFailureException("stale build task"));
+
+    mvc.perform(
+            post("/api/build-tasks/{id}/cancel", TASK_ID)
+                .header(HttpHeaders.AUTHORIZATION, bearerToken()))
+        .andExpect(status().isConflict())
+        .andExpect(jsonPath("$.code").value("CONCURRENT_MODIFICATION"))
+        .andExpect(jsonPath("$.message").value("The resource was modified concurrently"));
+  }
+
+  @Test
+  void mapsDatabaseLockFailureToStableConflictResponse() throws Exception {
+    given(service.cancel(USER_ID, TASK_ID))
+        .willThrow(new PessimisticLockingFailureException("database lock timeout"));
 
     mvc.perform(
             post("/api/build-tasks/{id}/cancel", TASK_ID)

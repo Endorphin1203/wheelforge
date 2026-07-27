@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.BDDMockito.given;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 
@@ -226,6 +227,10 @@ class BuildTaskServiceTest {
   void cancelsReadyQueuedTaskAndBuildJobTogether() {
     var task = task(BuildStatus.QUEUED, null, null);
     given(
+            taskRepository.findStatusByIdAndUserIdAndDeletedAtIsNull(
+                TASK_ID.toString(), USER_ID.toString()))
+        .willReturn(Optional.of(BuildStatus.QUEUED.name()));
+    given(
             taskRepository.findByIdAndUserIdAndDeletedAtIsNullForUpdate(
                 TASK_ID.toString(), USER_ID.toString()))
         .willReturn(Optional.of(task));
@@ -237,6 +242,16 @@ class BuildTaskServiceTest {
 
     service.cancel(USER_ID, TASK_ID);
 
+    var order = inOrder(taskRepository, jobRepository);
+    order
+        .verify(taskRepository)
+        .findStatusByIdAndUserIdAndDeletedAtIsNull(TASK_ID.toString(), USER_ID.toString());
+    order
+        .verify(jobRepository)
+        .cancelReadyBuildJob(TASK_ID.toString(), NOW.atOffset(ZoneOffset.UTC).toLocalDateTime());
+    order
+        .verify(taskRepository)
+        .findByIdAndUserIdAndDeletedAtIsNullForUpdate(TASK_ID.toString(), USER_ID.toString());
     assertThat(task.getStatus()).isEqualTo(BuildStatus.CANCELLED.name());
     assertThat(task.isCancelRequested()).isTrue();
     assertThat(task.getFinishedAt()).isEqualTo(NOW.atOffset(ZoneOffset.UTC).toLocalDateTime());
@@ -244,7 +259,11 @@ class BuildTaskServiceTest {
 
   @Test
   void preservesCancellationFlagWhenWorkerClaimWinsTheReadyJobCas() {
-    var task = task(BuildStatus.QUEUED, null, null);
+    var task = task(BuildStatus.RESOLVING, null, null);
+    given(
+            taskRepository.findStatusByIdAndUserIdAndDeletedAtIsNull(
+                TASK_ID.toString(), USER_ID.toString()))
+        .willReturn(Optional.of(BuildStatus.QUEUED.name()));
     given(
             taskRepository.findByIdAndUserIdAndDeletedAtIsNullForUpdate(
                 TASK_ID.toString(), USER_ID.toString()))
@@ -257,7 +276,17 @@ class BuildTaskServiceTest {
 
     service.cancel(USER_ID, TASK_ID);
 
-    assertThat(task.getStatus()).isEqualTo(BuildStatus.QUEUED.name());
+    var order = inOrder(taskRepository, jobRepository);
+    order
+        .verify(taskRepository)
+        .findStatusByIdAndUserIdAndDeletedAtIsNull(TASK_ID.toString(), USER_ID.toString());
+    order
+        .verify(jobRepository)
+        .cancelReadyBuildJob(TASK_ID.toString(), NOW.atOffset(ZoneOffset.UTC).toLocalDateTime());
+    order
+        .verify(taskRepository)
+        .findByIdAndUserIdAndDeletedAtIsNullForUpdate(TASK_ID.toString(), USER_ID.toString());
+    assertThat(task.getStatus()).isEqualTo(BuildStatus.RESOLVING.name());
     assertThat(task.isCancelRequested()).isTrue();
     assertThat(task.getFinishedAt()).isNull();
   }
@@ -265,6 +294,10 @@ class BuildTaskServiceTest {
   @Test
   void marksRunningTaskForCancellationWithoutChangingItsStatus() {
     var task = task(BuildStatus.RESOLVING, null, null);
+    given(
+            taskRepository.findStatusByIdAndUserIdAndDeletedAtIsNull(
+                TASK_ID.toString(), USER_ID.toString()))
+        .willReturn(Optional.of(BuildStatus.RESOLVING.name()));
     given(
             taskRepository.findByIdAndUserIdAndDeletedAtIsNullForUpdate(
                 TASK_ID.toString(), USER_ID.toString()))
@@ -274,6 +307,7 @@ class BuildTaskServiceTest {
 
     assertThat(task.getStatus()).isEqualTo(BuildStatus.RESOLVING.name());
     assertThat(task.isCancelRequested()).isTrue();
+    verifyNoInteractions(jobRepository);
   }
 
   @Test
@@ -281,6 +315,10 @@ class BuildTaskServiceTest {
     var finishedAt = NOW.minusSeconds(60).atOffset(ZoneOffset.UTC).toLocalDateTime();
     var task = task(BuildStatus.VALIDATING, null, null);
     task.transitionTo(BuildStatus.FAILED, finishedAt);
+    given(
+            taskRepository.findStatusByIdAndUserIdAndDeletedAtIsNull(
+                TASK_ID.toString(), USER_ID.toString()))
+        .willReturn(Optional.of(BuildStatus.FAILED.name()));
     given(
             taskRepository.findByIdAndUserIdAndDeletedAtIsNullForUpdate(
                 TASK_ID.toString(), USER_ID.toString()))
@@ -291,6 +329,22 @@ class BuildTaskServiceTest {
     assertThat(task.isCancelRequested()).isFalse();
     assertThat(task.getStatus()).isEqualTo(BuildStatus.FAILED.name());
     assertThat(task.getFinishedAt()).isEqualTo(finishedAt);
+    verifyNoInteractions(jobRepository);
+  }
+
+  @Test
+  void cancellationDoesNotTouchAJobBeforeConfirmingActiveOwnership() {
+    given(
+            taskRepository.findStatusByIdAndUserIdAndDeletedAtIsNull(
+                TASK_ID.toString(), USER_ID.toString()))
+        .willReturn(Optional.empty());
+
+    assertThatThrownBy(() -> service().cancel(USER_ID, TASK_ID))
+        .isInstanceOf(ApiException.class)
+        .extracting(exception -> ((ApiException) exception).status())
+        .isEqualTo(HttpStatus.NOT_FOUND);
+
+    verifyNoInteractions(jobRepository);
   }
 
   @ParameterizedTest

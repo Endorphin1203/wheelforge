@@ -15,6 +15,16 @@ public interface BuildTaskRepository extends JpaRepository<BuildTaskEntity, Stri
 
   Optional<BuildTaskEntity> findByIdAndUserId(String id, String userId);
 
+  @Query(
+      """
+      select task.status from BuildTaskEntity task
+       where task.id = :id
+         and task.userId = :userId
+         and task.deletedAt is null
+      """)
+  Optional<String> findStatusByIdAndUserIdAndDeletedAtIsNull(
+      @Param("id") String id, @Param("userId") String userId);
+
   @Lock(LockModeType.PESSIMISTIC_WRITE)
   @Query(
       """

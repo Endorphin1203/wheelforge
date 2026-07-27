@@ -162,7 +162,9 @@ public record JobPayload(
       }
     }
     JsonNode profileVersion = snapshot.path("profileVersion");
-    if (!profileVersion.isIntegralNumber() || profileVersion.asLong() < 0) {
+    if (!profileVersion.isNumber()
+        || profileVersion.decimalValue().signum() < 0
+        || profileVersion.decimalValue().stripTrailingZeros().scale() > 0) {
       throw new IllegalArgumentException("profileVersion must be a non-negative integer");
     }
   }

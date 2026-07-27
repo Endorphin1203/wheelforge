@@ -36,8 +36,8 @@
       "type": "object",
       "required": ["originalObjectKey", "normalizedObjectKey"],
       "properties": {
-        "originalObjectKey": {"type": "string", "minLength": 1},
-        "normalizedObjectKey": {"type": "string", "minLength": 1}
+        "originalObjectKey": {"type": "string", "minLength": 1, "pattern": "\\S"},
+        "normalizedObjectKey": {"type": "string", "minLength": 1, "pattern": "\\S"}
       },
       "additionalProperties": false
     },
@@ -55,7 +55,7 @@
           "format": "uuid",
           "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
         },
-        "normalizedObjectKey": {"type": "string", "minLength": 1},
+        "normalizedObjectKey": {"type": "string", "minLength": 1, "pattern": "\\S"},
         "solveMode": {"const": "COMPATIBLE"},
         "targetSnapshot": {"$ref": "#/$defs/targetSnapshot"}
       },
@@ -83,20 +83,20 @@
           "format": "uuid",
           "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
         },
-        "profileCode": {"type": "string", "minLength": 1},
-        "os": {"type": "string", "minLength": 1},
-        "architecture": {"type": "string", "minLength": 1},
-        "pythonImplementation": {"type": "string", "minLength": 1},
-        "pythonVersion": {"type": "string", "minLength": 1},
-        "pythonFullVersion": {"type": "string", "minLength": 1},
-        "platformTag": {"type": "string", "minLength": 1},
+        "profileCode": {"type": "string", "minLength": 1, "pattern": "\\S"},
+        "os": {"type": "string", "minLength": 1, "pattern": "\\S"},
+        "architecture": {"type": "string", "minLength": 1, "pattern": "\\S"},
+        "pythonImplementation": {"type": "string", "minLength": 1, "pattern": "\\S"},
+        "pythonVersion": {"type": "string", "minLength": 1, "pattern": "\\S"},
+        "pythonFullVersion": {"type": "string", "minLength": 1, "pattern": "\\S"},
+        "platformTag": {"type": "string", "minLength": 1, "pattern": "\\S"},
         "abiTags": {
           "type": "array",
           "minItems": 1,
-          "items": {"type": "string", "minLength": 1}
+          "items": {"type": "string", "minLength": 1, "pattern": "\\S"}
         },
-        "validationType": {"type": "string", "minLength": 1},
-        "validationPolicyVersion": {"type": "string", "minLength": 1},
+        "validationType": {"type": "string", "minLength": 1, "pattern": "\\S"},
+        "validationPolicyVersion": {"type": "string", "minLength": 1, "pattern": "\\S"},
         "profileVersion": {"type": "integer", "minimum": 0}
       },
       "additionalProperties": false

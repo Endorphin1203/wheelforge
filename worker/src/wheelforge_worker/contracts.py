@@ -57,6 +57,13 @@ class _StrictPayloadModel(BaseModel):
         validate_by_name=True,
     )
 
+    @field_validator("*", check_fields=False)
+    @classmethod
+    def require_non_blank_strings(cls, value: Any) -> Any:
+        if isinstance(value, str) and not value.strip():
+            raise ValueError("payload strings must not be blank")
+        return value
+
 
 class RequirementParsePayload(_StrictPayloadModel):
     original_object_key: str = Field(alias="originalObjectKey", min_length=1)
@@ -79,6 +86,17 @@ class TargetSnapshot(_StrictPayloadModel):
     )
     profile_version: StrictInt = Field(alias="profileVersion", ge=0)
 
+    @field_validator("profile_version", mode="before")
+    @classmethod
+    def require_mathematical_integer(cls, profile_version: Any) -> int:
+        if isinstance(profile_version, bool):
+            raise ValueError("profileVersion must be a non-negative integer")
+        if isinstance(profile_version, int):
+            return profile_version
+        if isinstance(profile_version, Decimal) and profile_version == profile_version.to_integral():
+            return int(profile_version)
+        raise ValueError("profileVersion must be a non-negative integer")
+
     @field_validator("profile_id")
     @classmethod
     def require_canonical_profile_id(cls, profile_id: str) -> str:
@@ -87,7 +105,7 @@ class TargetSnapshot(_StrictPayloadModel):
     @field_validator("abi_tags")
     @classmethod
     def require_non_empty_abi_tags(cls, abi_tags: list[str]) -> list[str]:
-        if any(not value for value in abi_tags):
+        if any(not value.strip() for value in abi_tags):
             raise ValueError("abiTags must contain non-empty strings")
         return abi_tags
 

@@ -10,6 +10,7 @@ import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.OptimisticLockingFailureException;
+import org.springframework.dao.PessimisticLockingFailureException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -190,11 +191,12 @@ public class ApiExceptionHandler implements AuthenticationEntryPoint, AccessDeni
         Map.of());
   }
 
-  @ExceptionHandler(OptimisticLockingFailureException.class)
+  @ExceptionHandler({
+    OptimisticLockingFailureException.class,
+    PessimisticLockingFailureException.class
+  })
   public void handleConcurrentModification(
-      OptimisticLockingFailureException exception,
-      HttpServletRequest request,
-      HttpServletResponse response)
+      RuntimeException exception, HttpServletRequest request, HttpServletResponse response)
       throws IOException {
     write(
         response,
