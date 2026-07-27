@@ -2,7 +2,8 @@
 .superpowers/sdd/
 .mvn/timing.properties
 .mvn/wrapper/maven-wrapper.jar
-target/
+/target/
+/backend/target/
 worker/.venv/
 worker/.pytest_cache/
 worker/.mypy_cache/

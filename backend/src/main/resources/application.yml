@@ -4,10 +4,15 @@ spring:
     username: ${WF_DATABASE_USER:wheelforge}
     password: ${WF_DATABASE_PASSWORD:wheelforge_local}
   jpa:
+    open-in-view: false
     hibernate:
       ddl-auto: validate
   flyway:
     enabled: true
+  servlet:
+    multipart:
+      max-file-size: 512KB
+      max-request-size: 1MB
 
 wheelforge:
   auth:

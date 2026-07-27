@@ -19,6 +19,16 @@ import org.springframework.test.context.bean.override.mockito.MockitoBean;
 class WheelForgeApplicationTest {
   @Autowired private ApplicationContext context;
   @MockitoBean private com.wheelforge.api.security.UserAccountRepository userAccountRepository;
+  @MockitoBean private com.wheelforge.api.common.jobs.BuildJobRepository buildJobRepository;
+
+  @MockitoBean
+  private com.wheelforge.api.requirements.RequirementFileRepository requirementFileRepository;
+
+  @MockitoBean
+  private com.wheelforge.api.requirements.RequirementItemRepository requirementItemRepository;
+
+  @MockitoBean private com.wheelforge.api.target.TargetProfileRepository targetProfileRepository;
+  @MockitoBean private com.wheelforge.api.common.storage.LocalFileStorage localFileStorage;
 
   @Test
   void contextLoads() {

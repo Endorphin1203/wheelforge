@@ -26,6 +26,8 @@ import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
+import org.springframework.web.multipart.MaxUploadSizeExceededException;
+import org.springframework.web.multipart.support.MissingServletRequestPartException;
 import org.springframework.web.servlet.NoHandlerFoundException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 import tools.jackson.databind.ObjectMapper;
@@ -39,6 +41,27 @@ public class ApiExceptionHandler implements AuthenticationEntryPoint, AccessDeni
 
   public ApiExceptionHandler(ObjectMapper objectMapper) {
     this.objectMapper = objectMapper;
+  }
+
+  @ExceptionHandler(ApiException.class)
+  public void handleApiException(
+      ApiException exception, HttpServletRequest request, HttpServletResponse response)
+      throws IOException {
+    write(response, exception.status(), exception.code(), exception.getMessage(), Map.of());
+  }
+
+  @ExceptionHandler(MaxUploadSizeExceededException.class)
+  public void handleUploadTooLarge(
+      MaxUploadSizeExceededException exception,
+      HttpServletRequest request,
+      HttpServletResponse response)
+      throws IOException {
+    write(
+        response,
+        HttpStatus.PAYLOAD_TOO_LARGE,
+        "FILE_TOO_LARGE",
+        "Requirements file exceeds 512 KiB",
+        Map.of());
   }
 
   @ExceptionHandler(AuthenticationFailedException.class)
@@ -123,11 +146,12 @@ public class ApiExceptionHandler implements AuthenticationEntryPoint, AccessDeni
         Map.of());
   }
 
-  @ExceptionHandler(MissingServletRequestParameterException.class)
+  @ExceptionHandler({
+    MissingServletRequestParameterException.class,
+    MissingServletRequestPartException.class
+  })
   public void handleMissingParameter(
-      MissingServletRequestParameterException exception,
-      HttpServletRequest request,
-      HttpServletResponse response)
+      Exception exception, HttpServletRequest request, HttpServletResponse response)
       throws IOException {
     write(
         response,
