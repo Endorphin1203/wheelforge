@@ -157,7 +157,7 @@ public record JobPayload(
       throw new IllegalArgumentException("abiTags must be a non-empty array");
     }
     for (JsonNode abiTag : abiTags) {
-      if (!abiTag.isTextual() || abiTag.asText().isBlank()) {
+      if (!abiTag.isTextual() || isUnicodeBlank(abiTag.asText())) {
         throw new IllegalArgumentException("abiTags must contain non-empty strings");
       }
     }
@@ -182,10 +182,17 @@ public record JobPayload(
 
   private static String requireText(JsonNode object, String field) {
     JsonNode value = object.path(field);
-    if (!value.isTextual() || value.asText().isBlank()) {
+    if (!value.isTextual() || isUnicodeBlank(value.asText())) {
       throw new IllegalArgumentException(field + " must be a non-empty string");
     }
     return value.asText();
+  }
+
+  private static boolean isUnicodeBlank(String value) {
+    return value
+        .codePoints()
+        .allMatch(
+            codePoint -> Character.isWhitespace(codePoint) || Character.isSpaceChar(codePoint));
   }
 
   private static void requireCanonicalUuid(String value, String field) {
