@@ -120,6 +120,10 @@ public class RequirementFileService {
 
   private void validateMetadata(MultipartFile upload) {
     String filename = upload.getOriginalFilename();
+    if (filename != null && filename.length() > 255) {
+      throw ApiException.badRequest(
+          "INVALID_REQUIREMENT_FILE", "Original filename must not exceed 255 characters");
+    }
     if (filename == null || !filename.toLowerCase(Locale.ROOT).endsWith(".txt")) {
       throw ApiException.badRequest(
           "INVALID_REQUIREMENT_FILE", "Only .txt requirements files are supported");

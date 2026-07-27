@@ -9,7 +9,6 @@ import com.wheelforge.api.requirements.RequirementFileRepository;
 import com.wheelforge.api.requirements.RequirementItemRepository;
 import com.wheelforge.api.target.TargetProfileRepository;
 import java.lang.reflect.Proxy;
-import java.nio.file.Path;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.test.context.runner.WebApplicationContextRunner;
@@ -75,8 +74,7 @@ class TokenSecretContextTest {
 
     @Bean
     LocalFileStorage localFileStorage() {
-      return new LocalFileStorage(
-          Path.of(System.getProperty("java.io.tmpdir"), "wheelforge-token-secret-context-test"));
+      return org.mockito.Mockito.mock(LocalFileStorage.class);
     }
 
     private static <T> T repositoryProxy(Class<T> repositoryType) {

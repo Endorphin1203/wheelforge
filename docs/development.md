@@ -78,6 +78,23 @@ set -a
 set +a
 ```
 
+`WF_DATA_ROOT` is a security boundary. The API and Python Worker must read and
+write the same data root. Prefer running both processes as one dedicated
+WheelForge service identity; alternatively, use an ACL that grants access only
+to their two dedicated identities. On POSIX systems, use mode `0700` for the
+shared identity or an equivalent narrowly scoped ACL. On Windows, use an NTFS
+ACL limited to the API and Worker service identities plus administrators.
+Ordinary users and unrelated services must not have write access.
+
+When the filesystem provider supports `SecureDirectoryStream`, storage uses
+descriptor-relative traversal for object operations. Other providers use the
+cross-platform fallback: normalized relative keys, per-segment no-follow
+checks, same-directory temporary files, and atomic publication. Pure Java
+cannot completely prevent a local process that can write the data root from
+replacing directories during those fallback checks; such a process is outside
+the deployment threat model, which is why exclusive write permission is
+required.
+
 The application uses Flyway migrations and Hibernate `ddl-auto: validate`
 against MySQL. Flyway is the only schema owner; do not use Hibernate to create
 or update tables.

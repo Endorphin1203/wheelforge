@@ -1,27 +1,22 @@
 package com.wheelforge.api.common.storage;
 
+import jakarta.annotation.PreDestroy;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
-import java.nio.file.AtomicMoveNotSupportedException;
-import java.nio.file.FileAlreadyExistsException;
+import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
-import java.nio.file.LinkOption;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
-import java.util.HexFormat;
+import java.nio.file.SecureDirectoryStream;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 @Component
-public class LocalFileStorage {
-  private static final int BUFFER_SIZE = 8192;
-
-  private final Path root;
-  private final Path realRoot;
+public class LocalFileStorage implements AutoCloseable {
+  private final LocalStorageBackend backend;
+  private final ReentrantReadWriteLock lifecycleLock = new ReentrantReadWriteLock();
+  private boolean closed;
 
   @Autowired
   public LocalFileStorage(@Value("${wheelforge.storage.data-root}") String root) {
@@ -29,160 +24,99 @@ public class LocalFileStorage {
   }
 
   public LocalFileStorage(Path root) {
+    this(root, Files::newDirectoryStream);
+  }
+
+  LocalFileStorage(Path root, DirectoryStreamOpener directoryStreamOpener) {
     if (!root.isAbsolute()) {
       throw new IllegalArgumentException("Storage root must be an absolute path");
     }
+    DirectoryStream<Path> openedDirectory = null;
     try {
       Path normalizedRoot = root.normalize();
       Files.createDirectories(normalizedRoot);
-      this.realRoot = normalizedRoot.toRealPath();
-      this.root = this.realRoot;
+      Path realRoot = normalizedRoot.toRealPath();
+      openedDirectory = directoryStreamOpener.open(realRoot);
+      if (openedDirectory instanceof SecureDirectoryStream<?> secureDirectory) {
+        @SuppressWarnings("unchecked")
+        SecureDirectoryStream<Path> typedDirectory = (SecureDirectoryStream<Path>) secureDirectory;
+        backend = new SecureDirectoryStorageBackend(realRoot, typedDirectory);
+        openedDirectory = null;
+      } else {
+        openedDirectory.close();
+        openedDirectory = null;
+        backend = new PortableFileStorageBackend(realRoot);
+      }
     } catch (IOException exception) {
       throw new StorageException("Could not initialize local storage", exception);
+    } finally {
+      if (openedDirectory != null) {
+        try {
+          openedDirectory.close();
+        } catch (IOException ignored) {
+          // Initialization already failed; retain the actionable cause.
+        }
+      }
     }
   }
 
   public StoredObject putAtomically(String key, InputStream input, long expectedSize) {
-    if (expectedSize < 0) {
-      throw new IllegalArgumentException("Expected size must not be negative");
-    }
-    Path destination = resolveForWrite(key);
-    Path temporary = null;
+    lifecycleLock.readLock().lock();
     try {
-      Path parent = destination.getParent();
-      createDirectoriesWithoutFollowingLinks(parent);
-      temporary = Files.createTempFile(parent, ".wheelforge-", ".tmp");
-      MessageDigest digest = MessageDigest.getInstance("SHA-256");
-      long written = 0;
-      byte[] buffer = new byte[BUFFER_SIZE];
-      try (OutputStream output = Files.newOutputStream(temporary)) {
-        int count;
-        while ((count = input.read(buffer)) != -1) {
-          written += count;
-          if (written > expectedSize) {
-            throw new SizeMismatchException(expectedSize, written);
-          }
-          digest.update(buffer, 0, count);
-          output.write(buffer, 0, count);
-        }
-      }
-      if (written != expectedSize) {
-        throw new SizeMismatchException(expectedSize, written);
-      }
-      try {
-        Files.move(temporary, destination, StandardCopyOption.ATOMIC_MOVE);
-      } catch (AtomicMoveNotSupportedException exception) {
-        throw new StorageException(
-            "Storage filesystem does not support atomic publication", exception);
-      }
-      temporary = null;
-      return new StoredObject(key, written, HexFormat.of().formatHex(digest.digest()));
-    } catch (StorageException exception) {
-      throw exception;
-    } catch (IOException | NoSuchAlgorithmException exception) {
-      throw new StorageException("Could not publish local object", exception);
+      requireOpen();
+      return backend.putAtomically(key, input, expectedSize);
     } finally {
-      if (temporary != null) {
-        try {
-          Files.deleteIfExists(temporary);
-        } catch (IOException ignored) {
-          // The original storage failure remains the actionable error.
-        }
-      }
+      lifecycleLock.readLock().unlock();
     }
   }
 
   public InputStream open(String key) {
-    Path object = resolveExisting(key);
+    lifecycleLock.readLock().lock();
     try {
-      return Files.newInputStream(object);
-    } catch (IOException exception) {
-      throw new StorageException("Could not open local object", exception);
+      requireOpen();
+      return backend.open(key);
+    } finally {
+      lifecycleLock.readLock().unlock();
     }
   }
 
   public void deleteIfExists(String key) {
-    Path object = resolveForWrite(key);
+    lifecycleLock.readLock().lock();
     try {
-      Path parent = object.getParent();
-      if (!Files.exists(parent, LinkOption.NOFOLLOW_LINKS)) {
+      requireOpen();
+      backend.deleteIfExists(key);
+    } finally {
+      lifecycleLock.readLock().unlock();
+    }
+  }
+
+  @Override
+  @PreDestroy
+  public void close() {
+    lifecycleLock.writeLock().lock();
+    try {
+      if (closed) {
         return;
       }
-      requireExistingDirectoriesWithoutLinks(parent);
-      if (Files.isSymbolicLink(object)) {
-        throw new IllegalArgumentException("Symbolic-link object keys are not allowed");
+      try {
+        backend.close();
+      } finally {
+        closed = true;
       }
-      Files.deleteIfExists(object);
-    } catch (IOException exception) {
-      throw new StorageException("Could not delete local object", exception);
+    } finally {
+      lifecycleLock.writeLock().unlock();
     }
   }
 
-  private Path resolveForWrite(String key) {
-    Path relative = validatedRelativeKey(key);
-    Path resolved = root.resolve(relative).normalize();
-    requireInsideRoot(resolved);
-    return resolved;
-  }
-
-  private Path resolveExisting(String key) {
-    Path resolved = resolveForWrite(key);
-    try {
-      Path real = resolved.toRealPath(LinkOption.NOFOLLOW_LINKS);
-      requireInsideRoot(real);
-      if (Files.isSymbolicLink(real)) {
-        throw new IllegalArgumentException("Symbolic-link object keys are not allowed");
-      }
-      return real;
-    } catch (IOException exception) {
-      throw new StorageException("Local object does not exist", exception);
+  private void requireOpen() {
+    if (closed) {
+      throw new StorageException("Local storage root handle is closed", null);
     }
   }
 
-  private Path validatedRelativeKey(String key) {
-    if (key == null || key.isBlank() || key.indexOf('\\') >= 0) {
-      throw new IllegalArgumentException("Object key must be a non-empty portable relative path");
-    }
-    Path relative = Path.of(key);
-    if (relative.isAbsolute() || relative.normalize().startsWith("..")) {
-      throw new IllegalArgumentException("Object key escapes the storage root");
-    }
-    return relative.normalize();
-  }
-
-  private void createDirectoriesWithoutFollowingLinks(Path directory) throws IOException {
-    Path current = root;
-    for (Path segment : root.relativize(directory)) {
-      current = current.resolve(segment);
-      if (!Files.exists(current, LinkOption.NOFOLLOW_LINKS)) {
-        try {
-          Files.createDirectory(current);
-        } catch (FileAlreadyExistsException ignored) {
-          // A concurrent upload may have created this shared generated-key directory.
-        }
-      }
-      if (Files.isSymbolicLink(current) || !Files.isDirectory(current, LinkOption.NOFOLLOW_LINKS)) {
-        throw new IllegalArgumentException("Object key contains an unsafe directory");
-      }
-      requireInsideRoot(current.toRealPath(LinkOption.NOFOLLOW_LINKS));
-    }
-  }
-
-  private void requireExistingDirectoriesWithoutLinks(Path directory) throws IOException {
-    Path current = root;
-    for (Path segment : root.relativize(directory)) {
-      current = current.resolve(segment);
-      if (Files.isSymbolicLink(current) || !Files.isDirectory(current, LinkOption.NOFOLLOW_LINKS)) {
-        throw new IllegalArgumentException("Object key contains an unsafe directory");
-      }
-      requireInsideRoot(current.toRealPath(LinkOption.NOFOLLOW_LINKS));
-    }
-  }
-
-  private void requireInsideRoot(Path path) {
-    if (!path.normalize().startsWith(realRoot)) {
-      throw new IllegalArgumentException("Object key escapes the storage root");
-    }
+  @FunctionalInterface
+  interface DirectoryStreamOpener {
+    DirectoryStream<Path> open(Path root) throws IOException;
   }
 
   public record StoredObject(String key, long sizeBytes, String sha256) {}

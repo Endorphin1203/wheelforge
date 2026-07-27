@@ -91,6 +91,26 @@ class RequirementFileControllerTest {
   }
 
   @Test
+  void rejectsAnOverlongOriginalFilenameUsingTheGlobalErrorShape() throws Exception {
+    String filename = "a".repeat(252) + ".txt";
+    var file =
+        new MockMultipartFile("file", filename, "text/plain", "requests==2.32.4\n".getBytes(UTF_8));
+    given(requirementFileService.upload(eq(USER_ID), any()))
+        .willThrow(
+            ApiException.badRequest(
+                "INVALID_REQUIREMENT_FILE", "Original filename must not exceed 255 characters"));
+
+    mvc.perform(
+            multipart("/api/requirement-files")
+                .file(file)
+                .header(HttpHeaders.AUTHORIZATION, bearerToken()))
+        .andExpect(status().isBadRequest())
+        .andExpect(jsonPath("$.code").value("INVALID_REQUIREMENT_FILE"))
+        .andExpect(jsonPath("$.fieldErrors").isMap())
+        .andExpect(jsonPath("$.traceId").isString());
+  }
+
+  @Test
   void returnsDetailAndParsedItemsForAuthenticatedOwner() throws Exception {
     given(requirementFileService.get(USER_ID, FILE_ID)).willReturn(fileView("PARSED"));
     given(requirementFileService.items(USER_ID, FILE_ID))

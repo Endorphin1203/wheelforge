@@ -1,5 +1,6 @@
 package com.wheelforge.api.requirements;
 
+import static com.wheelforge.api.common.storage.SecureDirectoryStreamTestSupport.secureStorage;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -51,7 +52,7 @@ class RequirementFileServiceTest {
 
   @BeforeEach
   void setUp() {
-    storage = new LocalFileStorage(tempDir.toAbsolutePath());
+    storage = secureStorage(tempDir.toAbsolutePath());
     service =
         new RequirementFileService(
             fileRepository,
@@ -199,6 +200,38 @@ class RequirementFileServiceTest {
     service.upload(USER_ID, upload);
 
     assertThat(stream.closed).isTrue();
+  }
+
+  @Test
+  void acceptsAnOriginalFilenameOfExactly255JavaCharacters() throws Exception {
+    beginTransactionSynchronization();
+    String filename = "a".repeat(251) + ".txt";
+    var upload =
+        new MockMultipartFile("file", filename, "text/plain", "requests==2.32.4\n".getBytes(UTF_8));
+    given(fileRepository.save(any())).willAnswer(invocation -> invocation.getArgument(0));
+
+    var result = service.upload(USER_ID, upload);
+
+    assertThat(filename).hasSize(255);
+    assertThat(result.originalName()).isEqualTo(filename);
+    assertThat(Files.walk(tempDir).filter(Files::isRegularFile)).hasSize(1);
+  }
+
+  @Test
+  void rejectsAnOriginalFilenameOf256JavaCharactersBeforePublishing() throws Exception {
+    beginTransactionSynchronization();
+    String filename = "a".repeat(252) + ".txt";
+    var upload =
+        new MockMultipartFile("file", filename, "text/plain", "requests==2.32.4\n".getBytes(UTF_8));
+
+    assertThat(filename).hasSize(256);
+    assertThatThrownBy(() -> service.upload(USER_ID, upload))
+        .isInstanceOf(ApiException.class)
+        .extracting("status")
+        .isEqualTo(org.springframework.http.HttpStatus.BAD_REQUEST);
+    assertThat(Files.walk(tempDir).filter(Files::isRegularFile)).isEmpty();
+    verify(fileRepository, never()).save(any());
+    verify(buildJobService, never()).enqueue(any(), any(), any());
   }
 
   private void beginTransactionSynchronization() {
