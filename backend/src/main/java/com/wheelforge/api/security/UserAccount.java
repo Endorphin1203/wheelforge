@@ -72,4 +72,11 @@ public class UserAccount {
   public boolean isActive() {
     return "ACTIVE".equals(status);
   }
+
+  public void updateStatus(String status) {
+    if (!"ACTIVE".equals(status) && !"DISABLED".equals(status)) {
+      throw new IllegalArgumentException("User status is invalid");
+    }
+    this.status = status;
+  }
 }

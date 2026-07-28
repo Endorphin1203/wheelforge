@@ -60,11 +60,16 @@ public class SecurityConfig {
         .build();
   }
 
-  private static final class TokenAuthenticationFilter extends OncePerRequestFilter {
+  static final class TokenAuthenticationFilter extends OncePerRequestFilter {
     private final TokenService tokenService;
 
-    private TokenAuthenticationFilter(TokenService tokenService) {
+    TokenAuthenticationFilter(TokenService tokenService) {
       this.tokenService = tokenService;
+    }
+
+    @Override
+    protected boolean shouldNotFilterAsyncDispatch() {
+      return false;
     }
 
     @Override

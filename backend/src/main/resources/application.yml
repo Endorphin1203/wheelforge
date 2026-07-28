@@ -19,3 +19,7 @@ wheelforge:
     token-secret: ${WF_AUTH_TOKEN_SECRET}
   storage:
     data-root: ${WF_DATA_ROOT}
+  retention:
+    enabled: ${WF_RETENTION_ENABLED:false}
+    batch-size: ${WF_RETENTION_BATCH_SIZE:100}
+    fixed-delay-ms: ${WF_RETENTION_FIXED_DELAY_MS:60000}

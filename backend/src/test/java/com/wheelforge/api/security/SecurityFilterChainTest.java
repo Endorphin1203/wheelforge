@@ -1,12 +1,16 @@
 package com.wheelforge.api.security;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.asyncDispatch;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.request;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 import com.wheelforge.api.common.ApiExceptionHandler;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
@@ -33,6 +37,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
 import tools.jackson.databind.ObjectMapper;
 
 @WebMvcTest(
@@ -58,6 +63,27 @@ class SecurityFilterChainTest {
         .andExpect(status().isOk())
         .andExpect(jsonPath("$.userId").value(USER_ID))
         .andExpect(jsonPath("$.admin").value(true));
+  }
+
+  @Test
+  void reauthenticatesBearerTokenForAsyncStreamingRedispatch() throws Exception {
+    String token = validToken();
+    MvcResult pending =
+        mvc.perform(get("/api/test/stream").header(HttpHeaders.AUTHORIZATION, bearer(token)))
+            .andExpect(request().asyncStarted())
+            .andReturn();
+
+    mvc.perform(asyncDispatch(pending))
+        .andExpect(status().isOk())
+        .andExpect(content().bytes("streamed".getBytes(StandardCharsets.UTF_8)));
+  }
+
+  @Test
+  void rejectsUnauthenticatedStreamingRequestsBeforeAsyncHandlingStarts() throws Exception {
+    mvc.perform(get("/api/test/stream"))
+        .andExpect(status().isUnauthorized())
+        .andExpect(request().asyncNotStarted())
+        .andExpect(jsonPath("$.code").value("UNAUTHENTICATED"));
   }
 
   @Test
@@ -236,6 +262,11 @@ class SecurityFilterChainTest {
     @GetMapping(value = "/produces-json", produces = "application/json")
     Map<String, String> producesJson() {
       return Map.of("status", "ok");
+    }
+
+    @GetMapping(value = "/stream", produces = "application/octet-stream")
+    StreamingResponseBody stream() {
+      return output -> output.write("streamed".getBytes(StandardCharsets.UTF_8));
     }
   }
 }

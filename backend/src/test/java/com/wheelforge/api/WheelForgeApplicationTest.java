@@ -31,6 +31,13 @@ class WheelForgeApplicationTest {
   @MockitoBean private com.wheelforge.api.build.BuildTaskRepository buildTaskRepository;
   @MockitoBean private com.wheelforge.api.build.BuildLogRepository buildLogRepository;
   @MockitoBean private com.wheelforge.api.build.ResolvedPackageRepository resolvedPackageRepository;
+  @MockitoBean private com.wheelforge.api.artifact.ArtifactRepository artifactRepository;
+
+  @MockitoBean
+  private com.wheelforge.api.artifact.DownloadRecordRepository downloadRecordRepository;
+
+  @MockitoBean private com.wheelforge.api.admin.PackageSourceRepository packageSourceRepository;
+  @MockitoBean private com.wheelforge.api.admin.SystemConfigRepository systemConfigRepository;
   @MockitoBean private com.wheelforge.api.common.storage.LocalFileStorage localFileStorage;
 
   @Test

@@ -3,6 +3,10 @@ package com.wheelforge.api.security;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.wheelforge.api.WheelForgeApplication;
+import com.wheelforge.api.admin.PackageSourceRepository;
+import com.wheelforge.api.admin.SystemConfigRepository;
+import com.wheelforge.api.artifact.ArtifactRepository;
+import com.wheelforge.api.artifact.DownloadRecordRepository;
 import com.wheelforge.api.build.BuildLogRepository;
 import com.wheelforge.api.build.BuildTaskRepository;
 import com.wheelforge.api.build.ResolvedPackageRepository;
@@ -88,6 +92,26 @@ class TokenSecretContextTest {
     @Bean
     ResolvedPackageRepository resolvedPackageRepository() {
       return repositoryProxy(ResolvedPackageRepository.class);
+    }
+
+    @Bean
+    ArtifactRepository artifactRepository() {
+      return repositoryProxy(ArtifactRepository.class);
+    }
+
+    @Bean
+    DownloadRecordRepository downloadRecordRepository() {
+      return repositoryProxy(DownloadRecordRepository.class);
+    }
+
+    @Bean
+    PackageSourceRepository packageSourceRepository() {
+      return repositoryProxy(PackageSourceRepository.class);
+    }
+
+    @Bean
+    SystemConfigRepository systemConfigRepository() {
+      return repositoryProxy(SystemConfigRepository.class);
     }
 
     @Bean
