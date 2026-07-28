@@ -19,7 +19,12 @@ from wheelforge_worker.parser import parse_requirements
 from wheelforge_worker.parser.models import ParsedRequirements, RequirementItem
 from wheelforge_worker.target import TargetProfile, wheel_is_compatible
 
-from .candidates import CandidateMetadata, CandidateProvider, ordered_candidates
+from .candidates import (
+    CandidateMetadata,
+    CandidateProvider,
+    _normalized_release,
+    ordered_candidates,
+)
 from .models import (
     CandidateRejection,
     CandidateRejectionCode,
@@ -62,6 +67,18 @@ class _Observation:
     source: PackageSource
     metadata: CandidateMetadata
     version: Version
+
+
+@dataclass(frozen=True, slots=True)
+class _CandidateOptions:
+    versions: tuple[Version, ...]
+    eligible_sources: tuple[tuple[Version, frozenset[PackageSource]], ...]
+
+    def supports(self, version: Version, source: PackageSource) -> bool:
+        return any(
+            candidate == version and source in sources
+            for candidate, sources in self.eligible_sources
+        )
 
 
 class _StopResolution(Exception):
@@ -114,6 +131,8 @@ class CompatibleResolver:
                     source,
                     original_selections,
                     attempts,
+                    started,
+                    limits,
                 )
                 if result is not None:
                     return _successful_result(
@@ -124,20 +143,28 @@ class CompatibleResolver:
                         rejections,
                     )
 
-            options: list[tuple[Version, ...]] = []
+            candidate_options: list[_CandidateOptions] = []
             for pin in pins:
                 self._guard(started, attempts, limits)
                 alternatives = self._discover_candidates(
                     pin, profile, source_order, limits, started, attempts, rejections
                 )
-                options.append((pin.original, *alternatives))
+                candidate_options.append(alternatives)
 
-            for versions in product(*options):
+            version_options = [
+                (pin.original, *options.versions)
+                for pin, options in zip(pins, candidate_options, strict=True)
+            ]
+            for versions in product(*version_options):
                 if versions == original_versions:
                     continue
                 candidate_parsed = _rebuild_requirements(parsed, pins, versions)
                 selections = _selections(pins, versions)
                 for source in source_order:
+                    if not _source_supports_substitutions(
+                        source, pins, versions, candidate_options
+                    ):
+                        continue
                     self._guard(started, attempts, limits)
                     result = self._attempt(
                         candidate_parsed,
@@ -145,6 +172,8 @@ class CompatibleResolver:
                         source,
                         selections,
                         attempts,
+                        started,
+                        limits,
                     )
                     if result is not None:
                         return _successful_result(
@@ -170,10 +199,13 @@ class CompatibleResolver:
         attempts: list[ResolutionAttempt],
         limits: ResolveLimits,
     ) -> None:
-        if self._clock() - started >= limits.timeout.total_seconds():
-            raise _StopResolution(CompatibilityFailureCode.TIMEOUT)
+        self._check_deadline(started, limits)
         if len(attempts) >= limits.max_resolution_attempts:
             raise _StopResolution(CompatibilityFailureCode.ATTEMPT_LIMIT)
+
+    def _check_deadline(self, started: float, limits: ResolveLimits) -> None:
+        if self._clock() - started >= limits.timeout.total_seconds():
+            raise _StopResolution(CompatibilityFailureCode.TIMEOUT)
 
     def _attempt(
         self,
@@ -182,10 +214,13 @@ class CompatibleResolver:
         source: PackageSource,
         selections: tuple[CandidateSelection, ...],
         attempts: list[ResolutionAttempt],
+        started: float,
+        limits: ResolveLimits,
     ) -> ResolutionResult | None:
         try:
             result = self._strict_resolver.resolve(parsed, profile, source.value)
         except ResolverError as error:
+            self._check_deadline(started, limits)
             attempts.append(
                 ResolutionAttempt(
                     selections,
@@ -195,6 +230,7 @@ class CompatibleResolver:
                 )
             )
             return None
+        self._check_deadline(started, limits)
         attempts.append(ResolutionAttempt(selections, source, None, "strict graph resolved"))
         return result
 
@@ -207,7 +243,7 @@ class CompatibleResolver:
         started: float,
         attempts: list[ResolutionAttempt],
         rejections: list[CandidateRejection],
-    ) -> tuple[Version, ...]:
+    ) -> _CandidateOptions:
         observations: list[_Observation] = []
         for source in sources:
             self._guard(started, attempts, limits)
@@ -227,12 +263,16 @@ class CompatibleResolver:
                     )
                 )
 
-        original_is_yanked = any(
-            observation.version == pin.original and observation.metadata.yanked
-            for observation in observations
-        )
-        eligible: set[Version] = set()
-        source_by_version: dict[Version, PackageSource] = {}
+        original_is_yanked = {
+            source: any(
+                observation.source is source
+                and observation.version == pin.original
+                and observation.metadata.yanked
+                for observation in observations
+            )
+            for source in sources
+        }
+        eligible_sources: dict[Version, set[PackageSource]] = {}
         for observation in observations:
             metadata = observation.metadata
             version = observation.version
@@ -258,7 +298,7 @@ class CompatibleResolver:
                     "candidate crosses the allowed compatibility boundary",
                 )
                 continue
-            if metadata.yanked and not original_is_yanked:
+            if metadata.yanked and not original_is_yanked[observation.source]:
                 _reject(
                     rejections,
                     pin.package,
@@ -274,22 +314,42 @@ class CompatibleResolver:
                 continue
             if not _has_target_wheel(pin.package, observation, profile, rejections):
                 continue
-            eligible.add(version)
-            source_by_version.setdefault(version, observation.source)
+            eligible_sources.setdefault(version, set()).add(observation.source)
 
-        ordered = ordered_candidates(pin.original, eligible)
+        ordered = ordered_candidates(pin.original, eligible_sources)
         accepted = ordered[: limits.max_candidates_per_requirement]
         for version in ordered[limits.max_candidates_per_requirement :]:
-            source = source_by_version[version]
-            _reject(
-                rejections,
-                pin.package,
-                str(version),
-                source,
-                CandidateRejectionCode.CANDIDATE_LIMIT,
-                "candidate omitted by the per-requirement candidate limit",
-            )
-        return tuple(accepted)
+            for source in sources:
+                if source in eligible_sources[version]:
+                    _reject(
+                        rejections,
+                        pin.package,
+                        str(version),
+                        source,
+                        CandidateRejectionCode.CANDIDATE_LIMIT,
+                        "candidate omitted by the per-requirement candidate limit",
+                    )
+        return _CandidateOptions(
+            tuple(accepted),
+            tuple(
+                (version, frozenset(eligible_sources[version]))
+                for version in accepted
+            ),
+        )
+
+
+def _source_supports_substitutions(
+    source: PackageSource,
+    pins: tuple[_RelaxablePin, ...],
+    versions: tuple[Version, ...],
+    options: list[_CandidateOptions],
+) -> bool:
+    return all(
+        version == pin.original or candidate_options.supports(version, source)
+        for pin, version, candidate_options in zip(
+            pins, versions, options, strict=True
+        )
+    )
 
 
 def _validated_sources(
@@ -520,9 +580,11 @@ def _reject(
 
 
 def _within_boundary(original: Version, candidate: Version) -> bool:
-    if original.release[0] == 0:
-        return candidate.release[:2] == original.release[:2]
-    return candidate.release[0] == original.release[0]
+    original_release = _normalized_release(original)
+    candidate_release = _normalized_release(candidate)
+    if original_release[0] == 0:
+        return candidate_release[:2] == original_release[:2]
+    return candidate_release[0] == original_release[0]
 
 
 def _relaxable_pins(parsed: ParsedRequirements) -> tuple[_RelaxablePin, ...]:

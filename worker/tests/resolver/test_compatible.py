@@ -121,6 +121,14 @@ class RecordingStrictResolver:
         return result
 
 
+class AdjustableClock:
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def __call__(self) -> float:
+        return self.value
+
+
 def pinned_versions(parsed: ParsedRequirements) -> dict[str, str]:
     found: dict[str, str] = {}
     for item in parsed.items:
@@ -186,6 +194,22 @@ def test_prerelease_original_permits_prerelease_candidates() -> None:
     assert ordered_candidates(Version("1.2.3rc1"), available) == versions(
         "1.2.3rc2", "1.2.3", "1.2.4rc1"
     )
+
+
+@pytest.mark.parametrize("original", ["1", "1.0"])
+def test_short_stable_release_uses_zero_filled_minor_and_patch(original: str) -> None:
+    available = versions("1.0.1", "1.1", "2.0")
+
+    assert ordered_candidates(Version(original), available) == versions(
+        "1.0.1", "1.1"
+    )
+
+
+@pytest.mark.parametrize("original", ["0", "0.0"])
+def test_short_zero_release_stays_within_zero_filled_minor(original: str) -> None:
+    available = versions("0.0.1", "0.1")
+
+    assert ordered_candidates(Version(original), available) == versions("0.0.1")
 
 
 @pytest.mark.parametrize(
@@ -274,6 +298,37 @@ def test_candidate_source_invocations_each_consume_one_attempt() -> None:
         PackageSource.PYPI,
     ]
     assert result.changes[0].kind is VersionChangeKind.UPGRADE
+
+
+@pytest.mark.parametrize(
+    ("original", "replacement"),
+    [
+        ("1", "1.0.1"),
+        ("1.0", "1.0.1"),
+        ("0", "0.0.1"),
+        ("0.0", "0.0.1"),
+    ],
+)
+def test_short_exact_pin_resolves_end_to_end(
+    original: str, replacement: str
+) -> None:
+    parsed = parse_requirements(f"demo=={original}\n".encode())
+    strict = RecordingStrictResolver(
+        lambda requirements, _source: result_for(demo=replacement)
+        if pinned_versions(requirements) == {"demo": replacement}
+        else None
+    )
+    provider = RecordingProvider(
+        {("demo", PackageSource.PYPI): (candidate(replacement),)}
+    )
+
+    result = CompatibleResolver(strict, provider).resolve(
+        parsed, profile(), (PackageSource.PYPI,), ResolveLimits()
+    )
+
+    assert result.packages[0].version == Version(replacement)
+    assert result.changes[0].kind is VersionChangeKind.UPGRADE
+    assert len(strict.calls) == 2
 
 
 @pytest.mark.parametrize(
@@ -429,6 +484,113 @@ def test_yanked_alternative_is_allowed_when_original_pin_is_yanked() -> None:
         rejection.code is CandidateRejectionCode.YANKED
         for rejection in result.rejections
     )
+
+
+def test_candidate_cannot_borrow_eligibility_from_another_source() -> None:
+    parsed = parse_requirements(b"demo==1.0\n")
+    strict = RecordingStrictResolver(
+        lambda requirements, source: result_for(demo="1.1")
+        if pinned_versions(requirements) == {"demo": "1.1"}
+        and source == "TSINGHUA"
+        else None
+    )
+    provider = RecordingProvider(
+        {
+            ("demo", PackageSource.TSINGHUA): (
+                candidate("1.1", yanked=True),
+            ),
+            ("demo", PackageSource.PYPI): (candidate("1.1"),),
+        }
+    )
+
+    with pytest.raises(CompatibilityResolutionError) as captured:
+        CompatibleResolver(strict, provider).resolve(
+            parsed,
+            profile(),
+            (PackageSource.TSINGHUA, PackageSource.PYPI),
+            ResolveLimits(),
+        )
+
+    candidate_calls = [
+        (pinned_versions(requirements), source)
+        for requirements, _target, source in strict.calls
+        if pinned_versions(requirements) != {"demo": "1.0"}
+    ]
+    assert candidate_calls == [({"demo": "1.1"}, "PYPI")]
+    assert any(
+        rejection.source is PackageSource.TSINGHUA
+        and rejection.version == "1.1"
+        and rejection.code is CandidateRejectionCode.YANKED
+        for rejection in captured.value.rejections
+    )
+
+
+def test_yanked_original_policy_is_source_local() -> None:
+    parsed = parse_requirements(b"demo==1.0\n")
+    strict = RecordingStrictResolver(
+        lambda requirements, source: result_for(demo="1.1")
+        if pinned_versions(requirements) == {"demo": "1.1"}
+        and source == "TSINGHUA"
+        else None
+    )
+    provider = RecordingProvider(
+        {
+            ("demo", PackageSource.TSINGHUA): (
+                candidate("1.0", yanked=True),
+                candidate("1.1", yanked=True),
+            ),
+            ("demo", PackageSource.PYPI): (
+                candidate("1.0"),
+                candidate("1.1", yanked=True),
+            ),
+        }
+    )
+
+    result = CompatibleResolver(strict, provider).resolve(
+        parsed,
+        profile(),
+        (PackageSource.TSINGHUA, PackageSource.PYPI),
+        ResolveLimits(),
+    )
+
+    assert result.source is PackageSource.TSINGHUA
+    assert any(
+        rejection.source is PackageSource.PYPI
+        and rejection.version == "1.1"
+        and rejection.code is CandidateRejectionCode.YANKED
+        for rejection in result.rejections
+    )
+
+
+def test_combination_requires_every_substitution_on_the_same_source() -> None:
+    parsed = parse_requirements(b"alpha==1.0\nbeta==2.0\n")
+    strict = RecordingStrictResolver(
+        lambda requirements, _source: result_for(alpha="1.1", beta="2.1")
+        if pinned_versions(requirements) == {"alpha": "1.1", "beta": "2.1"}
+        else None
+    )
+    provider = RecordingProvider(
+        {
+            ("alpha", PackageSource.TSINGHUA): (
+                candidate("1.1", wheels=("alpha-1.1-py3-none-any.whl",)),
+            ),
+            ("beta", PackageSource.PYPI): (
+                candidate("2.1", wheels=("beta-2.1-py3-none-any.whl",)),
+            ),
+        }
+    )
+
+    with pytest.raises(CompatibilityResolutionError):
+        CompatibleResolver(strict, provider).resolve(
+            parsed,
+            profile(),
+            (PackageSource.TSINGHUA, PackageSource.PYPI),
+            ResolveLimits(),
+        )
+
+    attempted_pins = [pinned_versions(requirements) for requirements, _, _ in strict.calls]
+    assert {"alpha": "1.1", "beta": "2.1"} not in attempted_pins
+    assert len(strict.calls) == 4
 
 
 def test_rebuild_preserves_ranges_compatible_extras_and_marker() -> None:
@@ -608,6 +770,56 @@ def test_monotonic_deadline_stops_before_candidate_discovery() -> None:
     assert captured.value.code is CompatibilityFailureCode.TIMEOUT
     assert len(strict.calls) == 1
     assert provider.calls == []
+
+
+def test_late_strict_success_is_rejected_before_acceptance() -> None:
+    parsed = parse_requirements(b"demo==1.0\n")
+    clock = AdjustableClock()
+
+    def finish_late(
+        _requirements: ParsedRequirements, _source: str
+    ) -> ResolutionResult:
+        clock.value = 2.0
+        return result_for(demo="1.0")
+
+    strict = RecordingStrictResolver(finish_late)
+
+    with pytest.raises(CompatibilityResolutionError) as captured:
+        CompatibleResolver(strict, RecordingProvider({}), clock=clock).resolve(
+            parsed,
+            profile(),
+            (PackageSource.PYPI,),
+            ResolveLimits(timeout=timedelta(seconds=1)),
+        )
+
+    assert captured.value.code is CompatibilityFailureCode.TIMEOUT
+    assert captured.value.attempts == ()
+    assert len(strict.calls) == 1
+
+
+def test_late_strict_failure_is_rejected_before_recording() -> None:
+    parsed = parse_requirements(b"demo==1.0\n")
+    clock = AdjustableClock()
+
+    def fail_late(
+        _requirements: ParsedRequirements, _source: str
+    ) -> ResolutionResult | None:
+        clock.value = 2.0
+        return None
+
+    strict = RecordingStrictResolver(fail_late)
+
+    with pytest.raises(CompatibilityResolutionError) as captured:
+        CompatibleResolver(strict, RecordingProvider({}), clock=clock).resolve(
+            parsed,
+            profile(),
+            (PackageSource.PYPI,),
+            ResolveLimits(timeout=timedelta(seconds=1)),
+        )
+
+    assert captured.value.code is CompatibilityFailureCode.TIMEOUT
+    assert captured.value.attempts == ()
+    assert len(strict.calls) == 1
 
 
 def test_provider_release_count_and_strings_are_bounded() -> None:

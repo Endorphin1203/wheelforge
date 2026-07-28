@@ -24,6 +24,7 @@ class CandidateProvider(Protocol):
 def ordered_candidates(
     original: Version, available: Iterable[Version]
 ) -> list[Version]:
+    original_release = _normalized_release(original)
     candidates = {
         candidate
         for candidate in available
@@ -49,13 +50,13 @@ def ordered_candidates(
     higher_minors = sorted(
         candidate
         for candidate in candidates
-        if candidate.release[1] > original.release[1]
+        if _normalized_release(candidate)[1] > original_release[1]
     )
     lower_minors = sorted(
         (
             candidate
             for candidate in candidates
-            if candidate.release[1] < original.release[1]
+            if _normalized_release(candidate)[1] < original_release[1]
         ),
         reverse=True,
     )
@@ -63,10 +64,17 @@ def ordered_candidates(
 
 
 def _within_boundary(original: Version, candidate: Version) -> bool:
-    if original.release[0] == 0:
-        return candidate.release[:2] == original.release[:2]
-    return candidate.release[0] == original.release[0]
+    original_release = _normalized_release(original)
+    candidate_release = _normalized_release(candidate)
+    if original_release[0] == 0:
+        return candidate_release[:2] == original_release[:2]
+    return candidate_release[0] == original_release[0]
 
 
 def _same_minor(original: Version, candidate: Version) -> bool:
-    return candidate.release[:2] == original.release[:2]
+    return _normalized_release(candidate)[:2] == _normalized_release(original)[:2]
+
+
+def _normalized_release(version: Version) -> tuple[int, int, int]:
+    release = version.release + (0, 0, 0)
+    return release[0], release[1], release[2]
