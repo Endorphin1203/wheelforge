@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 import subprocess
 import sys
 from datetime import timedelta
 from pathlib import Path
+from typing import BinaryIO, cast
 
 import pytest
 
@@ -28,6 +31,10 @@ from wheelforge_worker.resolver import (
     parse_pip_report,
 )
 from wheelforge_worker.target import TargetProfile
+import wheelforge_worker.resolver.pip_report as pip_report_module
+
+
+_TRUNCATION_MARKER = "\n...[truncated]..."
 
 
 @pytest.fixture
@@ -61,6 +68,8 @@ def _install(
     *,
     requested: bool = True,
     hashes: dict[str, str] | None = None,
+    requires_dist: tuple[str, ...] = ("dep>=1",),
+    requires_python: str | None = ">=3.9",
 ) -> dict[str, object]:
     archive_info: dict[str, object] = {}
     if hashes is not None:
@@ -70,8 +79,8 @@ def _install(
         "metadata": {
             "name": name,
             "version": version,
-            "requires_dist": ["dep>=1"],
-            "requires_python": ">=3.9",
+            "requires_dist": list(requires_dist),
+            "requires_python": requires_python,
         },
         "requested": requested,
     }
@@ -164,10 +173,12 @@ def test_runner_uses_tokenized_argv_and_complete_environment(
 
     def fake_run(
         args: tuple[str, ...], **kwargs: object
-    ) -> subprocess.CompletedProcess[str]:
+    ) -> subprocess.CompletedProcess[bytes]:
         observed.update(kwargs)
         observed["args"] = args
-        return subprocess.CompletedProcess(args, 0, "out", "err")
+        cast(BinaryIO, kwargs["stdout"]).write(b"out")
+        cast(BinaryIO, kwargs["stderr"]).write(b"err")
+        return subprocess.CompletedProcess(args, 0)
 
     monkeypatch.setattr("wheelforge_worker.process.subprocess.run", fake_run)
 
@@ -182,8 +193,10 @@ def test_runner_uses_tokenized_argv_and_complete_environment(
     assert result.stdout == "out"
     assert observed["shell"] is False
     assert observed["env"] == {"PIP_NO_INPUT": "1"}
-    assert observed["text"] is True
-    assert observed["capture_output"] is True
+    assert "capture_output" not in observed
+    assert "text" not in observed
+    assert observed["stdout"] is not subprocess.PIPE
+    assert observed["stderr"] is not subprocess.PIPE
 
 
 @pytest.mark.parametrize(
@@ -216,6 +229,42 @@ def test_runner_returns_nonzero_exit_without_raising(tmp_path: Path) -> None:
     assert result.stderr == "bad\n"
 
 
+@pytest.mark.parametrize("return_code", [0, 7])
+def test_runner_bounds_flooded_output_for_every_exit(
+    tmp_path: Path, return_code: int
+) -> None:
+    script = (
+        "import os,sys;"
+        "os.write(1,b'o'*100000);"
+        "os.write(2,b'e'*100000);"
+        f"sys.exit({return_code})"
+    )
+
+    result = ProcessRunner().run(
+        [sys.executable, "-c", script], tmp_path, timedelta(seconds=5), {}
+    )
+
+    assert result.return_code == return_code
+    assert len(result.stdout.encode()) <= 4096
+    assert len(result.stderr.encode()) <= 4096
+    assert result.stdout.endswith(_TRUNCATION_MARKER)
+    assert result.stderr.endswith(_TRUNCATION_MARKER)
+
+
+def test_runner_keeps_invalid_utf8_replacement_output_within_byte_limit(
+    tmp_path: Path,
+) -> None:
+    result = ProcessRunner().run(
+        [sys.executable, "-c", "import os; os.write(1, b'\\xff' * 5000)"],
+        tmp_path,
+        timedelta(seconds=5),
+        {},
+    )
+
+    assert len(result.stdout.encode()) <= 4096
+    assert result.stdout.endswith(_TRUNCATION_MARKER)
+
+
 def test_runner_maps_timeout_to_typed_error(tmp_path: Path) -> None:
     with pytest.raises(ProcessTimeoutError) as raised:
         ProcessRunner().run(
@@ -227,6 +276,28 @@ def test_runner_maps_timeout_to_typed_error(tmp_path: Path) -> None:
 
     assert len(raised.value.stdout) <= 4096
     assert len(raised.value.stderr) <= 4096
+
+
+def test_runner_bounds_flooded_output_on_timeout(tmp_path: Path) -> None:
+    script = (
+        "import os,time;"
+        "os.write(1,b'o'*100000);"
+        "os.write(2,b'e'*100000);"
+        "time.sleep(5)"
+    )
+
+    with pytest.raises(ProcessTimeoutError) as raised:
+        ProcessRunner().run(
+            [sys.executable, "-c", script],
+            tmp_path,
+            timedelta(milliseconds=100),
+            {},
+        )
+
+    assert len(raised.value.stdout.encode()) <= 4096
+    assert len(raised.value.stderr.encode()) <= 4096
+    assert raised.value.stdout.endswith(_TRUNCATION_MARKER)
+    assert raised.value.stderr.endswith(_TRUNCATION_MARKER)
 
 
 def test_runner_maps_spawn_failure_to_typed_error(tmp_path: Path) -> None:
@@ -279,6 +350,78 @@ def test_parse_report_rejects_malformed_json_or_schema(
         parse_pip_report(payload)
 
 
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_parse_report_rejects_non_json_constants(constant: str) -> None:
+    payload = f'{{"version":"1","install":[],"extra":{constant}}}'
+
+    with pytest.raises(InvalidPipReportError):
+        parse_pip_report(payload)
+
+
+def test_parse_report_rejects_duplicate_json_keys() -> None:
+    payload = '{"version":"1","version":"1","install":[]}'
+
+    with pytest.raises(InvalidPipReportError):
+        parse_pip_report(payload)
+
+
+def test_parse_report_rejects_invalid_utf8_path(tmp_path: Path) -> None:
+    report_path = tmp_path / "report.json"
+    report_path.write_bytes(b'{"version":"1","install":[]}\xff')
+
+    with pytest.raises(InvalidPipReportError):
+        parse_pip_report(report_path)
+
+
+@pytest.mark.parametrize("form", ["path", "text", "bytes"])
+def test_parse_report_enforces_byte_limit_for_serialized_inputs(
+    form: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(pip_report_module, "MAX_PIP_REPORT_BYTES", 128, raising=False)
+    payload = json.dumps({"version": "1", "install": [], "padding": "x" * 200})
+    report_input: Path | str | bytes
+    if form == "path":
+        report_input = tmp_path / "report.json"
+        report_input.write_text(payload, encoding="utf-8")
+    elif form == "bytes":
+        report_input = payload.encode()
+    else:
+        report_input = payload
+
+    with pytest.raises(InvalidPipReportError):
+        parse_pip_report(report_input)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "x" * 65537,
+        {f"field-{index}": index for index in range(129)},
+        float("nan"),
+    ],
+)
+def test_parse_report_bounds_in_memory_json_structure(extra: object) -> None:
+    payload = _report()
+    payload["extra"] = extra
+
+    with pytest.raises(PipReportSchemaError):
+        parse_pip_report(payload)
+
+
+def test_parse_report_bounds_dependency_count() -> None:
+    with pytest.raises(PipReportSchemaError):
+        parse_pip_report(
+            _report(_install(requires_dist=tuple("dep" for _ in range(1001))))
+        )
+
+
+def test_parse_report_bounds_archive_hash_count() -> None:
+    hashes = {f"sha{index}": "a" for index in range(17)}
+
+    with pytest.raises(PipReportSchemaError):
+        parse_pip_report(_report(_install(hashes=hashes)))
+
+
 @pytest.mark.parametrize(
     "url",
     [
@@ -287,6 +430,9 @@ def test_parse_report_rejects_malformed_json_or_schema(
         "https://user:password@example.test/demo-1.0.whl",
         "http://example.test/demo-1.0.whl",
         "not a url/demo-1.0.whl",
+        "https://bad host.example/demo-1.0-py3-none-any.whl",
+        "https://example.test:not-a-port/demo-1.0-py3-none-any.whl",
+        "https://[2001:db8::1/demo-1.0-py3-none-any.whl",
     ],
 )
 def test_parse_report_rejects_unsafe_or_nonwheel_artifacts(url: str) -> None:
@@ -314,16 +460,50 @@ def test_parse_report_rejects_conflicting_duplicate_package() -> None:
         )
 
 
+@pytest.mark.parametrize("requested_order", [(False, True), (True, False)])
+def test_parse_report_merges_requested_for_identical_duplicates(
+    requested_order: tuple[bool, bool],
+) -> None:
+    result = parse_pip_report(
+        _report(*(_install(requested=requested) for requested in requested_order))
+    )
+
+    assert len(result.packages) == 1
+    assert result.packages[0].requested is True
+
+
+@pytest.mark.parametrize(
+    "conflict",
+    [
+        _install(hashes={"sha256": "different"}),
+        _install(requires_dist=("other>=2",)),
+        _install(requires_python=">=3.12"),
+    ],
+)
+def test_parse_report_rejects_duplicate_observation_conflicts(
+    conflict: dict[str, object],
+) -> None:
+    with pytest.raises(PipReportSchemaError):
+        parse_pip_report(_report(_install(), conflict))
+
+
 class _WritingRunner:
     def __init__(self, payload: dict[str, object], return_code: int = 0) -> None:
         self.payload = payload
         self.return_code = return_code
         self.calls: list[tuple[list[str], Path, timedelta, dict[str, str]]] = []
+        self.requirements_text = ""
+        self.attempt_mode = 0
+        self.requirements_mode = 0
 
     def run(
         self, argv: list[str], cwd: Path, timeout: timedelta, env: dict[str, str]
     ) -> ProcessResult:
         self.calls.append((argv, cwd, timeout, env))
+        requirements_path = Path(argv[-1])
+        self.requirements_text = requirements_path.read_text(encoding="utf-8")
+        self.attempt_mode = stat.S_IMODE(cwd.stat().st_mode)
+        self.requirements_mode = stat.S_IMODE(requirements_path.lstat().st_mode)
         (cwd / "report.json").write_text(json.dumps(self.payload), encoding="utf-8")
         return ProcessResult(tuple(argv), self.return_code, "", "no credentials", timedelta(0))
 
@@ -337,11 +517,68 @@ def test_strict_resolver_uses_injected_runner_without_network(
     result = resolver.resolve(parse_requirements(b"demo-pkg==1.2.3\n"), profile_cp311_arm64, "PYPI")
 
     assert result.packages[0].name == "demo-pkg"
-    assert (tmp_path / "requirements.txt").read_text(encoding="utf-8") == "demo-pkg==1.2.3\n"
+    assert runner.requirements_text == "demo-pkg==1.2.3\n"
+    assert runner.attempt_mode == 0o700
+    assert runner.requirements_mode == 0o600
+    attempt_directory = runner.calls[0][1]
+    assert attempt_directory.parent == tmp_path.resolve()
+    assert not attempt_directory.exists()
     assert runner.calls[0][0] == build_resolve_argv(
-        tmp_path / "requirements.txt", tmp_path / "report.json", profile_cp311_arm64, "PYPI"
+        attempt_directory / "requirements.txt",
+        attempt_directory / "report.json",
+        profile_cp311_arm64,
+        "PYPI",
     )
-    assert runner.calls[0][3] == {"PIP_DISABLE_PIP_VERSION_CHECK": "1", "PIP_NO_INPUT": "1"}
+    assert runner.calls[0][3] == {
+        "PIP_CONFIG_FILE": os.devnull,
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+        "PIP_NO_INPUT": "1",
+    }
+
+
+def test_strict_resolver_ignores_fixed_path_symlinks_and_cleans_attempt(
+    profile_cp311_arm64: TargetProfile, tmp_path: Path
+) -> None:
+    outside_requirements = tmp_path / "outside-requirements.txt"
+    outside_report = tmp_path / "outside-report.json"
+    outside_requirements.write_text("sentinel requirements", encoding="utf-8")
+    outside_report.write_text("sentinel report", encoding="utf-8")
+    (tmp_path / "requirements.txt").symlink_to(outside_requirements)
+    (tmp_path / "report.json").symlink_to(outside_report)
+    runner = _WritingRunner(_report(_install()))
+
+    result = StrictResolver(tmp_path, runner=runner).resolve(
+        parse_requirements(b"demo\n"), profile_cp311_arm64, "PYPI"
+    )
+
+    assert result.packages[0].name == "demo-pkg"
+    assert outside_requirements.read_text(encoding="utf-8") == "sentinel requirements"
+    assert outside_report.read_text(encoding="utf-8") == "sentinel report"
+    assert not runner.calls[0][1].exists()
+
+
+def test_strict_resolver_rejects_symlink_report_and_cleans_attempt(
+    profile_cp311_arm64: TargetProfile, tmp_path: Path
+) -> None:
+    outside_report = tmp_path / "outside-report.json"
+    outside_report.write_text(json.dumps(_report(_install())), encoding="utf-8")
+
+    class _SymlinkReportRunner(_WritingRunner):
+        def run(
+            self, argv: list[str], cwd: Path, timeout: timedelta, env: dict[str, str]
+        ) -> ProcessResult:
+            self.calls.append((argv, cwd, timeout, env))
+            (cwd / "report.json").symlink_to(outside_report)
+            return ProcessResult(tuple(argv), 0, "", "", timedelta(0))
+
+    runner = _SymlinkReportRunner(_report())
+
+    with pytest.raises(InvalidPipReportError):
+        StrictResolver(tmp_path, runner=runner).resolve(
+            parse_requirements(b"demo\n"), profile_cp311_arm64, "PYPI"
+        )
+
+    assert not runner.calls[0][1].exists()
 
 
 def test_strict_resolver_rejects_nonzero_pip_exit(
@@ -362,22 +599,45 @@ def test_strict_resolver_rejects_missing_report(
         ) -> ProcessResult:
             return ProcessResult(tuple(argv), 0, "", "", timedelta(0))
 
+    stale_report = tmp_path / "report.json"
+    stale_report.write_text(json.dumps(_report(_install())), encoding="utf-8")
     resolver = StrictResolver(tmp_path, runner=_NoReportRunner())
 
     with pytest.raises(ResolverMissingReportError):
         resolver.resolve(parse_requirements(b"demo\n"), profile_cp311_arm64, "PYPI")
+
+    assert stale_report.read_text(encoding="utf-8") == json.dumps(_report(_install()))
 
 
 def test_strict_resolver_maps_runner_failures_to_typed_error(
     profile_cp311_arm64: TargetProfile, tmp_path: Path
 ) -> None:
     class _TimeoutRunner:
+        def __init__(self) -> None:
+            self.cwd: Path | None = None
+
         def run(
             self, argv: list[str], cwd: Path, timeout: timedelta, env: dict[str, str]
         ) -> ProcessResult:
+            self.cwd = cwd
             raise ProcessTimeoutError("partial output", "partial error")
 
-    resolver = StrictResolver(tmp_path, runner=_TimeoutRunner())
+    runner = _TimeoutRunner()
+    resolver = StrictResolver(tmp_path, runner=runner)
 
     with pytest.raises(ResolverProcessError):
         resolver.resolve(parse_requirements(b"demo\n"), profile_cp311_arm64, "PYPI")
+
+    assert runner.cwd is not None
+    assert not runner.cwd.exists()
+
+
+@pytest.mark.parametrize(
+    "timeout",
+    [timedelta(0), timedelta(minutes=10, microseconds=1), "one minute"],
+)
+def test_strict_resolver_rejects_invalid_or_unbounded_timeout(
+    timeout: object, tmp_path: Path
+) -> None:
+    with pytest.raises(ValueError):
+        StrictResolver(tmp_path, timeout=timeout)  # type: ignore[arg-type]

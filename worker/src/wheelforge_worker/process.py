@@ -3,14 +3,17 @@ from __future__ import annotations
 import math
 import re
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import BinaryIO, Mapping, Sequence
 
 
 _ENVIRONMENT_KEY = re.compile(r"^[A-Z_][A-Z0-9_]*$")
-_MAX_DIAGNOSTIC_CHARS = 4096
+MAX_PROCESS_OUTPUT_BYTES = 4096
+PROCESS_OUTPUT_TRUNCATION_MARKER = "\n...[truncated]..."
+_TRUNCATION_MARKER_BYTES = PROCESS_OUTPUT_TRUNCATION_MARKER.encode()
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,8 +35,8 @@ class ProcessValidationError(ProcessError):
 
 class ProcessTimeoutError(ProcessError):
     def __init__(self, stdout: str, stderr: str) -> None:
-        self.stdout = _bounded_output(stdout)
-        self.stderr = _bounded_output(stderr)
+        self.stdout = _bounded_text(stdout)
+        self.stderr = _bounded_text(stderr)
         super().__init__("process timed out")
 
 
@@ -51,29 +54,37 @@ class ProcessRunner:
     ) -> ProcessResult:
         command = _validate_invocation(argv, cwd, timeout, env)
         started = _monotonic()
-        try:
-            completed = subprocess.run(
-                command,
-                cwd=cwd,
-                env=dict(env),
-                timeout=timeout.total_seconds(),
-                capture_output=True,
-                text=True,
-                check=False,
-                shell=False,
-            )
-        except subprocess.TimeoutExpired as error:
-            raise ProcessTimeoutError(
-                _as_text(error.stdout), _as_text(error.stderr)
-            ) from error
-        except OSError as error:
-            raise ProcessExecutionError("process could not be started") from error
+        timeout_error: subprocess.TimeoutExpired | None = None
+        with tempfile.TemporaryFile(mode="w+b") as stdout_file, tempfile.TemporaryFile(
+            mode="w+b"
+        ) as stderr_file:
+            try:
+                completed = subprocess.run(
+                    command,
+                    cwd=cwd,
+                    env=dict(env),
+                    timeout=timeout.total_seconds(),
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    check=False,
+                    shell=False,
+                )
+            except subprocess.TimeoutExpired as error:
+                timeout_error = error
+            except OSError as error:
+                raise ProcessExecutionError("process could not be started") from error
+
+            stdout = _read_bounded(stdout_file)
+            stderr = _read_bounded(stderr_file)
+
+        if timeout_error is not None:
+            raise ProcessTimeoutError(stdout, stderr) from timeout_error
 
         return ProcessResult(
             command,
             completed.returncode,
-            completed.stdout,
-            completed.stderr,
+            stdout,
+            stderr,
             timedelta(seconds=_monotonic() - started),
         )
 
@@ -105,16 +116,24 @@ def _validate_invocation(
     return command
 
 
-def _as_text(value: str | bytes | None) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, bytes):
-        return value.decode(errors="replace")
-    return value
+def _read_bounded(stream: BinaryIO) -> str:
+    stream.flush()
+    stream.seek(0)
+    return _bounded_bytes(stream.read(MAX_PROCESS_OUTPUT_BYTES + 1))
 
 
-def _bounded_output(value: str) -> str:
-    return value[:_MAX_DIAGNOSTIC_CHARS]
+def _bounded_text(value: str) -> str:
+    return _bounded_bytes(value[: MAX_PROCESS_OUTPUT_BYTES + 1].encode())
+
+
+def _bounded_bytes(value: bytes) -> str:
+    decoded = value.decode(errors="replace")
+    encoded = decoded.encode()
+    if len(encoded) <= MAX_PROCESS_OUTPUT_BYTES:
+        return decoded
+    content_limit = MAX_PROCESS_OUTPUT_BYTES - len(_TRUNCATION_MARKER_BYTES)
+    content = encoded[:content_limit].decode("utf-8", errors="ignore")
+    return content + PROCESS_OUTPUT_TRUNCATION_MARKER
 
 
 def _monotonic() -> float:
