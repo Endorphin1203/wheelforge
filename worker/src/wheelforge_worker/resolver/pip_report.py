@@ -9,6 +9,7 @@ import shutil
 import stat
 import sys
 import tempfile
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import timedelta
@@ -256,7 +257,7 @@ def _load_report(payload: PipReportPayload) -> Mapping[str, object]:
                 object_pairs_hook=_unique_json_object,
                 parse_constant=_reject_json_constant,
             )
-        except (json.JSONDecodeError, _StrictJsonError) as error:
+        except (ValueError, RecursionError) as error:
             raise InvalidPipReportError("pip report is not valid JSON") from error
     if not isinstance(raw, Mapping):
         raise PipReportSchemaError("pip report must be a JSON object")
@@ -318,7 +319,10 @@ def _artifact_url(value: object) -> tuple[str, str]:
     url = _bounded_string(
         value, "download_info.url", _MAX_ARTIFACT_URL_CHARS, required=True
     )
-    if url != url.strip() or any(character.isspace() for character in url):
+    if url != url.strip() or any(
+        character.isspace() or unicodedata.category(character) == "Cc"
+        for character in url
+    ):
         raise PipReportSchemaError("download_info.url must be a safe URL")
     try:
         parsed = urlsplit(url)
@@ -463,6 +467,7 @@ def _reject_json_constant(value: str) -> object:
 def _validate_json_structure(value: object) -> None:
     pending: list[tuple[object, int]] = [(value, 0)]
     nodes = 0
+    aggregate_utf8_bytes = 0
     while pending:
         current, depth = pending.pop()
         nodes += 1
@@ -471,12 +476,14 @@ def _validate_json_structure(value: object) -> None:
         if isinstance(current, str):
             if len(current) > _MAX_JSON_STRING_CHARS:
                 raise PipReportSchemaError("pip report string exceeds its limit")
+            aggregate_utf8_bytes += _utf8_size(current)
         elif isinstance(current, Mapping):
             if len(current) > _MAX_JSON_OBJECT_FIELDS:
                 raise PipReportSchemaError("pip report object has too many fields")
             for key, child in current.items():
                 if not isinstance(key, str) or len(key) > _MAX_JSON_STRING_CHARS:
                     raise PipReportSchemaError("pip report object key is invalid")
+                aggregate_utf8_bytes += _utf8_size(key)
                 pending.append((child, depth + 1))
         elif isinstance(current, list):
             if len(current) > _MAX_JSON_LIST_ITEMS:
@@ -489,6 +496,15 @@ def _validate_json_structure(value: object) -> None:
             continue
         else:
             raise PipReportSchemaError("pip report contains a non-JSON value")
+        if aggregate_utf8_bytes > MAX_PIP_REPORT_BYTES:
+            raise PipReportSchemaError("pip report exceeds the aggregate byte limit")
+
+
+def _utf8_size(value: str) -> int:
+    try:
+        return len(value.encode("utf-8"))
+    except UnicodeEncodeError as error:
+        raise PipReportSchemaError("pip report string is not valid UTF-8") from error
 
 
 def _same_observation(left: ResolvedPackage, right: ResolvedPackage) -> bool:

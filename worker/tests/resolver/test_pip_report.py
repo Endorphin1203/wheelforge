@@ -5,9 +5,10 @@ import os
 import stat
 import subprocess
 import sys
+import tempfile
 from datetime import timedelta
 from pathlib import Path
-from typing import BinaryIO, cast
+from typing import Any, cast
 
 import pytest
 
@@ -170,17 +171,34 @@ def test_runner_uses_tokenized_argv_and_complete_environment(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     observed: dict[str, object] = {}
+    real_popen = subprocess.Popen
 
-    def fake_run(
-        args: tuple[str, ...], **kwargs: object
-    ) -> subprocess.CompletedProcess[bytes]:
-        observed.update(kwargs)
+    def observing_popen(
+        args: tuple[str, ...],
+        *,
+        cwd: Path,
+        env: dict[str, str],
+        stdout: int,
+        stderr: int,
+        shell: bool,
+    ) -> subprocess.Popen[bytes]:
+        observed.update(
+            cwd=cwd, env=env, stdout=stdout, stderr=stderr, shell=shell
+        )
         observed["args"] = args
-        cast(BinaryIO, kwargs["stdout"]).write(b"out")
-        cast(BinaryIO, kwargs["stderr"]).write(b"err")
-        return subprocess.CompletedProcess(args, 0)
+        return cast(
+            Any,
+            real_popen(
+                args,
+                cwd=cwd,
+                env=env,
+                stdout=stdout,
+                stderr=stderr,
+                shell=shell,
+            ),
+        )
 
-    monkeypatch.setattr("wheelforge_worker.process.subprocess.run", fake_run)
+    monkeypatch.setattr("wheelforge_worker.process.subprocess.Popen", observing_popen)
 
     result = ProcessRunner().run(
         [sys.executable, "-c", "print('ok')"],
@@ -190,13 +208,54 @@ def test_runner_uses_tokenized_argv_and_complete_environment(
     )
 
     assert result.return_code == 0
-    assert result.stdout == "out"
+    assert result.stdout == "ok\n"
     assert observed["shell"] is False
     assert observed["env"] == {"PIP_NO_INPUT": "1"}
-    assert "capture_output" not in observed
     assert "text" not in observed
-    assert observed["stdout"] is not subprocess.PIPE
-    assert observed["stderr"] is not subprocess.PIPE
+    assert observed["stdout"] is subprocess.PIPE
+    assert observed["stderr"] is subprocess.PIPE
+
+
+@pytest.mark.parametrize(
+    ("script", "return_code"),
+    [("print('pipe output')", 0), ("import sys; sys.exit(7)", 7)],
+)
+def test_runner_does_not_create_unbounded_temporary_output_files_for_exits(
+    script: str,
+    return_code: int,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def reject_temporary_file(*args: object, **kwargs: object) -> Any:
+        raise AssertionError("process output must not use temporary files")
+
+    monkeypatch.setattr(tempfile, "TemporaryFile", reject_temporary_file)
+
+    result = ProcessRunner().run(
+        [sys.executable, "-c", script],
+        tmp_path,
+        timedelta(seconds=5),
+        {},
+    )
+
+    assert result.return_code == return_code
+
+
+def test_runner_does_not_create_temporary_output_files_on_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def reject_temporary_file(*args: object, **kwargs: object) -> Any:
+        raise AssertionError("process output must not use temporary files")
+
+    monkeypatch.setattr(tempfile, "TemporaryFile", reject_temporary_file)
+
+    with pytest.raises(ProcessTimeoutError):
+        ProcessRunner().run(
+            [sys.executable, "-c", "import time; time.sleep(5)"],
+            tmp_path,
+            timedelta(milliseconds=50),
+            {},
+        )
 
 
 @pytest.mark.parametrize(
@@ -408,6 +467,45 @@ def test_parse_report_bounds_in_memory_json_structure(extra: object) -> None:
         parse_pip_report(payload)
 
 
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["x" * 400, "y" * 400, "z" * 400],
+        {("k" * 400) + str(index): index for index in range(3)},
+        "\u4e2d" * 400,
+    ],
+)
+def test_parse_report_enforces_aggregate_utf8_budget_for_mappings(
+    extra: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(pip_report_module, "MAX_PIP_REPORT_BYTES", 1024)
+    payload = _report()
+    payload["extra"] = extra
+
+    with pytest.raises(PipReportSchemaError):
+        parse_pip_report(payload)
+
+
+def test_parse_report_maps_oversized_json_integer_to_typed_error() -> None:
+    payload = '{"version":"1","install":[],"extra":' + ("9" * 5000) + "}"
+
+    with pytest.raises(InvalidPipReportError):
+        parse_pip_report(payload)
+
+
+def test_parse_report_maps_deep_json_nesting_to_typed_error() -> None:
+    payload = (
+        '{"version":"1","install":[],"extra":'
+        + ("[" * 20_000)
+        + "0"
+        + ("]" * 20_000)
+        + "}"
+    )
+
+    with pytest.raises(InvalidPipReportError):
+        parse_pip_report(payload)
+
+
 def test_parse_report_bounds_dependency_count() -> None:
     with pytest.raises(PipReportSchemaError):
         parse_pip_report(
@@ -436,6 +534,19 @@ def test_parse_report_bounds_archive_hash_count() -> None:
     ],
 )
 def test_parse_report_rejects_unsafe_or_nonwheel_artifacts(url: str) -> None:
+    with pytest.raises(PipReportSchemaError):
+        parse_pip_report(_report(_install(url=url)))
+
+
+@pytest.mark.parametrize("control", ["\x00", "\x01", "\x7f"])
+def test_parse_report_rejects_raw_unicode_controls_in_artifact_url(
+    control: str,
+) -> None:
+    url = (
+        f"https://example.test/bad{control}path/"
+        "demo_pkg-1.2.3-py3-none-any.whl"
+    )
+
     with pytest.raises(PipReportSchemaError):
         parse_pip_report(_report(_install(url=url)))
 
