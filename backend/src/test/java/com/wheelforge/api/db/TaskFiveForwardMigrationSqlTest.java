@@ -10,12 +10,23 @@ class TaskFiveForwardMigrationSqlTest {
   @Test
   void v2ReconcilesBuiltInsWithoutOverwritingOperationalOrConfigValues() throws Exception {
     String migration = migration("V2__seed_builtin_data.sql");
+    String sourceMigration = migration.substring(0, migration.indexOf("insert into system_config"));
 
-    assertThat(migration).contains("on duplicate key update");
-    assertThat(migration).contains("display_name = values(display_name)");
-    assertThat(migration).contains("base_url = values(base_url)");
-    assertThat(migration).doesNotContain("enabled = values(enabled)");
-    assertThat(migration).doesNotContain("priority_no = values(priority_no)");
+    assertThat(sourceMigration)
+        .contains("where code = 'tsinghua'")
+        .contains("where code = 'aliyun'")
+        .contains("where code = 'pypi'")
+        .contains("where not exists")
+        .contains("select 1 from package_sources where code =")
+        .contains("case when not exists")
+        .contains("select 1 from package_sources where id =")
+        .contains("else uuid()")
+        .doesNotContain("on duplicate key update")
+        .doesNotContain("enabled =")
+        .doesNotContain("priority_no =")
+        .doesNotContain("timeout_seconds =")
+        .doesNotContain("failure_count =")
+        .doesNotContain("version_no =");
     assertThat(migration).doesNotContain("config_value = values(config_value)");
   }
 

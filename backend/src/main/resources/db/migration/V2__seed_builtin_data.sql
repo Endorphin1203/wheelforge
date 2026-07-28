@@ -1,16 +1,59 @@
+update package_sources
+set display_name = 'Tsinghua PyPI',
+    base_url = 'https://pypi.tuna.tsinghua.edu.cn/simple'
+where code = 'TSINGHUA';
+
 insert into package_sources (
   id, code, display_name, base_url, priority_no, enabled,
   timeout_seconds, failure_count, version_no, updated_at
-) values
-  ('10000000-0000-0000-0000-000000000001', 'TSINGHUA', 'Tsinghua PyPI',
-   'https://pypi.tuna.tsinghua.edu.cn/simple', 10, true, 30, 0, 0, '2026-07-22 00:00:00.000000'),
-  ('10000000-0000-0000-0000-000000000002', 'ALIYUN', 'Aliyun PyPI',
-   'https://mirrors.aliyun.com/pypi/simple', 20, true, 30, 0, 0, '2026-07-22 00:00:00.000000'),
-  ('10000000-0000-0000-0000-000000000003', 'PYPI', 'PyPI',
-   'https://pypi.org/simple', 30, true, 30, 0, 0, '2026-07-22 00:00:00.000000')
-on duplicate key update
-  display_name = values(display_name),
-  base_url = values(base_url);
+)
+select
+  case when not exists (
+    select 1 from package_sources where id = '10000000-0000-0000-0000-000000000001'
+  ) then '10000000-0000-0000-0000-000000000001' else uuid() end,
+  'TSINGHUA', 'Tsinghua PyPI', 'https://pypi.tuna.tsinghua.edu.cn/simple',
+  10, true, 30, 0, 0, '2026-07-22 00:00:00.000000'
+where not exists (
+  select 1 from package_sources where code = 'TSINGHUA'
+);
+
+update package_sources
+set display_name = 'Aliyun PyPI',
+    base_url = 'https://mirrors.aliyun.com/pypi/simple'
+where code = 'ALIYUN';
+
+insert into package_sources (
+  id, code, display_name, base_url, priority_no, enabled,
+  timeout_seconds, failure_count, version_no, updated_at
+)
+select
+  case when not exists (
+    select 1 from package_sources where id = '10000000-0000-0000-0000-000000000002'
+  ) then '10000000-0000-0000-0000-000000000002' else uuid() end,
+  'ALIYUN', 'Aliyun PyPI', 'https://mirrors.aliyun.com/pypi/simple',
+  20, true, 30, 0, 0, '2026-07-22 00:00:00.000000'
+where not exists (
+  select 1 from package_sources where code = 'ALIYUN'
+);
+
+update package_sources
+set display_name = 'PyPI',
+    base_url = 'https://pypi.org/simple'
+where code = 'PYPI';
+
+insert into package_sources (
+  id, code, display_name, base_url, priority_no, enabled,
+  timeout_seconds, failure_count, version_no, updated_at
+)
+select
+  case when not exists (
+    select 1 from package_sources where id = '10000000-0000-0000-0000-000000000003'
+  ) then '10000000-0000-0000-0000-000000000003' else uuid() end,
+  'PYPI', 'PyPI', 'https://pypi.org/simple',
+  30, true, 30, 0, 0, '2026-07-22 00:00:00.000000'
+where not exists (
+  select 1 from package_sources where code = 'PYPI'
+);
 
 insert into system_config (
   config_key, config_value, description, updated_by, updated_at, version_no
