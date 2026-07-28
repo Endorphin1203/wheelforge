@@ -1,8 +1,99 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta
+from enum import StrEnum
 
 from packaging.version import Version
+
+
+class PackageSource(StrEnum):
+    TSINGHUA = "TSINGHUA"
+    ALIYUN = "ALIYUN"
+    PYPI = "PYPI"
+
+
+class CandidateRejectionCode(StrEnum):
+    PRERELEASE = "PRERELEASE"
+    YANKED = "YANKED"
+    REQUIRES_PYTHON = "REQUIRES_PYTHON"
+    NO_TARGET_WHEEL = "NO_TARGET_WHEEL"
+    OUTSIDE_COMPATIBILITY_BOUNDARY = "OUTSIDE_COMPATIBILITY_BOUNDARY"
+    MALFORMED_PROVIDER_DATA = "MALFORMED_PROVIDER_DATA"
+    CANDIDATE_LIMIT = "CANDIDATE_LIMIT"
+
+
+class CompatibilityFailureCode(StrEnum):
+    STRICT_RESOLUTION = "STRICT_RESOLUTION"
+    EXHAUSTED = "EXHAUSTED"
+    ATTEMPT_LIMIT = "ATTEMPT_LIMIT"
+    TIMEOUT = "TIMEOUT"
+
+
+class VersionChangeKind(StrEnum):
+    UPGRADE = "UPGRADE"
+    DOWNGRADE = "DOWNGRADE"
+    UNCHANGED = "UNCHANGED"
+    UNRESOLVED = "UNRESOLVED"
+
+
+@dataclass(frozen=True, slots=True)
+class ResolveLimits:
+    max_candidates_per_requirement: int = 20
+    max_resolution_attempts: int = 100
+    timeout: timedelta = timedelta(minutes=10)
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.max_candidates_per_requirement) is not int
+            or not 1 <= self.max_candidates_per_requirement <= 20
+        ):
+            raise ValueError("candidate limit must be an integer from 1 through 20")
+        if (
+            type(self.max_resolution_attempts) is not int
+            or not 1 <= self.max_resolution_attempts <= 100
+        ):
+            raise ValueError("attempt limit must be an integer from 1 through 100")
+        if (
+            not isinstance(self.timeout, timedelta)
+            or self.timeout <= timedelta(0)
+            or self.timeout > timedelta(minutes=10)
+        ):
+            raise ValueError("timeout must be positive and at most 10 minutes")
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateSelection:
+    package: str
+    version: Version
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateRejection:
+    package: str
+    version: str
+    source: PackageSource
+    code: CandidateRejectionCode
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class ResolutionAttempt:
+    selections: tuple[CandidateSelection, ...]
+    source: PackageSource
+    failure: CompatibilityFailureCode | None
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class VersionChange:
+    package: str
+    kind: VersionChangeKind
+    original_constraint: str
+    original_version: Version | None
+    resolved_version: Version | None
+    reason: str
+    source: PackageSource | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +118,10 @@ class ResolvedPackage:
 class ResolutionResult:
     report_version: str
     packages: tuple[ResolvedPackage, ...]
+    attempts: tuple[ResolutionAttempt, ...] = ()
+    rejections: tuple[CandidateRejection, ...] = ()
+    changes: tuple[VersionChange, ...] = ()
+    source: PackageSource | None = None
 
 
 class ResolverError(RuntimeError):
@@ -62,3 +157,18 @@ class ResolverCommandError(ResolverError):
 
 class ResolverMissingReportError(ResolverError):
     pass
+
+
+class CompatibilityResolutionError(ResolverError):
+    def __init__(
+        self,
+        code: CompatibilityFailureCode,
+        attempts: tuple[ResolutionAttempt, ...],
+        rejections: tuple[CandidateRejection, ...],
+        changes: tuple[VersionChange, ...],
+    ) -> None:
+        self.code = code
+        self.attempts = attempts
+        self.rejections = rejections
+        self.changes = changes
+        super().__init__(f"compatibility resolution failed: {code.value}")
