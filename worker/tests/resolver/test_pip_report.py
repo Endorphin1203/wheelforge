@@ -35,6 +35,7 @@ from wheelforge_worker.resolver import (
     parse_pip_report,
 )
 from wheelforge_worker.target import TargetProfile
+import wheelforge_worker.process as process_module
 import wheelforge_worker.resolver.pip_report as pip_report_module
 
 
@@ -349,6 +350,189 @@ def test_runner_bounds_flooded_output_on_timeout(tmp_path: Path) -> None:
     assert len(raised.value.stderr.encode()) <= 4096
     assert raised.value.stdout.endswith(_TRUNCATION_MARKER)
     assert raised.value.stderr.endswith(_TRUNCATION_MARKER)
+
+
+class _FakeWindowsProcess:
+    def __init__(
+        self,
+        *,
+        poll_result: int | None = None,
+        poll_error: Exception | None = None,
+        kill_error: Exception | None = None,
+        wait_error: Exception | None = None,
+    ) -> None:
+        self.pid = 4321
+        self.poll_result = poll_result
+        self.poll_error = poll_error
+        self.kill_error = kill_error
+        self.wait_error = wait_error
+        self.calls: list[object] = []
+
+    def poll(self) -> int | None:
+        self.calls.append("poll")
+        if self.poll_error is not None:
+            raise self.poll_error
+        return self.poll_result
+
+    def kill(self) -> None:
+        self.calls.append("kill")
+        if self.kill_error is not None:
+            raise self.kill_error
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.calls.append(("wait", timeout))
+        if self.wait_error is not None:
+            raise self.wait_error
+        return 0
+
+
+def _terminate_fake_windows_process(process: _FakeWindowsProcess) -> None:
+    process_module._terminate_windows_process_tree(cast(Any, process))
+
+
+def test_windows_taskkill_success_finalizes_live_parent_with_bounded_reap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+    process = _FakeWindowsProcess()
+
+    def successful_taskkill(args: tuple[str, ...], **kwargs: object) -> Any:
+        observed["args"] = args
+        observed.update(kwargs)
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(process_module.subprocess, "run", successful_taskkill)
+
+    _terminate_fake_windows_process(process)
+
+    assert observed == {
+        "args": ("taskkill", "/PID", "4321", "/T", "/F"),
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "timeout": 5.0,
+        "check": False,
+        "shell": False,
+    }
+    assert process.calls == ["poll", "kill", ("wait", 5.0)]
+
+
+def test_windows_taskkill_success_skips_kill_for_exited_parent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakeWindowsProcess(poll_result=0)
+    monkeypatch.setattr(
+        process_module.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0),
+    )
+
+    _terminate_fake_windows_process(process)
+
+    assert process.calls == ["poll", ("wait", 5.0)]
+
+
+@pytest.mark.parametrize(("poll_result", "raises"), [(None, True), (0, False)])
+def test_windows_taskkill_nonzero_always_uses_bounded_parent_finalizer(
+    monkeypatch: pytest.MonkeyPatch,
+    poll_result: int | None,
+    raises: bool,
+) -> None:
+    process = _FakeWindowsProcess(poll_result=poll_result)
+    monkeypatch.setattr(
+        process_module.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 1),
+    )
+
+    if raises:
+        with pytest.raises(ProcessExecutionError):
+            _terminate_fake_windows_process(process)
+    else:
+        _terminate_fake_windows_process(process)
+
+    expected_kill = ["kill"] if poll_result is None else []
+    assert process.calls == ["poll", *expected_kill, ("wait", 5.0)]
+
+
+@pytest.mark.parametrize(
+    "taskkill_error",
+    [
+        subprocess.TimeoutExpired(("taskkill",), 5.0),
+        OSError("taskkill unavailable"),
+    ],
+)
+def test_windows_taskkill_failures_still_finalize_parent_with_bounded_reap(
+    monkeypatch: pytest.MonkeyPatch,
+    taskkill_error: Exception,
+) -> None:
+    process = _FakeWindowsProcess()
+
+    def failing_taskkill(*args: object, **kwargs: object) -> Any:
+        raise taskkill_error
+
+    monkeypatch.setattr(process_module.subprocess, "run", failing_taskkill)
+
+    with pytest.raises(ProcessExecutionError):
+        _terminate_fake_windows_process(process)
+
+    assert process.calls == ["poll", "kill", ("wait", 5.0)]
+
+
+def test_windows_parent_poll_failure_still_attempts_kill_and_bounded_reap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakeWindowsProcess(poll_error=RuntimeError("poll failed"))
+    monkeypatch.setattr(
+        process_module.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0),
+    )
+
+    with pytest.raises(ProcessExecutionError):
+        _terminate_fake_windows_process(process)
+
+    assert process.calls == ["poll", "kill", ("wait", 5.0)]
+
+
+def test_windows_parent_kill_failure_still_attempts_bounded_reap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakeWindowsProcess(kill_error=RuntimeError("kill failed"))
+    monkeypatch.setattr(
+        process_module.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0),
+    )
+
+    with pytest.raises(ProcessExecutionError):
+        _terminate_fake_windows_process(process)
+
+    assert process.calls == ["poll", "kill", ("wait", 5.0)]
+
+
+@pytest.mark.parametrize(
+    "wait_error",
+    [
+        subprocess.TimeoutExpired(("parent",), 5.0),
+        OSError("wait failed"),
+        RuntimeError("unexpected wait failure"),
+    ],
+)
+def test_windows_parent_reap_failures_are_typed_and_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+    wait_error: Exception,
+) -> None:
+    process = _FakeWindowsProcess(wait_error=wait_error)
+    monkeypatch.setattr(
+        process_module.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0),
+    )
+
+    with pytest.raises(ProcessExecutionError):
+        _terminate_fake_windows_process(process)
+
+    assert process.calls == ["poll", "kill", ("wait", 5.0)]
 
 
 def _descendant_parent_script(

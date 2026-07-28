@@ -19,6 +19,7 @@ _TRUNCATION_MARKER_BYTES = PROCESS_OUTPUT_TRUNCATION_MARKER.encode()
 _DRAIN_JOIN_TIMEOUT_SECONDS = 0.5
 _DRAIN_CLOSE_JOIN_TIMEOUT_SECONDS = 0.1
 _WINDOWS_TREE_KILL_TIMEOUT_SECONDS = 5.0
+_PROCESS_REAP_TIMEOUT_SECONDS = 5.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,15 +236,17 @@ def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
     except ProcessLookupError:
         pass
     except OSError as error:
-        _kill_direct_process(process)
+        _finalize_parent_process(process)
         raise ProcessExecutionError("process group could not be terminated") from error
     try:
-        process.wait()
-    except OSError as error:
+        process.wait(timeout=_PROCESS_REAP_TIMEOUT_SECONDS)
+    except Exception as error:
         raise ProcessExecutionError("process could not be reaped") from error
 
 
 def _terminate_windows_process_tree(process: subprocess.Popen[bytes]) -> None:
+    taskkill_error: Exception | None = None
+    taskkill_return_code: int | None = None
     try:
         completed = subprocess.run(
             ("taskkill", "/PID", str(process.pid), "/T", "/F"),
@@ -253,23 +256,48 @@ def _terminate_windows_process_tree(process: subprocess.Popen[bytes]) -> None:
             check=False,
             shell=False,
         )
-    except (OSError, subprocess.SubprocessError) as error:
-        _kill_direct_process(process)
-        raise ProcessExecutionError("Windows process tree could not be terminated") from error
-    if completed.returncode != 0 and process.poll() is None:
-        _kill_direct_process(process)
+        taskkill_return_code = completed.returncode
+    except Exception as error:
+        taskkill_error = error
+
+    parent_was_live = _finalize_parent_process(process)
+
+    if taskkill_error is not None:
+        raise ProcessExecutionError(
+            "Windows process tree could not be terminated"
+        ) from taskkill_error
+    if taskkill_return_code != 0 and parent_was_live:
         raise ProcessExecutionError("Windows process tree could not be terminated")
-    try:
-        process.wait(timeout=_WINDOWS_TREE_KILL_TIMEOUT_SECONDS)
-    except (OSError, subprocess.SubprocessError) as error:
-        raise ProcessExecutionError("process could not be reaped") from error
 
 
-def _kill_direct_process(process: subprocess.Popen[bytes]) -> None:
+def _finalize_parent_process(process: subprocess.Popen[bytes]) -> bool:
+    poll_error: Exception | None = None
+    kill_error: Exception | None = None
+    reap_error: Exception | None = None
     try:
-        process.kill()
-    finally:
-        process.wait()
+        parent_was_live = process.poll() is None
+    except Exception as error:
+        poll_error = error
+        parent_was_live = True
+
+    if parent_was_live:
+        try:
+            process.kill()
+        except Exception as error:
+            kill_error = error
+
+    try:
+        process.wait(timeout=_PROCESS_REAP_TIMEOUT_SECONDS)
+    except Exception as error:
+        reap_error = error
+
+    if reap_error is not None:
+        raise ProcessExecutionError("process could not be reaped") from reap_error
+    if kill_error is not None:
+        raise ProcessExecutionError("process could not be terminated") from kill_error
+    if poll_error is not None:
+        raise ProcessExecutionError("process state could not be checked") from poll_error
+    return parent_was_live
 
 
 def _finish_drains(
