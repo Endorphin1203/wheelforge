@@ -252,6 +252,35 @@ def test_linux_arm64_wheel_policy_accepts_native_abi3_pure_and_compressed_tags()
     )
 
 
+@pytest.mark.parametrize("abi3_interpreter", ["cp32", "cp38"])
+def test_wheel_policy_accepts_stable_abi_baselines_from_cp32(
+    abi3_interpreter: str,
+) -> None:
+    profile = make_profile(
+        python_version="3.13",
+        python_full_version="3.13.9",
+    )
+    _, _, wheel_is_compatible = import_target_policy()
+
+    assert wheel_is_compatible(
+        f"demo-1.0-{abi3_interpreter}-abi3-manylinux2014_aarch64.whl",
+        profile,
+    )
+
+
+def test_wheel_policy_rejects_stable_abi_baseline_newer_than_target() -> None:
+    profile = make_profile(
+        python_version="3.13",
+        python_full_version="3.13.9",
+    )
+    _, _, wheel_is_compatible = import_target_policy()
+
+    assert not wheel_is_compatible(
+        "demo-1.0-cp314-abi3-manylinux2014_aarch64.whl",
+        profile,
+    )
+
+
 def test_linux_manylinux_policy_accepts_older_pep600_baselines_but_not_newer_ones() -> None:
     profile = make_profile(os="LINUX", architecture="X86_64", platform_tag="manylinux2014_x86_64")
     _, _, wheel_is_compatible = import_target_policy()

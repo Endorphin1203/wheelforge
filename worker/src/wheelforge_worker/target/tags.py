@@ -54,4 +54,4 @@ def compatible_platform_tags(profile: TargetProfile) -> tuple[str, ...]:
 
 def compatible_abi3_interpreters(profile: TargetProfile) -> tuple[str, ...]:
     target_minor = int(profile.python_version.split(".")[1])
-    return tuple(f"cp3{minor}" for minor in range(9, target_minor + 1))
+    return tuple(f"cp3{minor}" for minor in range(2, target_minor + 1))
