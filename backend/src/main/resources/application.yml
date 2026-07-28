@@ -9,6 +9,11 @@ spring:
       ddl-auto: validate
   flyway:
     enabled: true
+  jackson:
+    deserialization:
+      fail-on-unknown-properties: true
+    read:
+      strict-duplicate-detection: true
   servlet:
     multipart:
       max-file-size: 512KB
@@ -23,3 +28,4 @@ wheelforge:
     enabled: ${WF_RETENTION_ENABLED:false}
     batch-size: ${WF_RETENTION_BATCH_SIZE:100}
     fixed-delay-ms: ${WF_RETENTION_FIXED_DELAY_MS:60000}
+    active-download-lease-seconds: ${WF_RETENTION_ACTIVE_DOWNLOAD_LEASE_SECONDS:300}

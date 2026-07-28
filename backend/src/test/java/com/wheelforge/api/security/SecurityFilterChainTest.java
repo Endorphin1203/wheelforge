@@ -18,6 +18,7 @@ import java.util.Base64;
 import java.util.Map;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -29,6 +30,7 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.security.access.AccessDeniedException;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -55,6 +57,14 @@ class SecurityFilterChainTest {
 
   @Autowired private MockMvc mvc;
   @Autowired private TokenService tokenService;
+  @MockitoBean private UserAccountRepository userAccountRepository;
+  private UserAccount currentAccount;
+
+  @BeforeEach
+  void resolveCurrentAccountFromTheRepository() {
+    org.mockito.BDDMockito.given(userAccountRepository.findById(USER_ID))
+        .willAnswer(ignored -> java.util.Optional.ofNullable(currentAccount));
+  }
 
   @Test
   void acceptsAValidBearerTokenAndExposesTheCurrentUser() throws Exception {
@@ -63,6 +73,35 @@ class SecurityFilterChainTest {
         .andExpect(status().isOk())
         .andExpect(jsonPath("$.userId").value(USER_ID))
         .andExpect(jsonPath("$.admin").value(true));
+  }
+
+  @Test
+  void oldUserAndAdminTokensLoseAccessImmediatelyAfterDisable() throws Exception {
+    String userToken = validToken("USER");
+    mvc.perform(get("/api/test/current-user").header(HttpHeaders.AUTHORIZATION, bearer(userToken)))
+        .andExpect(status().isOk());
+    currentAccount.updateStatus("DISABLED");
+    mvc.perform(get("/api/test/current-user").header(HttpHeaders.AUTHORIZATION, bearer(userToken)))
+        .andExpect(status().isUnauthorized())
+        .andExpect(jsonPath("$.code").value("UNAUTHENTICATED"));
+
+    String adminToken = validToken("ADMIN");
+    mvc.perform(get("/api/test/method-admin").header(HttpHeaders.AUTHORIZATION, bearer(adminToken)))
+        .andExpect(status().isOk());
+    currentAccount.updateStatus("DISABLED");
+    mvc.perform(get("/api/test/method-admin").header(HttpHeaders.AUTHORIZATION, bearer(adminToken)))
+        .andExpect(status().isUnauthorized())
+        .andExpect(jsonPath("$.code").value("UNAUTHENTICATED"));
+  }
+
+  @Test
+  void oldTokenLosesAccessWhenItsRoleNoLongerMatchesTheDatabase() throws Exception {
+    String adminToken = validToken("ADMIN");
+    currentAccount = account("USER");
+
+    mvc.perform(get("/api/test/method-admin").header(HttpHeaders.AUTHORIZATION, bearer(adminToken)))
+        .andExpect(status().isUnauthorized())
+        .andExpect(jsonPath("$.code").value("UNAUTHENTICATED"));
   }
 
   @Test
@@ -76,6 +115,12 @@ class SecurityFilterChainTest {
     mvc.perform(asyncDispatch(pending))
         .andExpect(status().isOk())
         .andExpect(content().bytes("streamed".getBytes(StandardCharsets.UTF_8)));
+
+    currentAccount.updateStatus("DISABLED");
+    mvc.perform(get("/api/test/stream").header(HttpHeaders.AUTHORIZATION, bearer(token)))
+        .andExpect(status().isUnauthorized())
+        .andExpect(request().asyncNotStarted())
+        .andExpect(jsonPath("$.code").value("UNAUTHENTICATED"));
   }
 
   @Test
@@ -154,6 +199,7 @@ class SecurityFilterChainTest {
         .andExpect(jsonPath("$.message").isString())
         .andExpect(jsonPath("$.fieldErrors").isMap())
         .andExpect(jsonPath("$.traceId").isString());
+    currentAccount = account("ADMIN");
     mvc.perform(get("/api/test/typed/not-a-uuid").header(HttpHeaders.AUTHORIZATION, authorization))
         .andExpect(status().isBadRequest())
         .andExpect(jsonPath("$.code").value("VALIDATION_FAILED"))
@@ -191,16 +237,13 @@ class SecurityFilterChainTest {
   }
 
   private String validToken(String role) {
-    return tokenService
-        .issue(
-            new UserAccount(
-                USER_ID,
-                "admin",
-                "$argon2id$encoded",
-                role,
-                "ACTIVE",
-                LocalDateTime.now(ZoneOffset.UTC)))
-        .accessToken();
+    currentAccount = account(role);
+    return tokenService.issue(currentAccount).accessToken();
+  }
+
+  private UserAccount account(String role) {
+    return new UserAccount(
+        USER_ID, "admin", "$argon2id$encoded", role, "ACTIVE", LocalDateTime.now(ZoneOffset.UTC));
   }
 
   private String bearer(String token) {

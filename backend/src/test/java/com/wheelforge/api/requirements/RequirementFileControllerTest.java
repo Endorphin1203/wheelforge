@@ -15,6 +15,7 @@ import com.wheelforge.api.common.ApiExceptionHandler;
 import com.wheelforge.api.security.SecurityConfig;
 import com.wheelforge.api.security.TokenService;
 import com.wheelforge.api.security.UserAccount;
+import com.wheelforge.api.security.UserAccountRepository;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
@@ -40,6 +41,7 @@ class RequirementFileControllerTest {
   @Autowired private MockMvc mvc;
   @Autowired private TokenService tokenService;
   @MockitoBean private RequirementFileService requirementFileService;
+  @MockitoBean private UserAccountRepository userAccountRepository;
 
   @Test
   void uploadsRequirementsAndQueuesParsingForAuthenticatedOwner() throws Exception {
@@ -173,6 +175,8 @@ class RequirementFileControllerTest {
             "USER",
             "ACTIVE",
             LocalDateTime.now(ZoneOffset.UTC));
+    given(userAccountRepository.findById(USER_ID.toString()))
+        .willReturn(java.util.Optional.of(user));
     return "Bearer " + tokenService.issue(user).accessToken();
   }
 }

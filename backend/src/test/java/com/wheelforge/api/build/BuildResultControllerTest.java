@@ -12,6 +12,7 @@ import com.wheelforge.api.common.ApiExceptionHandler;
 import com.wheelforge.api.security.SecurityConfig;
 import com.wheelforge.api.security.TokenService;
 import com.wheelforge.api.security.UserAccount;
+import com.wheelforge.api.security.UserAccountRepository;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
@@ -37,6 +38,7 @@ class BuildResultControllerTest {
   @Autowired private MockMvc mvc;
   @Autowired private TokenService tokenService;
   @MockitoBean private BuildResultService service;
+  @MockitoBean private UserAccountRepository userAccountRepository;
 
   @Test
   void returnsLogsAfterTheExplicitCursorWithStaticValidation() throws Exception {
@@ -177,6 +179,8 @@ class BuildResultControllerTest {
             "USER",
             "ACTIVE",
             LocalDateTime.now(ZoneOffset.UTC));
+    given(userAccountRepository.findById(USER_ID.toString()))
+        .willReturn(java.util.Optional.of(user));
     return "Bearer " + tokenService.issue(user).accessToken();
   }
 }

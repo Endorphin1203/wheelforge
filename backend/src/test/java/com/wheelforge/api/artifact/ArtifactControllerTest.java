@@ -16,6 +16,7 @@ import com.wheelforge.api.common.ApiExceptionHandler;
 import com.wheelforge.api.security.SecurityConfig;
 import com.wheelforge.api.security.TokenService;
 import com.wheelforge.api.security.UserAccount;
+import com.wheelforge.api.security.UserAccountRepository;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
@@ -42,10 +43,11 @@ class ArtifactControllerTest {
   @Autowired private MockMvc mvc;
   @Autowired private TokenService tokenService;
   @MockitoBean private ArtifactService service;
+  @MockitoBean private UserAccountRepository userAccountRepository;
 
   @Test
   void listAndDetailExposeStaticMetadataWithoutStoragePaths() throws Exception {
-    given(service.list(USER_ID)).willReturn(List.of(view()));
+    given(service.list(USER_ID, null, null, 50)).willReturn(List.of(view()));
     given(service.get(USER_ID, ARTIFACT_ID)).willReturn(view());
 
     mvc.perform(get("/api/artifacts").header(HttpHeaders.AUTHORIZATION, bearerToken()))
@@ -72,7 +74,11 @@ class ArtifactControllerTest {
   void streamsOwnedArtifactWithFixedZipHeadersAndExactLength() throws Exception {
     var ticket =
         new ArtifactService.DownloadTicket(
-            RECORD_ID, "users/internal/artifacts/object.zip", "wheelhouse.zip", 4);
+            RECORD_ID,
+            "users/internal/artifacts/object.zip",
+            "../../unsafe\r\nname.zip",
+            4,
+            "9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a");
     given(service.prepareDownload(any(), any(), any(), any())).willReturn(ticket);
     org.mockito.Mockito.doAnswer(
         invocation -> {
@@ -146,6 +152,8 @@ class ArtifactControllerTest {
             "USER",
             "ACTIVE",
             LocalDateTime.now(ZoneOffset.UTC));
+    given(userAccountRepository.findById(USER_ID.toString()))
+        .willReturn(java.util.Optional.of(user));
     return "Bearer " + tokenService.issue(user).accessToken();
   }
 }

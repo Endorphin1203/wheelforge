@@ -13,6 +13,7 @@ import com.wheelforge.api.common.ApiExceptionHandler;
 import com.wheelforge.api.security.SecurityConfig;
 import com.wheelforge.api.security.TokenService;
 import com.wheelforge.api.security.UserAccount;
+import com.wheelforge.api.security.UserAccountRepository;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
@@ -38,6 +39,7 @@ class AdminControllerTest {
   @Autowired private MockMvc mvc;
   @Autowired private TokenService tokenService;
   @MockitoBean private AdminService service;
+  @MockitoBean private UserAccountRepository userAccountRepository;
 
   @Test
   void aRealUserTokenReceivesTheGlobal403ForEveryAdminEndpoint() throws Exception {
@@ -200,6 +202,39 @@ class AdminControllerTest {
         .andExpect(jsonPath("$[0].version").value(1));
   }
 
+  @Test
+  void adminRequestsRejectUnknownAlternateAndDuplicateJsonFields() throws Exception {
+    String authorization = token("ADMIN");
+    for (String body :
+        List.of(
+            "{\"enabled\":true,\"priorityNo\":10,\"timeoutSeconds\":30,\"url\":\"https://evil.example\"}",
+            "{\"enabled\":true,\"priorityNo\":10,\"timeoutSeconds\":30,\"base_url\":\"https://evil.example\"}",
+            "{\"enabled\":true,\"priorityN0\":10,\"timeoutSeconds\":30}",
+            "{\"enabled\":true,\"priorityNo\":10,\"timeoutSeconds\":30,\"unknown\":1}",
+            "{\"enabled\":true,\"enabled\":false,\"priorityNo\":10,\"timeoutSeconds\":30}")) {
+      mvc.perform(
+              put("/api/admin/package-sources/{id}", SOURCE_ID)
+                  .header(HttpHeaders.AUTHORIZATION, authorization)
+                  .contentType(MediaType.APPLICATION_JSON)
+                  .content(body))
+          .andExpect(status().isBadRequest());
+    }
+
+    mvc.perform(
+            post("/api/admin/users")
+                .header(HttpHeaders.AUTHORIZATION, authorization)
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"username\":\"new-user\",\"role\":\"USER\",\"rol\":\"ADMIN\"}"))
+        .andExpect(status().isBadRequest());
+    mvc.perform(
+            put("/api/admin/system-config")
+                .header(HttpHeaders.AUTHORIZATION, authorization)
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(
+                    "{\"artifactRetentionDays\":{\"value\":30,\"version\":0,\"unknown\":true}}"))
+        .andExpect(status().isBadRequest());
+  }
+
   private String token(String role) {
     var user =
         new UserAccount(
@@ -209,6 +244,8 @@ class AdminControllerTest {
             role,
             "ACTIVE",
             LocalDateTime.now(ZoneOffset.UTC));
+    given(userAccountRepository.findById(ADMIN_ID.toString()))
+        .willReturn(java.util.Optional.of(user));
     return "Bearer " + tokenService.issue(user).accessToken();
   }
 }

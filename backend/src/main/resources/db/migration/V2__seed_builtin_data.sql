@@ -7,7 +7,10 @@ insert into package_sources (
   ('10000000-0000-0000-0000-000000000002', 'ALIYUN', 'Aliyun PyPI',
    'https://mirrors.aliyun.com/pypi/simple', 20, true, 30, 0, 0, '2026-07-22 00:00:00.000000'),
   ('10000000-0000-0000-0000-000000000003', 'PYPI', 'PyPI',
-   'https://pypi.org/simple', 30, true, 30, 0, 0, '2026-07-22 00:00:00.000000');
+   'https://pypi.org/simple', 30, true, 30, 0, 0, '2026-07-22 00:00:00.000000')
+on duplicate key update
+  display_name = values(display_name),
+  base_url = values(base_url);
 
 insert into system_config (
   config_key, config_value, description, updated_by, updated_at, version_no
@@ -41,4 +44,6 @@ insert into system_config (
   ('artifactRetentionDays', '30', 'Artifact retention period in days', null,
    '2026-07-22 00:00:00.000000', 0),
   ('retentionEnabled', 'true', 'Whether automatic Artifact retention cleanup is enabled', null,
-   '2026-07-22 00:00:00.000000', 0);
+   '2026-07-22 00:00:00.000000', 0)
+on duplicate key update
+  config_key = values(config_key);

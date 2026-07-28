@@ -160,6 +160,7 @@ public class AdminService {
             .filter(value -> BUILT_IN_SOURCES.contains(value.getCode()))
             .orElseThrow(() -> ApiException.notFound("Package source was not found"));
     source.update(request.enabled(), request.priorityNo(), request.timeoutSeconds(), now());
+    sourceRepository.flush();
     return sourceView(source);
   }
 

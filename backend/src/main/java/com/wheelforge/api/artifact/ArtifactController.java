@@ -12,6 +12,7 @@ import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
 
@@ -25,8 +26,12 @@ public class ArtifactController {
   }
 
   @GetMapping
-  public List<ArtifactService.ArtifactView> list(@AuthenticationPrincipal CurrentUser currentUser) {
-    return service.list(currentUser.requireUserId());
+  public List<ArtifactService.ArtifactView> list(
+      @AuthenticationPrincipal CurrentUser currentUser,
+      @RequestParam(required = false) java.time.LocalDateTime beforeCreatedAt,
+      @RequestParam(required = false) UUID beforeId,
+      @RequestParam(defaultValue = "50") int limit) {
+    return service.list(currentUser.requireUserId(), beforeCreatedAt, beforeId, limit);
   }
 
   @GetMapping("/{id}")
@@ -52,7 +57,7 @@ public class ArtifactController {
         .contentLength(ticket.sizeBytes())
         .header(
             HttpHeaders.CONTENT_DISPOSITION,
-            ContentDisposition.attachment().filename(ticket.filename()).build().toString())
+            ContentDisposition.attachment().filename("wheelhouse.zip").build().toString())
         .body(body);
   }
 }

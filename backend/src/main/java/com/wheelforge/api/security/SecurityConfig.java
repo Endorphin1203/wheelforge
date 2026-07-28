@@ -36,7 +36,10 @@ public class SecurityConfig {
 
   @Bean
   SecurityFilterChain securityFilterChain(
-      HttpSecurity http, TokenService tokenService, ApiExceptionHandler apiExceptionHandler)
+      HttpSecurity http,
+      TokenService tokenService,
+      UserAccountRepository userAccountRepository,
+      ApiExceptionHandler apiExceptionHandler)
       throws Exception {
     return http.csrf(AbstractHttpConfigurer::disable)
         .sessionManagement(
@@ -56,15 +59,19 @@ public class SecurityConfig {
                     .anyRequest()
                     .authenticated())
         .addFilterBefore(
-            new TokenAuthenticationFilter(tokenService), UsernamePasswordAuthenticationFilter.class)
+            new TokenAuthenticationFilter(tokenService, userAccountRepository),
+            UsernamePasswordAuthenticationFilter.class)
         .build();
   }
 
   static final class TokenAuthenticationFilter extends OncePerRequestFilter {
     private final TokenService tokenService;
+    private final UserAccountRepository userAccountRepository;
 
-    TokenAuthenticationFilter(TokenService tokenService) {
+    TokenAuthenticationFilter(
+        TokenService tokenService, UserAccountRepository userAccountRepository) {
       this.tokenService = tokenService;
+      this.userAccountRepository = userAccountRepository;
     }
 
     @Override
@@ -76,10 +83,12 @@ public class SecurityConfig {
     protected void doFilterInternal(
         HttpServletRequest request, HttpServletResponse response, FilterChain filterChain)
         throws ServletException, IOException {
+      SecurityContextHolder.clearContext();
       String authorization = request.getHeader(HttpHeaders.AUTHORIZATION);
       if (authorization != null && authorization.startsWith("Bearer ")) {
         tokenService
             .parse(authorization.substring("Bearer ".length()))
+            .filter(this::isCurrentActiveAccount)
             .ifPresent(
                 currentUser -> {
                   var authentication =
@@ -91,6 +100,14 @@ public class SecurityConfig {
                 });
       }
       filterChain.doFilter(request, response);
+    }
+
+    private boolean isCurrentActiveAccount(CurrentUser currentUser) {
+      return userAccountRepository
+          .findById(currentUser.userId().toString())
+          .filter(UserAccount::isActive)
+          .filter(account -> account.getRole().equals(currentUser.role()))
+          .isPresent();
     }
   }
 }

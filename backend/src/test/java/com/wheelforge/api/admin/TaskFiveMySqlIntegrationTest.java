@@ -1,6 +1,7 @@
 package com.wheelforge.api.admin;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.asyncDispatch;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
@@ -11,6 +12,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 import com.wheelforge.api.artifact.ArtifactEntity;
 import com.wheelforge.api.artifact.ArtifactRepository;
+import com.wheelforge.api.artifact.ArtifactService;
 import com.wheelforge.api.artifact.DownloadRecordRepository;
 import com.wheelforge.api.build.BuildStatus;
 import com.wheelforge.api.build.BuildTaskEntity;
@@ -25,18 +27,24 @@ import com.wheelforge.api.security.UserAccountRepository;
 import com.wheelforge.api.target.TargetProfileEntity;
 import com.wheelforge.api.target.TargetProfileRepository;
 import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.security.MessageDigest;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
+import org.springframework.data.domain.Pageable;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -65,7 +73,9 @@ class TaskFiveMySqlIntegrationTest {
   @Autowired private RequirementFileRepository requirementFileRepository;
   @Autowired private BuildTaskRepository taskRepository;
   @Autowired private ArtifactRepository artifactRepository;
+  @Autowired private ArtifactService artifactService;
   @Autowired private DownloadRecordRepository downloadRecordRepository;
+  @Autowired private PackageSourceRepository packageSourceRepository;
   @Autowired private LocalFileStorage storage;
   @Autowired private JdbcTemplate jdbcTemplate;
   @Autowired private PlatformTransactionManager transactionManager;
@@ -75,6 +85,12 @@ class TaskFiveMySqlIntegrationTest {
     registry.add("spring.datasource.url", () -> System.getenv("WF_TEST_JDBC_URL"));
     registry.add("spring.datasource.username", () -> System.getenv("WF_TEST_DATABASE_USER"));
     registry.add("spring.datasource.password", () -> System.getenv("WF_TEST_DATABASE_PASSWORD"));
+  }
+
+  @BeforeEach
+  void clearArtifactRows() {
+    jdbcTemplate.update("delete from download_records");
+    jdbcTemplate.update("delete from artifacts");
   }
 
   @Test
@@ -112,6 +128,23 @@ class TaskFiveMySqlIntegrationTest {
     assertThat(objectMapper.readTree(sources.getResponse().getContentAsByteArray()))
         .extracting(node -> node.get("code").asText())
         .containsExactlyInAnyOrder("TSINGHUA", "ALIYUN", "PYPI");
+    var sourceArray = objectMapper.readTree(sources.getResponse().getContentAsByteArray());
+    var tsinghua =
+        java.util.stream.StreamSupport.stream(sourceArray.spliterator(), false)
+            .filter(node -> node.get("code").asText().equals("TSINGHUA"))
+            .findFirst()
+            .orElseThrow();
+    String sourceId = tsinghua.get("id").asText();
+    long sourceVersion = tsinghua.get("version").asLong();
+    mvc.perform(
+            put("/api/admin/package-sources/{id}", sourceId)
+                .header(HttpHeaders.AUTHORIZATION, input.authorization())
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"enabled\":false,\"priorityNo\":9,\"timeoutSeconds\":45}"))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.version").value(sourceVersion + 1));
+    assertThat(packageSourceRepository.findById(sourceId).orElseThrow().getVersionNo())
+        .isEqualTo(sourceVersion + 1);
 
     MvcResult configs =
         mvc.perform(
@@ -140,8 +173,6 @@ class TaskFiveMySqlIntegrationTest {
 
   @Test
   void expiredArtifactClaimUsesSkipLockedAcrossTransactions() throws Exception {
-    jdbcTemplate.update("delete from download_records");
-    jdbcTemplate.update("delete from artifacts");
     TestInput input = seedArtifact();
     LocalDateTime claimAt = LocalDateTime.of(2100, 1, 1, 0, 0);
     var firstClaimed = new CountDownLatch(1);
@@ -154,7 +185,9 @@ class TaskFiveMySqlIntegrationTest {
                   new TransactionTemplate(transactionManager)
                       .execute(
                           ignored -> {
-                            List<ArtifactEntity> rows = artifactRepository.claimExpired(claimAt, 1);
+                            List<ArtifactEntity> rows =
+                                artifactRepository.claimExpired(
+                                    claimAt, claimAt.minusMinutes(5), 1);
                             firstClaimed.countDown();
                             await(releaseFirst);
                             return rows;
@@ -164,7 +197,10 @@ class TaskFiveMySqlIntegrationTest {
           executor.submit(
               () ->
                   new TransactionTemplate(transactionManager)
-                      .execute(ignored -> artifactRepository.claimExpired(claimAt, 1)));
+                      .execute(
+                          ignored ->
+                              artifactRepository.claimExpired(
+                                  claimAt, claimAt.minusMinutes(5), 1)));
 
       assertThat(second.get(5, TimeUnit.SECONDS)).isEmpty();
       releaseFirst.countDown();
@@ -176,6 +212,101 @@ class TaskFiveMySqlIntegrationTest {
       releaseFirst.countDown();
       executor.shutdownNow();
     }
+  }
+
+  @Test
+  void flushFailureLeavesThePersistedDownloadAuditIncomplete() throws Exception {
+    TestInput input = seedArtifact();
+    byte[] zip = {80, 75, 3, 4};
+    storage.putAtomically(input.objectKey(), new ByteArrayInputStream(zip), zip.length);
+    ArtifactService.DownloadTicket ticket =
+        artifactService.prepareDownload(
+            input.userId(), input.artifactId(), "127.0.0.1", "native-flush-test");
+
+    assertThatThrownBy(() -> artifactService.stream(ticket, new FlushFailingOutputStream()))
+        .isInstanceOf(IOException.class)
+        .hasMessageContaining("flush failed");
+
+    assertThat(downloadRecordRepository.findById(ticket.recordId().toString()).orElseThrow())
+        .extracting(record -> record.isCompleted())
+        .isEqualTo(false);
+  }
+
+  @Test
+  void recentIncompleteDownloadLeaseBlocksRetentionButOldLeaseExpires() {
+    TestInput input = seedArtifact();
+    ArtifactEntity artifact =
+        artifactRepository.findById(input.artifactId().toString()).orElseThrow();
+    LocalDateTime claimAt = artifact.getExpiresAt().plusSeconds(1);
+    String recordId = UUID.randomUUID().toString();
+    assertThat(
+            jdbcTemplate.update(
+                """
+                insert into download_records
+                  (id, artifact_id, user_id, ip_address, user_agent, completed, downloaded_at)
+                select ?, artifact.id, ?, ?, ?, false, artifact.expires_at
+                  from artifacts artifact
+                 where artifact.id = ?
+                """,
+                recordId,
+                input.userId().toString(),
+                "127.0.0.1",
+                "lease-test",
+                input.artifactId().toString()))
+        .isEqualTo(1);
+
+    assertThat(claimExpired(claimAt, claimAt.minusMinutes(5), 10)).isEmpty();
+
+    assertThat(
+            jdbcTemplate.update(
+                """
+                update download_records download
+                  join artifacts artifact on artifact.id = download.artifact_id
+                   set download.downloaded_at = date_sub(artifact.expires_at, interval 6 minute)
+                 where download.id = ?
+                """,
+                recordId))
+        .isEqualTo(1);
+    assertThat(claimExpired(claimAt, claimAt.minusMinutes(5), 10))
+        .extracting(ArtifactEntity::getId)
+        .contains(input.artifactId().toString());
+  }
+
+  @Test
+  void artifactCursorPaginationIsStableWithoutDuplicates() {
+    TestInput input = seedArtifact();
+    ArtifactEntity original =
+        artifactRepository.findById(input.artifactId().toString()).orElseThrow();
+    for (String id :
+        List.of("11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222")) {
+      artifactRepository.saveAndFlush(
+          new ArtifactEntity(
+              id,
+              input.taskId().toString(),
+              "OFFLINE_ZIP",
+              "wheelhouse.zip",
+              "users/" + input.userId() + "/artifacts/" + id + "/wheelhouse.zip",
+              4,
+              sha256(new byte[] {80, 75, 3, 4}),
+              "SUCCESS",
+              "STATIC",
+              original.getExpiresAt(),
+              0,
+              null,
+              original.getCreatedAt()));
+    }
+
+    List<ArtifactEntity> first =
+        artifactRepository.findPageByOwner(
+            input.userId().toString(), null, null, Pageable.ofSize(2));
+    ArtifactEntity cursor = first.getLast();
+    List<ArtifactEntity> second =
+        artifactRepository.findPageByOwner(
+            input.userId().toString(), cursor.getCreatedAt(), cursor.getId(), Pageable.ofSize(2));
+
+    assertThat(first).hasSize(2);
+    assertThat(second).hasSize(1);
+    assertThat(first).doesNotContainAnyElementsOf(second);
   }
 
   private TestInput seedArtifact() {
@@ -241,14 +372,29 @@ class TaskFiveMySqlIntegrationTest {
             "wheelhouse.zip",
             objectKey,
             4,
-            "a".repeat(64),
+            sha256(new byte[] {80, 75, 3, 4}),
             "SUCCESS",
             "STATIC",
             now.plusDays(30),
             0,
             null,
             now));
-    return new TestInput(artifactId, objectKey, "Bearer " + tokenService.issue(user).accessToken());
+    return new TestInput(
+        userId, taskId, artifactId, objectKey, "Bearer " + tokenService.issue(user).accessToken());
+  }
+
+  private static String sha256(byte[] value) {
+    try {
+      return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(value));
+    } catch (java.security.NoSuchAlgorithmException exception) {
+      throw new IllegalStateException(exception);
+    }
+  }
+
+  private List<ArtifactEntity> claimExpired(
+      LocalDateTime now, LocalDateTime activeDownloadCutoff, int batchSize) {
+    return new TransactionTemplate(transactionManager)
+        .execute(ignored -> artifactRepository.claimExpired(now, activeDownloadCutoff, batchSize));
   }
 
   private void await(CountDownLatch latch) {
@@ -262,5 +408,16 @@ class TaskFiveMySqlIntegrationTest {
     }
   }
 
-  private record TestInput(UUID artifactId, String objectKey, String authorization) {}
+  private record TestInput(
+      UUID userId, UUID taskId, UUID artifactId, String objectKey, String authorization) {}
+
+  private static final class FlushFailingOutputStream extends OutputStream {
+    @Override
+    public void write(int value) {}
+
+    @Override
+    public void flush() throws IOException {
+      throw new IOException("flush failed");
+    }
+  }
 }

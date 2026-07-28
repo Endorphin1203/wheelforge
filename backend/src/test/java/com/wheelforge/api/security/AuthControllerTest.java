@@ -24,6 +24,7 @@ class AuthControllerTest {
   @Autowired private MockMvc mvc;
   @MockitoBean private AuthService authService;
   @MockitoBean private TokenService tokenService;
+  @MockitoBean private UserAccountRepository userAccountRepository;
 
   @Test
   void returnsTokenForValidCredentials() throws Exception {

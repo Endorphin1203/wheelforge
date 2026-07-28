@@ -4,6 +4,7 @@ import jakarta.persistence.LockModeType;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Optional;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Query;
@@ -15,9 +16,16 @@ public interface ArtifactRepository extends JpaRepository<ArtifactEntity, String
       select artifact from ArtifactEntity artifact, BuildTaskEntity task
        where artifact.buildTaskId = task.id
          and task.userId = :userId
-       order by artifact.createdAt desc
+         and (:cursorCreatedAt is null
+              or artifact.createdAt < :cursorCreatedAt
+              or (artifact.createdAt = :cursorCreatedAt and artifact.id < :cursorId))
+       order by artifact.createdAt desc, artifact.id desc
       """)
-  List<ArtifactEntity> findAllByOwner(@Param("userId") String userId);
+  List<ArtifactEntity> findPageByOwner(
+      @Param("userId") String userId,
+      @Param("cursorCreatedAt") LocalDateTime cursorCreatedAt,
+      @Param("cursorId") String cursorId,
+      Pageable pageable);
 
   @Query(
       """
@@ -45,11 +53,19 @@ public interface ArtifactRepository extends JpaRepository<ArtifactEntity, String
           select * from artifacts
            where expires_at <= :now
              and cleaned_at is null
+             and not exists (
+               select 1 from download_records download
+                where download.artifact_id = artifacts.id
+                  and download.completed = false
+                  and download.downloaded_at > :activeDownloadCutoff
+             )
            order by expires_at, id
            limit :batchSize
            for update skip locked
           """,
       nativeQuery = true)
   List<ArtifactEntity> claimExpired(
-      @Param("now") LocalDateTime now, @Param("batchSize") int batchSize);
+      @Param("now") LocalDateTime now,
+      @Param("activeDownloadCutoff") LocalDateTime activeDownloadCutoff,
+      @Param("batchSize") int batchSize);
 }

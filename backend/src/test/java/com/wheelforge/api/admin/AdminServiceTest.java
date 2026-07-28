@@ -135,6 +135,7 @@ class AdminServiceTest {
     assertThat(updated.priorityNo()).isEqualTo(20);
     assertThat(updated.timeoutSeconds()).isEqualTo(45);
     assertThat(updated.baseUrl()).isEqualTo("https://pypi.tuna.tsinghua.edu.cn/simple");
+    org.mockito.Mockito.verify(sourceRepository).flush();
 
     assertApiError(
         () ->

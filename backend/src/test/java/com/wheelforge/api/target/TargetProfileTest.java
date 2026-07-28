@@ -11,6 +11,7 @@ import com.wheelforge.api.common.ApiExceptionHandler;
 import com.wheelforge.api.security.SecurityConfig;
 import com.wheelforge.api.security.TokenService;
 import com.wheelforge.api.security.UserAccount;
+import com.wheelforge.api.security.UserAccountRepository;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
@@ -33,6 +34,7 @@ class TargetProfileTest {
   @Autowired private MockMvc mvc;
   @Autowired private TokenService tokenService;
   @MockitoBean private TargetProfileService service;
+  @MockitoBean private UserAccountRepository userAccountRepository;
 
   @Test
   void endpointReturnsEnabledTargetCombinations() throws Exception {
@@ -98,6 +100,7 @@ class TargetProfileTest {
             "USER",
             "ACTIVE",
             LocalDateTime.now(ZoneOffset.UTC));
+    given(userAccountRepository.findById(user.getId())).willReturn(java.util.Optional.of(user));
     return "Bearer " + tokenService.issue(user).accessToken();
   }
 }

@@ -39,7 +39,10 @@ class BaselineMigrationTest {
           "ix_log_cursor",
           "ix_artifact_task",
           "ix_artifact_expiry",
+          "ix_artifact_retention",
+          "ix_artifact_task_created",
           "ix_download_artifact",
+          "ix_download_active_lease",
           "ix_download_user_time",
           "ix_requirement_file_user",
           "ix_build_user_created",
@@ -68,7 +71,7 @@ class BaselineMigrationTest {
       }
     }
 
-    assertThat(flyway.info().current().getVersion().getVersion()).isEqualTo("2");
+    assertThat(flyway.info().current().getVersion().getVersion()).isEqualTo("3");
   }
 
   private boolean tableExists(Connection connection, String tableName) throws SQLException {
