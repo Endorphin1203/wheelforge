@@ -56,6 +56,16 @@ class UnsupportedRequirementSyntax(RequirementLineError):
     pass
 
 
+class RequirementConstraintConflictError(RequirementLineError):
+    def __init__(self, name: str, line_no: int, original_text: str) -> None:
+        self.name = name
+        super().__init__(
+            f"requirement {name!r} contains conflicting constraints",
+            line_no,
+            original_text,
+        )
+
+
 class DuplicateRequirementConflictError(RequirementLineError):
     def __init__(
         self, name: str, line_no: int, original_text: str, existing_line_no: int

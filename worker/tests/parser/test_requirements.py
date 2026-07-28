@@ -1,14 +1,23 @@
 import pytest
+from pip._internal.req.req_file import break_args_options, preprocess
 
 from wheelforge_worker.parser import (
     DuplicateRequirementConflictError,
     InputTooLargeError,
     InvalidRequirementError,
+    RequirementConstraintConflictError,
     RequirementsDecodeError,
     TooManyLinesError,
     UnsupportedRequirementSyntax,
     parse_requirements,
 )
+
+
+def _pip_preprocessed_argument(line: str) -> tuple[str, str]:
+    processed_lines = list(preprocess(line + "\n"))
+    assert len(processed_lines) == 1
+    _, processed = processed_lines[0]
+    return break_args_options(processed)
 
 
 def test_parses_bare_requirement_extras_specifier_and_marker() -> None:
@@ -84,7 +93,6 @@ def test_hash_without_preceding_whitespace_is_not_treated_as_a_comment() -> None
 @pytest.mark.parametrize(
     "marker_value",
     [
-        "x86 # lab",
         "ops@example.test",
         "https://example.test/simple",
         "git+mirror",
@@ -103,14 +111,62 @@ def test_preserves_special_characters_inside_quoted_marker_values(
 
 
 def test_strips_real_inline_comment_after_quoted_marker_value() -> None:
-    requirement = 'demo; platform_machine == "x86 # lab"'
+    requirement = 'demo; platform_machine == "x86_64"'
     original = requirement + "  # deployment note"
 
     result = parse_requirements((original + "\n").encode())
 
-    assert result.items[0].marker == 'platform_machine == "x86 # lab"'
+    assert result.items[0].marker == 'platform_machine == "x86_64"'
     assert result.items[0].original_text == original
     assert result.normalized_text == requirement + "\n"
+
+
+@pytest.mark.parametrize(
+    "requirement",
+    [
+        'demo; platform_machine == "x86 # lab"',
+        'demo; platform_machine == "x86 --index-url local"',
+        'demo; platform_machine == "x86 -r hidden.txt"',
+    ],
+)
+def test_rejects_markers_that_pip_preprocessing_changes(requirement: str) -> None:
+    pip_argument, pip_options = _pip_preprocessed_argument(requirement)
+    assert pip_argument != requirement or pip_options
+
+    with pytest.raises(UnsupportedRequirementSyntax) as raised:
+        parse_requirements((requirement + "\n").encode())
+
+    assert raised.value.line_no == 1
+    assert raised.value.original_text == requirement
+
+
+def test_rejects_marker_environment_expansion_used_by_pip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requirement = 'demo; platform_machine == "${UPPER_ENV}"'
+    monkeypatch.setenv("UPPER_ENV", "arm64")
+    pip_argument, pip_options = _pip_preprocessed_argument(requirement)
+    assert pip_argument != requirement
+    assert not pip_options
+
+    with pytest.raises(UnsupportedRequirementSyntax) as raised:
+        parse_requirements((requirement + "\n").encode())
+
+    assert raised.value.line_no == 1
+
+
+def test_every_normalized_line_is_safe_for_pip_requirements_preprocessing() -> None:
+    result = parse_requirements(
+        b'requests[security]>=2,<=3; python_version < "3.13"  # supported\n'
+        b'demo; platform_machine == "https://example.test/simple"\n'
+    )
+
+    normalized_lines = result.normalized_text.splitlines()
+    processed_lines = [line for _, line in preprocess(result.normalized_text)]
+    assert processed_lines == normalized_lines
+    assert [break_args_options(line) for line in processed_lines] == [
+        (line, "") for line in normalized_lines
+    ]
 
 
 def test_accepts_exact_lower_upper_and_compatible_release_specifiers() -> None:
@@ -169,6 +225,9 @@ def test_rejects_specifiers_outside_the_approved_subset(specifier: str) -> None:
         "demo.whl",
         "dist/demo.tar.gz",
         "demo.zip",
+        'demo.zip ; python_version >= "3.9"',
+        'demo.WHL\t; python_version >= "3.9"',
+        'demo.TAR.GZ  ; python_version >= "3.9"',
     ],
 )
 def test_rejects_unsafe_syntax_before_pep508_parsing(line: str) -> None:
@@ -253,6 +312,23 @@ def test_merges_canonical_duplicates_constraints_and_extras() -> None:
     assert result.normalized_text == "my-pkg[alpha,beta]>=1,<=3\n"
 
 
+@pytest.mark.parametrize(
+    "line",
+    [
+        "demo>=3,<=2",
+        "demo==1,>=2",
+        "demo~=2.4,>=3",
+    ],
+)
+def test_rejects_conflicting_constraints_on_first_occurrence(line: str) -> None:
+    with pytest.raises(RequirementConstraintConflictError) as raised:
+        parse_requirements((line + "\n").encode())
+
+    assert raised.value.line_no == 1
+    assert raised.value.name == "demo"
+    assert raised.value.original_text == line
+
+
 def test_keeps_same_name_with_different_markers_as_independent_items() -> None:
     result = parse_requirements(
         b'demo==1; python_version < "3.11"\n'
@@ -280,6 +356,70 @@ def test_rejects_obvious_duplicate_conflicts(lines: str) -> None:
 
     assert raised.value.line_no == 2
     assert raised.value.name == "demo"
+
+
+@pytest.mark.parametrize(
+    ("compatible", "lower"),
+    [
+        ("1.4.5", "1.5.0.dev0"),
+        ("1.4.5", "1.5.0a1"),
+        ("1.4.5", "1.5.0b1"),
+        ("1.4.5", "1.5.0rc1"),
+        ("1.4.5", "1.5.0.post1"),
+        ("1!2.4.5", "1!2.5.0a1"),
+    ],
+)
+def test_rejects_compatible_release_next_prefix_boundaries(
+    compatible: str, lower: str
+) -> None:
+    lines = f"demo~={compatible}\ndemo>={lower}\n"
+
+    with pytest.raises(DuplicateRequirementConflictError):
+        parse_requirements(lines.encode())
+
+
+def test_rejects_multiple_compatible_constraints_with_excluded_lower_bound() -> None:
+    with pytest.raises(RequirementConstraintConflictError):
+        parse_requirements(b"demo~=1.4.5,~=1.4.6,>=1.5.0.dev0\n")
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "demo~=1.4.5,>=1.4.6.dev0",
+        "demo~=1.4.5,>=1.4.5.post1",
+        "demo~=1!2.4.5,>=1!2.4.6rc1",
+        "demo~=1.4.5,~=1.4.6,<=1.4.9",
+    ],
+)
+def test_accepts_compatible_release_bounds_within_the_allowed_prefix(line: str) -> None:
+    result = parse_requirements((line + "\n").encode())
+
+    assert result.items[0].name == "demo"
+
+
+def test_accepts_public_and_local_exact_pin_intersection() -> None:
+    result = parse_requirements(b"demo==1.0\ndemo==1.0+local\n")
+
+    assert result.items[0].specifier == "==1.0,==1.0+local"
+
+
+def test_rejects_distinct_local_exact_pins() -> None:
+    with pytest.raises(DuplicateRequirementConflictError):
+        parse_requirements(b"demo==1.0+foo\ndemo==1.0+bar\n")
+
+
+@pytest.mark.parametrize(
+    "lines",
+    [
+        "demo==1.0.post1\ndemo>=1.0.post1\n",
+        "demo==1.0.dev1\ndemo<=1.0.dev1\n",
+    ],
+)
+def test_accepts_post_and_dev_exact_candidates(lines: str) -> None:
+    result = parse_requirements(lines.encode())
+
+    assert len(result.items) == 1
 
 
 def test_merges_overlapping_compatible_release_constraints() -> None:

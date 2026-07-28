@@ -11,6 +11,7 @@ from .models import (
     InputTooLargeError,
     InvalidRequirementError,
     ParsedRequirements,
+    RequirementConstraintConflictError,
     RequirementItem,
     RequirementsDecodeError,
     TooManyLinesError,
@@ -21,6 +22,8 @@ from .models import (
 MAX_INPUT_BYTES = 512 * 1024
 MAX_LOGICAL_LINES = 2000
 _PIP_ARGUMENT = re.compile(r"(?:^|[ \t])--?[a-z]", re.IGNORECASE)
+_PIP_FILE_COMMENT = re.compile(r"(^|\s+)#.*$")
+_PIP_ENVIRONMENT_VARIABLE = re.compile(r"\$\{[A-Z0-9_]+\}")
 _WINDOWS_DRIVE_PATH = re.compile(r"^[a-z]:[\\/]", re.IGNORECASE)
 _ARCHIVE_SUFFIXES = (".whl", ".tar.gz", ".tar.bz2", ".tgz", ".zip")
 _VCS_PREFIXES = ("git+", "hg+", "svn+", "bzr+")
@@ -60,6 +63,9 @@ def parse_requirements(raw: bytes) -> ParsedRequirements:
             marker=marker,
             original_text=original_text,
         )
+        _ensure_pip_file_safe(_format_item(item), line_no, original_text)
+        if _constraints_conflict(constraints):
+            raise RequirementConstraintConflictError(name, line_no, original_text)
 
         existing_index = indexes.get(key)
         if existing_index is None:
@@ -72,7 +78,7 @@ def parse_requirements(raw: bytes) -> ParsedRequirements:
         merged_constraints = _deduplicate_specifiers(
             (*constraints_by_key[key], *constraints)
         )
-        if _has_obvious_conflict(merged_constraints):
+        if _constraints_conflict(merged_constraints):
             raise DuplicateRequirementConflictError(
                 name, line_no, original_text, existing.line_no
             )
@@ -84,7 +90,10 @@ def parse_requirements(raw: bytes) -> ParsedRequirements:
         )
 
     result_items = tuple(items)
-    normalized_text = "\n".join(_format_item(item) for item in result_items) + "\n"
+    normalized_lines = tuple(_format_item(item) for item in result_items)
+    for item, line in zip(result_items, normalized_lines, strict=True):
+        _ensure_pip_file_safe(line, item.line_no, item.original_text)
+    normalized_text = "\n".join(normalized_lines) + "\n"
     return ParsedRequirements(normalized_text, result_items, encoding)
 
 
@@ -140,7 +149,7 @@ def _requirement_text(original_text: str, line_no: int) -> str | None:
 
 def _reject_unsafe_text(text: str, line_no: int, original_text: str) -> None:
     marker_index = _find_unquoted(text, ";")
-    requirement_part = text if marker_index is None else text[:marker_index]
+    requirement_part = (text if marker_index is None else text[:marker_index]).rstrip()
     lowered = requirement_part.casefold()
     if _PIP_ARGUMENT.search(requirement_part):
         raise UnsupportedRequirementSyntax(
@@ -163,6 +172,27 @@ def _reject_unsafe_text(text: str, line_no: int, original_text: str) -> None:
     ):
         raise UnsupportedRequirementSyntax(
             "local paths and package archives are not supported", line_no, original_text
+        )
+
+
+def _ensure_pip_file_safe(line: str, line_no: int, original_text: str) -> None:
+    if _PIP_FILE_COMMENT.search(line):
+        raise UnsupportedRequirementSyntax(
+            "markers that pip interprets as comments are not supported",
+            line_no,
+            original_text,
+        )
+    if any(token.startswith("-") for token in line.split(" ")):
+        raise UnsupportedRequirementSyntax(
+            "markers that pip interprets as options are not supported",
+            line_no,
+            original_text,
+        )
+    if _PIP_ENVIRONMENT_VARIABLE.search(line):
+        raise UnsupportedRequirementSyntax(
+            "pip environment variable expansion is not supported",
+            line_no,
+            original_text,
         )
 
 
@@ -237,50 +267,33 @@ def _deduplicate_specifiers(
     )
 
 
-def _has_obvious_conflict(constraints: tuple[Specifier, ...]) -> bool:
-    exact_versions = {
+def _constraints_conflict(constraints: tuple[Specifier, ...]) -> bool:
+    exact_candidates = {
         Version(specifier.version)
         for specifier in constraints
         if specifier.operator == "=="
     }
-    if len(exact_versions) > 1:
-        return True
-    if exact_versions:
-        exact = next(iter(exact_versions))
-        return any(
-            not SpecifierSet(str(specifier)).contains(exact, prereleases=True)
-            for specifier in constraints
+    if exact_candidates:
+        return not any(
+            all(
+                SpecifierSet(str(specifier)).contains(candidate, prereleases=True)
+                for specifier in constraints
+            )
+            for candidate in exact_candidates
         )
 
-    lower: Version | None = None
-    upper: Version | None = None
-    upper_inclusive = True
-    for specifier in constraints:
-        version = Version(specifier.version)
-        if specifier.operator in {">=", "~="}:
-            lower = version if lower is None else max(lower, version)
-        if specifier.operator == "<=":
-            if upper is None or version < upper:
-                upper = version
-                upper_inclusive = True
-        elif specifier.operator == "~=":
-            compatible_upper = _compatible_upper_bound(version)
-            if upper is None or compatible_upper <= upper:
-                upper = compatible_upper
-                upper_inclusive = False
-
-    if lower is None or upper is None:
+    lower_candidates = [
+        Version(specifier.version)
+        for specifier in constraints
+        if specifier.operator in {">=", "~="}
+    ]
+    if not lower_candidates:
         return False
-    return lower > upper or (lower == upper and not upper_inclusive)
-
-
-def _compatible_upper_bound(version: Version) -> Version:
-    prefix = version.release[:-1]
-    upper_release = (*prefix[:-1], prefix[-1] + 1)
-    rendered = ".".join(str(part) for part in upper_release)
-    if version.epoch:
-        rendered = f"{version.epoch}!{rendered}"
-    return Version(rendered)
+    candidate = max(lower_candidates)
+    return any(
+        not SpecifierSet(str(specifier)).contains(candidate, prereleases=True)
+        for specifier in constraints
+    )
 
 
 def _format_specifiers(constraints: tuple[Specifier, ...]) -> str:
