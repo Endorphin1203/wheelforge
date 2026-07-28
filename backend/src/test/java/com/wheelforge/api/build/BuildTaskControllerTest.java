@@ -6,6 +6,7 @@ import static org.mockito.Mockito.verify;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -86,6 +87,21 @@ class BuildTaskControllerTest {
   }
 
   @Test
+  void detailReportsOnlyStaticValidationAndNeverClaimsInstallationVerification() throws Exception {
+    given(service.get(USER_ID, TASK_ID)).willReturn(view());
+
+    mvc.perform(
+            get("/api/build-tasks/{id}", TASK_ID).header(HttpHeaders.AUTHORIZATION, bearerToken()))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.validationLevel").value("STATIC"))
+        .andExpect(jsonPath("$.installVerified").value(false))
+        .andExpect(
+            jsonPath("$.validationMessage")
+                .value("Static compatibility checks passed; target installation was not verified."))
+        .andExpect(header().doesNotExist("X-WheelForge-Validation"));
+  }
+
+  @Test
   void listsCancelsRetriesAndSoftDeletesOwnedTasks() throws Exception {
     given(service.list(USER_ID)).willReturn(List.of(view()));
     given(service.cancel(USER_ID, TASK_ID)).willReturn(view());
@@ -163,7 +179,10 @@ class BuildTaskControllerTest {
         null,
         LocalDateTime.of(2026, 7, 23, 1, 2, 3),
         null,
-        null);
+        null,
+        "STATIC",
+        false,
+        "Static compatibility checks passed; target installation was not verified.");
   }
 
   private String bearerToken() {

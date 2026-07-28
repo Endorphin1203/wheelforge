@@ -20,6 +20,11 @@ import tools.jackson.databind.ObjectMapper;
 
 @Service
 public class BuildTaskService {
+  public static final String VALIDATION_LEVEL = "STATIC";
+  public static final boolean INSTALL_VERIFIED = false;
+  public static final String VALIDATION_MESSAGE =
+      "Static compatibility checks passed; target installation was not verified.";
+
   private final BuildTaskRepository taskRepository;
   private final RequirementFileRepository fileRepository;
   private final TargetProfileRepository profileRepository;
@@ -232,7 +237,10 @@ public class BuildTaskService {
         task.getFailureMessage(),
         task.getCreatedAt(),
         task.getStartedAt(),
-        task.getFinishedAt());
+        task.getFinishedAt(),
+        VALIDATION_LEVEL,
+        INSTALL_VERIFIED,
+        VALIDATION_MESSAGE);
   }
 
   public record CreateBuildTaskRequest(
@@ -253,5 +261,8 @@ public class BuildTaskService {
       String failureMessage,
       LocalDateTime createdAt,
       LocalDateTime startedAt,
-      LocalDateTime finishedAt) {}
+      LocalDateTime finishedAt,
+      String validationLevel,
+      boolean installVerified,
+      String validationMessage) {}
 }
