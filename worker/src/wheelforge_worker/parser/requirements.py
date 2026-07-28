@@ -29,6 +29,9 @@ _ARCHIVE_SUFFIXES = (".whl", ".tar.gz", ".tar.bz2", ".tgz", ".zip")
 _VCS_PREFIXES = ("git+", "hg+", "svn+", "bzr+")
 _SUPPORTED_OPERATORS = {"==", ">=", "<=", "~="}
 _OPERATOR_ORDER = {"==": 0, "~=": 1, ">=": 2, "<=": 3}
+_UNSUPPORTED_LINE_SEPARATORS = frozenset(
+    {"\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"}
+)
 
 
 def parse_requirements(raw: bytes) -> ParsedRequirements:
@@ -125,6 +128,12 @@ def _logical_lines(text: str) -> list[str]:
 
 
 def _requirement_text(original_text: str, line_no: int) -> str | None:
+    if not _UNSUPPORTED_LINE_SEPARATORS.isdisjoint(original_text):
+        raise UnsupportedRequirementSyntax(
+            "additional line separators recognized by pip are not supported",
+            line_no,
+            original_text,
+        )
     if "\x00" in original_text:
         raise UnsupportedRequirementSyntax(
             "NUL bytes are not supported", line_no, original_text

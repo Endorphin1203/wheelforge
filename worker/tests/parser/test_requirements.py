@@ -251,6 +251,34 @@ def test_rejects_nul_with_line_number() -> None:
     assert raised.value.line_no == 2
 
 
+@pytest.mark.parametrize(
+    ("separator", "separator_name"),
+    [
+        ("\x0b", "vertical-tab"),
+        ("\x0c", "form-feed"),
+        ("\x1c", "file-separator"),
+        ("\x1d", "group-separator"),
+        ("\x1e", "record-separator"),
+        ("\x85", "next-line"),
+        ("\u2028", "line-separator"),
+        ("\u2029", "paragraph-separator"),
+    ],
+)
+def test_rejects_additional_splitlines_separators_inside_marker_values(
+    separator: str, separator_name: str
+) -> None:
+    original = f'demo; platform_machine == "x86{separator}lab"'
+    raw = f"requests==2\n{original}\n".encode()
+
+    assert len(list(preprocess(original + "\n"))) > 1, separator_name
+
+    with pytest.raises(UnsupportedRequirementSyntax) as raised:
+        parse_requirements(raw)
+
+    assert raised.value.line_no == 2
+    assert raised.value.original_text == original
+
+
 def test_rejects_backslash_line_continuation_with_line_number() -> None:
     with pytest.raises(UnsupportedRequirementSyntax) as raised:
         parse_requirements(b"requests>=2, \\" + b"\n<3\n")
