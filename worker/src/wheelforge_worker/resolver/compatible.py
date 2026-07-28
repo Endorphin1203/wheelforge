@@ -46,6 +46,7 @@ _MAX_VERSION_CHARS = 512
 _MAX_REQUIRES_PYTHON_CHARS = 1024
 _MAX_WHEELS_PER_RELEASE = 256
 _MAX_WHEEL_FILENAME_CHARS = 1024
+_STRICT_TIMEOUT_REASON = "strict invocation exceeded compatibility deadline"
 _Clock = Callable[[], float]
 
 
@@ -207,6 +208,26 @@ class CompatibleResolver:
         if self._clock() - started >= limits.timeout.total_seconds():
             raise _StopResolution(CompatibilityFailureCode.TIMEOUT)
 
+    def _record_timeout_attempt_if_expired(
+        self,
+        started: float,
+        limits: ResolveLimits,
+        selections: tuple[CandidateSelection, ...],
+        source: PackageSource,
+        attempts: list[ResolutionAttempt],
+    ) -> None:
+        if self._clock() - started < limits.timeout.total_seconds():
+            return
+        attempts.append(
+            ResolutionAttempt(
+                selections,
+                source,
+                CompatibilityFailureCode.TIMEOUT,
+                _STRICT_TIMEOUT_REASON,
+            )
+        )
+        raise _StopResolution(CompatibilityFailureCode.TIMEOUT)
+
     def _attempt(
         self,
         parsed: ParsedRequirements,
@@ -220,7 +241,9 @@ class CompatibleResolver:
         try:
             result = self._strict_resolver.resolve(parsed, profile, source.value)
         except ResolverError as error:
-            self._check_deadline(started, limits)
+            self._record_timeout_attempt_if_expired(
+                started, limits, selections, source, attempts
+            )
             attempts.append(
                 ResolutionAttempt(
                     selections,
@@ -230,7 +253,9 @@ class CompatibleResolver:
                 )
             )
             return None
-        self._check_deadline(started, limits)
+        self._record_timeout_attempt_if_expired(
+            started, limits, selections, source, attempts
+        )
         attempts.append(ResolutionAttempt(selections, source, None, "strict graph resolved"))
         return result
 

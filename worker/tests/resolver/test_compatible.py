@@ -789,12 +789,20 @@ def test_late_strict_success_is_rejected_before_acceptance() -> None:
             parsed,
             profile(),
             (PackageSource.PYPI,),
-            ResolveLimits(timeout=timedelta(seconds=1)),
+            ResolveLimits(
+                max_resolution_attempts=1, timeout=timedelta(seconds=1)
+            ),
         )
 
     assert captured.value.code is CompatibilityFailureCode.TIMEOUT
-    assert captured.value.attempts == ()
-    assert len(strict.calls) == 1
+    assert len(strict.calls) == len(captured.value.attempts) == 1
+    attempt = captured.value.attempts[0]
+    assert attempt.source is PackageSource.PYPI
+    assert [(selection.package, selection.version) for selection in attempt.selections] == [
+        ("demo", Version("1.0"))
+    ]
+    assert attempt.failure is CompatibilityFailureCode.TIMEOUT
+    assert attempt.reason == "strict invocation exceeded compatibility deadline"
 
 
 def test_late_strict_failure_is_rejected_before_recording() -> None:
@@ -814,12 +822,20 @@ def test_late_strict_failure_is_rejected_before_recording() -> None:
             parsed,
             profile(),
             (PackageSource.PYPI,),
-            ResolveLimits(timeout=timedelta(seconds=1)),
+            ResolveLimits(
+                max_resolution_attempts=1, timeout=timedelta(seconds=1)
+            ),
         )
 
     assert captured.value.code is CompatibilityFailureCode.TIMEOUT
-    assert captured.value.attempts == ()
-    assert len(strict.calls) == 1
+    assert len(strict.calls) == len(captured.value.attempts) == 1
+    attempt = captured.value.attempts[0]
+    assert attempt.source is PackageSource.PYPI
+    assert [(selection.package, selection.version) for selection in attempt.selections] == [
+        ("demo", Version("1.0"))
+    ]
+    assert attempt.failure is CompatibilityFailureCode.TIMEOUT
+    assert attempt.reason == "strict invocation exceeded compatibility deadline"
 
 
 def test_provider_release_count_and_strings_are_bounded() -> None:
