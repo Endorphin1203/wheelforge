@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -36,6 +39,7 @@ import wheelforge_worker.resolver.pip_report as pip_report_module
 
 
 _TRUNCATION_MARKER = "\n...[truncated]..."
+_DRAIN_THREAD_PREFIX = "process-"
 
 
 @pytest.fixture
@@ -174,29 +178,11 @@ def test_runner_uses_tokenized_argv_and_complete_environment(
     real_popen = subprocess.Popen
 
     def observing_popen(
-        args: tuple[str, ...],
-        *,
-        cwd: Path,
-        env: dict[str, str],
-        stdout: int,
-        stderr: int,
-        shell: bool,
+        args: tuple[str, ...], **kwargs: Any
     ) -> subprocess.Popen[bytes]:
-        observed.update(
-            cwd=cwd, env=env, stdout=stdout, stderr=stderr, shell=shell
-        )
+        observed.update(kwargs)
         observed["args"] = args
-        return cast(
-            Any,
-            real_popen(
-                args,
-                cwd=cwd,
-                env=env,
-                stdout=stdout,
-                stderr=stderr,
-                shell=shell,
-            ),
-        )
+        return cast(Any, real_popen(args, **kwargs))
 
     monkeypatch.setattr("wheelforge_worker.process.subprocess.Popen", observing_popen)
 
@@ -214,6 +200,12 @@ def test_runner_uses_tokenized_argv_and_complete_environment(
     assert "text" not in observed
     assert observed["stdout"] is subprocess.PIPE
     assert observed["stderr"] is subprocess.PIPE
+    if os.name == "posix":
+        assert observed["start_new_session"] is True
+    else:
+        assert observed["creationflags"] == getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP"
+        )
 
 
 @pytest.mark.parametrize(
@@ -357,6 +349,129 @@ def test_runner_bounds_flooded_output_on_timeout(tmp_path: Path) -> None:
     assert len(raised.value.stderr.encode()) <= 4096
     assert raised.value.stdout.endswith(_TRUNCATION_MARKER)
     assert raised.value.stderr.endswith(_TRUNCATION_MARKER)
+
+
+def _descendant_parent_script(
+    pid_path: Path,
+    *,
+    lifetime_seconds: float,
+    redirect_output: bool = False,
+    escape_group: bool = False,
+) -> str:
+    descendant = f"import time; time.sleep({lifetime_seconds})"
+    options: list[str] = []
+    if redirect_output:
+        options.extend(
+            ["stdout=subprocess.DEVNULL", "stderr=subprocess.DEVNULL"]
+        )
+    if escape_group:
+        options.append("start_new_session=True")
+    option_text = ", " + ", ".join(options) if options else ""
+    return (
+        "import pathlib,subprocess,sys,time;"
+        f"p=subprocess.Popen([sys.executable,'-c',{descendant!r}]{option_text});"
+        f"pathlib.Path({str(pid_path)!r}).write_text(str(p.pid));"
+        "time.sleep(10)"
+    )
+
+
+def _process_is_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _wait_for_process_exit(pid: int, timeout_seconds: float = 0.75) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if not _process_is_running(pid):
+            return True
+        time.sleep(0.01)
+    return not _process_is_running(pid)
+
+
+def _kill_process_if_running(pid: int) -> None:
+    if _process_is_running(pid):
+        os.kill(pid, signal.SIGKILL)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group regression")
+def test_runner_timeout_kills_inherited_pipe_descendant_near_deadline(
+    tmp_path: Path,
+) -> None:
+    pid_path = tmp_path / "inherited-descendant.pid"
+    script = _descendant_parent_script(pid_path, lifetime_seconds=1.5)
+    started = time.monotonic()
+
+    with pytest.raises(ProcessTimeoutError):
+        ProcessRunner().run(
+            [sys.executable, "-c", script],
+            tmp_path,
+            timedelta(milliseconds=100),
+            {},
+        )
+
+    elapsed = time.monotonic() - started
+    descendant_pid = int(pid_path.read_text())
+    try:
+        assert elapsed < 0.8
+        assert _wait_for_process_exit(descendant_pid)
+        assert not any(
+            thread.name.startswith(_DRAIN_THREAD_PREFIX)
+            for thread in threading.enumerate()
+        )
+    finally:
+        _kill_process_if_running(descendant_pid)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group regression")
+def test_runner_timeout_kills_redirected_pipe_descendant(tmp_path: Path) -> None:
+    pid_path = tmp_path / "redirected-descendant.pid"
+    script = _descendant_parent_script(
+        pid_path, lifetime_seconds=10, redirect_output=True
+    )
+
+    with pytest.raises(ProcessTimeoutError):
+        ProcessRunner().run(
+            [sys.executable, "-c", script],
+            tmp_path,
+            timedelta(milliseconds=100),
+            {},
+        )
+
+    descendant_pid = int(pid_path.read_text())
+    try:
+        assert _wait_for_process_exit(descendant_pid)
+    finally:
+        _kill_process_if_running(descendant_pid)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group regression")
+def test_runner_uses_typed_bounded_fallback_for_escaped_pipe_holder(
+    tmp_path: Path,
+) -> None:
+    pid_path = tmp_path / "escaped-descendant.pid"
+    script = _descendant_parent_script(
+        pid_path, lifetime_seconds=2, escape_group=True
+    )
+    started = time.monotonic()
+
+    with pytest.raises(ProcessExecutionError):
+        ProcessRunner().run(
+            [sys.executable, "-c", script],
+            tmp_path,
+            timedelta(milliseconds=100),
+            {},
+        )
+
+    elapsed = time.monotonic() - started
+    descendant_pid = int(pid_path.read_text())
+    try:
+        assert elapsed < 1.2
+    finally:
+        _kill_process_if_running(descendant_pid)
 
 
 def test_runner_maps_spawn_failure_to_typed_error(tmp_path: Path) -> None:

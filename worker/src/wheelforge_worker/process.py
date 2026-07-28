@@ -1,20 +1,24 @@
 from __future__ import annotations
 
 import math
+import os
 import re
+import signal
 import subprocess
 import threading
-from dataclasses import dataclass
-from dataclasses import field
+from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
-from typing import BinaryIO, Mapping, Sequence
+from typing import IO, Any, Mapping, Sequence
 
 
 _ENVIRONMENT_KEY = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 MAX_PROCESS_OUTPUT_BYTES = 4096
 PROCESS_OUTPUT_TRUNCATION_MARKER = "\n...[truncated]..."
 _TRUNCATION_MARKER_BYTES = PROCESS_OUTPUT_TRUNCATION_MARKER.encode()
+_DRAIN_JOIN_TIMEOUT_SECONDS = 0.5
+_DRAIN_CLOSE_JOIN_TIMEOUT_SECONDS = 0.1
+_WINDOWS_TREE_KILL_TIMEOUT_SECONDS = 5.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,21 +74,14 @@ class ProcessRunner:
         command = _validate_invocation(argv, cwd, timeout, env)
         started = _monotonic()
         try:
-            process = subprocess.Popen(
-                command,
-                cwd=cwd,
-                env=dict(env),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                shell=False,
-            )
+            process = _spawn_process_group(command, cwd, env)
         except OSError as error:
             raise ProcessExecutionError("process could not be started") from error
 
         stdout_pipe = process.stdout
         stderr_pipe = process.stderr
         if stdout_pipe is None or stderr_pipe is None:
-            _kill_and_wait(process)
+            _terminate_process_tree(process)
             raise ProcessExecutionError("process output pipes were not created")
 
         stdout_capture = _PipeCapture()
@@ -94,11 +91,13 @@ class ProcessRunner:
                 target=_drain_pipe,
                 args=(stdout_pipe, stdout_capture),
                 name="process-stdout-drain",
+                daemon=True,
             ),
             threading.Thread(
                 target=_drain_pipe,
                 args=(stderr_pipe, stderr_capture),
                 name="process-stderr-drain",
+                daemon=True,
             ),
         )
         started_threads: list[threading.Thread] = []
@@ -107,32 +106,31 @@ class ProcessRunner:
                 thread.start()
                 started_threads.append(thread)
         except RuntimeError as error:
-            _kill_and_wait(process)
-            stdout_pipe.close()
-            stderr_pipe.close()
-            for thread in started_threads:
-                thread.join()
+            try:
+                _terminate_process_tree(process)
+            finally:
+                _finish_drains(started_threads, (stdout_pipe, stderr_pipe))
             raise ProcessExecutionError("process output drain could not start") from error
 
         timeout_error: subprocess.TimeoutExpired | None = None
-        wait_error: OSError | None = None
+        lifecycle_error: ProcessExecutionError | None = None
         try:
             process.wait(timeout=timeout.total_seconds())
         except subprocess.TimeoutExpired as error:
             timeout_error = error
             try:
-                _kill_and_wait(process)
-            except OSError as lifecycle_error:
-                wait_error = lifecycle_error
+                _terminate_process_tree(process)
+            except ProcessExecutionError as error:
+                lifecycle_error = error
         except OSError as error:
-            wait_error = error
             try:
-                _kill_and_wait(process)
-            except OSError:
+                _terminate_process_tree(process)
+            except ProcessExecutionError:
                 pass
-        finally:
-            for thread in threads:
-                thread.join()
+            lifecycle_error = ProcessExecutionError("process could not be reaped")
+            lifecycle_error.__cause__ = error
+
+        drains_finished = _finish_drains(threads, (stdout_pipe, stderr_pipe))
 
         stdout = _bounded_bytes(
             bytes(stdout_capture.prefix), truncated=stdout_capture.truncated
@@ -141,8 +139,15 @@ class ProcessRunner:
             bytes(stderr_capture.prefix), truncated=stderr_capture.truncated
         )
 
-        if wait_error is not None:
-            raise ProcessExecutionError("process could not be reaped") from wait_error
+        if lifecycle_error is not None:
+            raise lifecycle_error
+        if not drains_finished:
+            if timeout_error is None:
+                try:
+                    _terminate_process_tree(process)
+                except ProcessExecutionError:
+                    pass
+            raise ProcessExecutionError("process output drain did not stop")
         if stdout_capture.error is not None or stderr_capture.error is not None:
             raise ProcessExecutionError("process output could not be drained")
 
@@ -185,7 +190,7 @@ def _validate_invocation(
     return command
 
 
-def _drain_pipe(stream: BinaryIO, capture: _PipeCapture) -> None:
+def _drain_pipe(stream: IO[Any], capture: _PipeCapture) -> None:
     try:
         while chunk := stream.read(64 * 1024):
             capture.retain(chunk)
@@ -195,9 +200,95 @@ def _drain_pipe(stream: BinaryIO, capture: _PipeCapture) -> None:
         stream.close()
 
 
-def _kill_and_wait(process: subprocess.Popen[bytes]) -> None:
-    process.kill()
-    process.wait()
+def _spawn_process_group(
+    command: tuple[str, ...], cwd: Path, env: Mapping[str, str]
+) -> subprocess.Popen[bytes]:
+    if os.name == "nt":
+        return subprocess.Popen(
+            command,
+            cwd=cwd,
+            env=dict(env),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+            bufsize=0,
+            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP"),
+        )
+    return subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=dict(env),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        shell=False,
+        bufsize=0,
+        start_new_session=True,
+    )
+
+
+def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
+    if os.name == "nt":
+        _terminate_windows_process_tree(process)
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError as error:
+        _kill_direct_process(process)
+        raise ProcessExecutionError("process group could not be terminated") from error
+    try:
+        process.wait()
+    except OSError as error:
+        raise ProcessExecutionError("process could not be reaped") from error
+
+
+def _terminate_windows_process_tree(process: subprocess.Popen[bytes]) -> None:
+    try:
+        completed = subprocess.run(
+            ("taskkill", "/PID", str(process.pid), "/T", "/F"),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=_WINDOWS_TREE_KILL_TIMEOUT_SECONDS,
+            check=False,
+            shell=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        _kill_direct_process(process)
+        raise ProcessExecutionError("Windows process tree could not be terminated") from error
+    if completed.returncode != 0 and process.poll() is None:
+        _kill_direct_process(process)
+        raise ProcessExecutionError("Windows process tree could not be terminated")
+    try:
+        process.wait(timeout=_WINDOWS_TREE_KILL_TIMEOUT_SECONDS)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ProcessExecutionError("process could not be reaped") from error
+
+
+def _kill_direct_process(process: subprocess.Popen[bytes]) -> None:
+    try:
+        process.kill()
+    finally:
+        process.wait()
+
+
+def _finish_drains(
+    threads: Sequence[threading.Thread], pipes: tuple[IO[Any], IO[Any]]
+) -> bool:
+    deadline = _monotonic() + _DRAIN_JOIN_TIMEOUT_SECONDS
+    for thread in threads:
+        thread.join(max(0.0, deadline - _monotonic()))
+    if not any(thread.is_alive() for thread in threads):
+        return True
+    for pipe in pipes:
+        try:
+            pipe.close()
+        except OSError:
+            pass
+    close_deadline = _monotonic() + _DRAIN_CLOSE_JOIN_TIMEOUT_SECONDS
+    for thread in threads:
+        thread.join(max(0.0, close_deadline - _monotonic()))
+    return False
 
 
 def _bounded_text(value: str) -> str:
