@@ -34,6 +34,8 @@ from wheelforge_worker.process import (
 )
 from wheelforge_worker.target.models import TargetProfile
 
+from wheelforge_worker.sources import resolver_source_url
+
 from .models import (
     ArchiveHash,
     InvalidPipReportError,
@@ -47,12 +49,6 @@ from .models import (
 )
 
 
-_SOURCES = {
-    "TSINGHUA": "https://pypi.tuna.tsinghua.edu.cn/simple",
-    "ALIYUN": "https://mirrors.aliyun.com/pypi/simple",
-    "PYPI": "https://pypi.org/simple",
-}
-_SOURCE_URLS = frozenset(_SOURCES.values())
 _MAX_INSTALL_ENTRIES = 2000
 MAX_PIP_REPORT_BYTES = 8 * 1024 * 1024
 MAX_RESOLVER_TIMEOUT = timedelta(minutes=10)
@@ -223,13 +219,7 @@ class StrictResolver:
 
 
 def _source_url(source: str) -> str:
-    if not isinstance(source, str):
-        raise ValueError("source must be a builtin source code or URL")
-    if source in _SOURCES:
-        return _SOURCES[source]
-    if source in _SOURCE_URLS:
-        return source
-    raise ValueError("source is not a builtin package index")
+    return resolver_source_url(source)
 
 
 def _load_report(payload: PipReportPayload) -> Mapping[str, object]:

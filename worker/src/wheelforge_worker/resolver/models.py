@@ -6,11 +6,7 @@ from enum import StrEnum
 
 from packaging.version import Version
 
-
-class PackageSource(StrEnum):
-    TSINGHUA = "TSINGHUA"
-    ALIYUN = "ALIYUN"
-    PYPI = "PYPI"
+from wheelforge_worker.sources import PackageSource
 
 
 class CandidateRejectionCode(StrEnum):
