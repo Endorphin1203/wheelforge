@@ -166,7 +166,12 @@ def _validate_dependencies(
             try:
                 if not requirement.marker.evaluate(environment):
                     continue
-            except (UndefinedComparison, UndefinedEnvironmentName, InvalidVersion):
+            except (
+                KeyError,
+                UndefinedComparison,
+                UndefinedEnvironmentName,
+                InvalidVersion,
+            ):
                 issues.append(
                     _issue(
                         ValidationIssueCode.REQUIRES_DIST_INVALID,

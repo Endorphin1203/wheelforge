@@ -129,6 +129,8 @@ def test_requires_dist_is_checked(
         "dep; python_version ~= 'wat'",
         "dep; implementation_version ~= 'wat'",
         "dep; unknown_variable == 'x'",
+        "dep; extras == 'foo'",
+        "dep; dependency_groups == 'foo'",
     ),
 )
 def test_marker_parse_and_evaluation_errors_become_validation_issues(

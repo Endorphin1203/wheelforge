@@ -267,6 +267,50 @@ def test_destination_swap_is_rejected_by_cross_platform_fallback(
     assert not list(tmp_path.glob(".download-*"))
 
 
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlinks are unavailable")
+def test_fallback_final_create_swap_leaves_no_wheel_in_replacement_destination(
+    profile_cp311_arm64: TargetProfile,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "out"
+    moved_destination = tmp_path / "moved-out"
+    escape = tmp_path / "escape"
+    real_open = os.open
+    swapped = False
+    monkeypatch.setattr(
+        wheels_module, "_DIRECTORY_HANDLE_SUPPORTED", False, raising=False
+    )
+
+    def swapping_open(
+        path: object, flags: int, *args: object, **kwargs: object
+    ) -> int:
+        nonlocal swapped
+        if (
+            not swapped
+            and Path(path).name == "demo-1.2.3-py3-none-any.whl"  # type: ignore[arg-type]
+            and flags & os.O_EXCL
+        ):
+            destination.rename(moved_destination)
+            escape.mkdir()
+            destination.symlink_to(escape, target_is_directory=True)
+            swapped = True
+        return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(wheels_module.os, "open", swapping_open)
+
+    with pytest.raises(DownloadValidationError):
+        WheelDownloader(
+            tmp_path,
+            runner=FakeRunner(write_one("demo-1.2.3-py3-none-any.whl")),
+        ).download_one(package(), profile_cp311_arm64, destination, lambda: False)
+
+    assert swapped is True
+    assert list(escape.rglob("*.whl")) == []
+    assert list(moved_destination.rglob("*.whl")) == []
+    assert not list(tmp_path.glob(".download-*"))
+
+
 def test_download_succeeds_through_cross_platform_path_fallback(
     profile_cp311_arm64: TargetProfile,
     tmp_path: Path,
@@ -295,7 +339,7 @@ def test_staging_and_destination_directory_handles_are_closed_independently(
 ) -> None:
     staging = tmp_path / "staging"
     staging.mkdir(mode=0o700)
-    destination = tmp_path / "out"
+    destination = staging / "out"
     real_open = os.open
     captured: dict[Path, int] = {}
 
@@ -478,7 +522,7 @@ def test_rollback_preserves_a_replacement_of_an_invocation_published_wheel(
             return write_one("alpha-1.0-py3-none-any.whl")(argv, _cwd)
         if not replaced:
             published = destination / "alpha-1.0-py3-none-any.whl"
-            published.unlink()
+            published.unlink(missing_ok=True)
             published.write_bytes(replacement)
             replaced = True
         return 1
@@ -503,9 +547,8 @@ def test_publication_failure_preserves_a_replacement_file(
     replacement = b"replacement after exclusive create"
 
     def replace_then_fail(observed: object, descriptor: int) -> None:
-        os.close(descriptor)
         final_path = destination / "demo-1.2.3-py3-none-any.whl"
-        final_path.unlink()
+        final_path.unlink(missing_ok=True)
         final_path.write_bytes(replacement)
         raise DownloadValidationError("injected copy failure")
 
@@ -518,6 +561,111 @@ def test_publication_failure_preserves_a_replacement_file(
         ).download_one(package(), profile_cp311_arm64, destination, lambda: False)
 
     assert (destination / "demo-1.2.3-py3-none-any.whl").read_bytes() == replacement
+
+
+@pytest.mark.skipif(
+    not wheels_module._DIRECTORY_HANDLE_SUPPORTED,
+    reason="directory handles are unavailable",
+)
+def test_rollback_final_unlink_cannot_delete_a_replacement(
+    profile_cp311_arm64: TargetProfile,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "out"
+    replacement = b"replacement at final unlink boundary"
+    real_unlink = os.unlink
+    real_fstat = os.fstat
+    replaced = False
+
+    def action(argv: list[str], cwd: Path) -> object:
+        nonlocal replaced
+        if argv[-1] == "alpha==1.0":
+            return write_one("alpha-1.0-py3-none-any.whl")(argv, cwd)
+        final_path = destination / "alpha-1.0-py3-none-any.whl"
+        if not final_path.exists():
+            final_path.write_bytes(replacement)
+            replaced = True
+        return 1
+
+    def replacing_unlink(
+        path: object, *args: object, **kwargs: object
+    ) -> None:
+        nonlocal replaced
+        directory_descriptor = kwargs.get("dir_fd")
+        is_destination = False
+        if directory_descriptor is not None and destination.exists():
+            directory_status = real_fstat(int(directory_descriptor))
+            destination_status = destination.lstat()
+            is_destination = (
+                directory_status.st_dev == destination_status.st_dev
+                and directory_status.st_ino == destination_status.st_ino
+            )
+        if (
+            not replaced
+            and Path(path).name == "alpha-1.0-py3-none-any.whl"  # type: ignore[arg-type]
+            and is_destination
+        ):
+            real_unlink(destination / "alpha-1.0-py3-none-any.whl")
+            (destination / "alpha-1.0-py3-none-any.whl").write_bytes(replacement)
+            replaced = True
+        real_unlink(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(wheels_module.os, "unlink", replacing_unlink)
+
+    with pytest.raises(WheelDownloadError):
+        WheelDownloader(
+            tmp_path,
+            runner=FakeRunner(action),
+        ).download(
+            resolution(package("alpha", "1.0"), package("beta", "2.0")),
+            profile_cp311_arm64,
+            destination,
+            lambda: False,
+        )
+
+    assert replaced is True
+    assert (destination / "alpha-1.0-py3-none-any.whl").read_bytes() == replacement
+
+
+def test_publication_fstat_failure_closes_descriptor_and_leaves_no_artifact(
+    profile_cp311_arm64: TargetProfile,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "out"
+    real_open = os.open
+    real_fstat = os.fstat
+    publication_descriptor: int | None = None
+
+    def recording_open(
+        path: object, flags: int, *args: object, **kwargs: object
+    ) -> int:
+        nonlocal publication_descriptor
+        descriptor = real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+        if Path(path).name == "demo-1.2.3-py3-none-any.whl":  # type: ignore[arg-type]
+            publication_descriptor = descriptor
+        return descriptor
+
+    def failing_fstat(descriptor: int) -> os.stat_result:
+        if descriptor == publication_descriptor:
+            raise OSError("injected publication fstat failure")
+        return real_fstat(descriptor)
+
+    monkeypatch.setattr(wheels_module.os, "open", recording_open)
+    monkeypatch.setattr(wheels_module.os, "fstat", failing_fstat)
+
+    with pytest.raises(DownloadValidationError):
+        WheelDownloader(
+            tmp_path,
+            runner=FakeRunner(write_one("demo-1.2.3-py3-none-any.whl")),
+        ).download_one(package(), profile_cp311_arm64, destination, lambda: False)
+
+    assert publication_descriptor is not None
+    with pytest.raises(OSError):
+        real_fstat(publication_descriptor)
+    assert not destination.exists()
+    assert list(tmp_path.rglob("*.whl")) == []
 
 
 def test_duplicate_canonical_package_name_across_versions_is_rejected_before_download(
