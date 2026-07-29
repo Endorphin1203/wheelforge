@@ -123,6 +123,56 @@ def test_requires_dist_is_checked(
     assert expected in [issue.code for issue in report.issues]
 
 
+@pytest.mark.parametrize(
+    "requires_dist",
+    (
+        "dep; python_version ~= 'wat'",
+        "dep; implementation_version ~= 'wat'",
+        "dep; unknown_variable == 'x'",
+    ),
+)
+def test_marker_parse_and_evaluation_errors_become_validation_issues(
+    requires_dist: str, profile_cp311_arm64: TargetProfile
+) -> None:
+    resolved = ResolutionResult(
+        "1",
+        (
+            package("root", "1.0", requires_dist=(requires_dist,)),
+            package("dep", "1.0"),
+        ),
+    )
+
+    report = validate_closure(
+        resolved,
+        (wheel("root", "1.0"), wheel("dep", "1.0")),
+        profile_cp311_arm64,
+    )
+
+    assert report.complete is False
+    assert ValidationIssueCode.REQUIRES_DIST_INVALID in {
+        issue.code for issue in report.issues
+    }
+
+
+def test_duplicate_canonical_package_name_across_versions_is_a_resolution_issue(
+    profile_cp311_arm64: TargetProfile,
+) -> None:
+    resolved = ResolutionResult(
+        "1", (package("demo", "1.0"), package("demo", "2.0"))
+    )
+
+    report = validate_closure(
+        resolved,
+        (wheel("demo", "1.0"), wheel("demo", "2.0")),
+        profile_cp311_arm64,
+    )
+
+    assert report.complete is False
+    assert ValidationIssueCode.RESOLUTION_DUPLICATE_PACKAGE in {
+        issue.code for issue in report.issues
+    }
+
+
 def test_missing_duplicate_unexpected_and_wrong_platform_wheels_are_reported(
     profile_cp311_arm64: TargetProfile,
 ) -> None:
@@ -157,4 +207,3 @@ def test_wheel_filename_name_and_version_mismatch_are_reported(
     assert ValidationIssueCode.WHEEL_MISSING in codes
     assert ValidationIssueCode.WHEEL_UNEXPECTED in codes
     assert ValidationIssueCode.WHEEL_NAME_VERSION_MISMATCH in codes
-

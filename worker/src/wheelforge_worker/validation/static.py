@@ -4,10 +4,11 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Iterable
 
+from packaging.markers import UndefinedComparison, UndefinedEnvironmentName
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.utils import InvalidWheelFilename, canonicalize_name, parse_wheel_filename
-from packaging.version import Version
+from packaging.version import InvalidVersion, Version
 
 from wheelforge_worker.download import DownloadedWheel
 from wheelforge_worker.resolver.models import ResolvedPackage, ResolutionResult
@@ -15,6 +16,7 @@ from wheelforge_worker.target import TargetProfile, marker_environment, wheel_is
 
 
 class ValidationIssueCode(StrEnum):
+    RESOLUTION_DUPLICATE_PACKAGE = "RESOLUTION_DUPLICATE_PACKAGE"
     WHEEL_MISSING = "WHEEL_MISSING"
     WHEEL_DUPLICATE = "WHEEL_DUPLICATE"
     WHEEL_UNEXPECTED = "WHEEL_UNEXPECTED"
@@ -62,7 +64,26 @@ def validate_closure(
     packages = tuple(sorted(resolved.packages, key=lambda item: (item.name, item.version)))
     observations = tuple(wheels)
     issues: list[ValidationIssue] = []
-    expected = {(item.name, item.version): item for item in packages}
+    package_names: dict[str, int] = {}
+    for item in packages:
+        canonical_name = canonicalize_name(item.name)
+        package_names[canonical_name] = package_names.get(canonical_name, 0) + 1
+    duplicate_names = {
+        name for name, occurrence_count in package_names.items() if occurrence_count > 1
+    }
+    for name in sorted(duplicate_names):
+        issues.append(
+            _issue(
+                ValidationIssueCode.RESOLUTION_DUPLICATE_PACKAGE,
+                name,
+                "resolved set contains multiple versions of one package",
+            )
+        )
+    expected = {
+        (item.name, item.version): item
+        for item in packages
+        if canonicalize_name(item.name) not in duplicate_names
+    }
     observed_by_actual: dict[tuple[str, Version], list[DownloadedWheel]] = {}
 
     for observed in observations:
@@ -84,7 +105,8 @@ def validate_closure(
 
     for package in packages:
         _validate_requires_python(package, profile, issues)
-        _validate_dependencies(package, expected, profile, issues)
+        if canonicalize_name(package.name) not in duplicate_names:
+            _validate_dependencies(package, expected, profile, issues)
 
     ordered = tuple(sorted(issues, key=lambda item: (item.package, item.code.value, item.filename or "", item.detail)))
     return StaticValidationReport(ordered, not ordered)
@@ -140,8 +162,19 @@ def _validate_dependencies(
         except InvalidRequirement:
             issues.append(_issue(ValidationIssueCode.REQUIRES_DIST_INVALID, package.name, raw))
             continue
-        if requirement.marker is not None and not requirement.marker.evaluate(environment):
-            continue
+        if requirement.marker is not None:
+            try:
+                if not requirement.marker.evaluate(environment):
+                    continue
+            except (UndefinedComparison, UndefinedEnvironmentName, InvalidVersion):
+                issues.append(
+                    _issue(
+                        ValidationIssueCode.REQUIRES_DIST_INVALID,
+                        package.name,
+                        raw,
+                    )
+                )
+                continue
         dependency = canonicalize_name(requirement.name)
         version = versions.get(dependency)
         if version is None:

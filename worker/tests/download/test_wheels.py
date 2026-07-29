@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from packaging.version import Version
 
+import wheelforge_worker.download.wheels as wheels_module
 from wheelforge_worker.download import (
     DownloadCancelledError,
     DownloadLimits,
@@ -208,6 +209,195 @@ def test_destination_with_a_symlinked_ancestor_is_rejected(
         )
 
 
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlinks are unavailable")
+def test_post_run_destination_symlink_swap_cannot_escape_bound_directory(
+    profile_cp311_arm64: TargetProfile, tmp_path: Path
+) -> None:
+    destination = tmp_path / "out"
+    moved_destination = tmp_path / "moved-out"
+    escape = tmp_path / "escape"
+
+    def action(argv: list[str], _cwd: Path) -> object:
+        attempt = Path(argv[argv.index("--dest") + 1])
+        destination.rename(moved_destination)
+        escape.mkdir()
+        destination.symlink_to(escape, target_is_directory=True)
+        attempt.mkdir(exist_ok=True)
+        (attempt / "demo-1.2.3-py3-none-any.whl").write_bytes(b"wheel")
+        return None
+
+    with pytest.raises(DownloadValidationError):
+        WheelDownloader(tmp_path, runner=FakeRunner(action)).download_one(
+            package(), profile_cp311_arm64, destination, lambda: False
+        )
+
+    assert list(escape.rglob("*.whl")) == []
+    assert not list(moved_destination.glob(".download-*"))
+    assert not list(tmp_path.glob(".download-*"))
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlinks are unavailable")
+def test_destination_swap_is_rejected_by_cross_platform_fallback(
+    profile_cp311_arm64: TargetProfile,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "out"
+    moved_destination = tmp_path / "moved-out"
+    escape = tmp_path / "escape"
+    monkeypatch.setattr(
+        wheels_module, "_DIRECTORY_HANDLE_SUPPORTED", False, raising=False
+    )
+
+    def action(argv: list[str], _cwd: Path) -> object:
+        attempt = Path(argv[argv.index("--dest") + 1])
+        destination.rename(moved_destination)
+        escape.mkdir()
+        destination.symlink_to(escape, target_is_directory=True)
+        attempt.mkdir(exist_ok=True)
+        (attempt / "demo-1.2.3-py3-none-any.whl").write_bytes(b"wheel")
+        return None
+
+    with pytest.raises(DownloadValidationError):
+        WheelDownloader(tmp_path, runner=FakeRunner(action)).download_one(
+            package(), profile_cp311_arm64, destination, lambda: False
+        )
+
+    assert list(escape.rglob("*.whl")) == []
+    assert not list(tmp_path.glob(".download-*"))
+
+
+def test_download_succeeds_through_cross_platform_path_fallback(
+    profile_cp311_arm64: TargetProfile,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        wheels_module, "_DIRECTORY_HANDLE_SUPPORTED", False, raising=False
+    )
+
+    result = WheelDownloader(
+        tmp_path,
+        runner=FakeRunner(write_one("demo-1.2.3-py3-none-any.whl")),
+    ).download_one(package(), profile_cp311_arm64, tmp_path / "out", lambda: False)
+
+    assert result.path.read_bytes() == b"wheel"
+
+
+@pytest.mark.skipif(
+    not wheels_module._DIRECTORY_HANDLE_SUPPORTED,
+    reason="directory handles are unavailable",
+)
+def test_staging_and_destination_directory_handles_are_closed_independently(
+    profile_cp311_arm64: TargetProfile,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    staging = tmp_path / "staging"
+    staging.mkdir(mode=0o700)
+    destination = tmp_path / "out"
+    real_open = os.open
+    captured: dict[Path, int] = {}
+
+    def recording_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        descriptor = real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+        if kwargs.get("dir_fd") is None and isinstance(path, (str, os.PathLike)):
+            candidate = Path(path)
+            if candidate in {staging, destination} and flags & os.O_DIRECTORY:
+                captured[candidate] = descriptor
+        return descriptor
+
+    monkeypatch.setattr(wheels_module.os, "open", recording_open)
+
+    WheelDownloader(
+        staging,
+        runner=FakeRunner(write_one("demo-1.2.3-py3-none-any.whl")),
+    ).download_one(package(), profile_cp311_arm64, destination, lambda: False)
+
+    assert set(captured) == {staging, destination}
+    for descriptor in captured.values():
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+@pytest.mark.skipif(
+    not wheels_module._DIRECTORY_HANDLE_SUPPORTED,
+    reason="directory handles are unavailable",
+)
+def test_staging_handle_is_closed_when_initial_identity_revalidation_fails(
+    profile_cp311_arm64: TargetProfile,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    staging = tmp_path / "staging"
+    staging.mkdir(mode=0o700)
+    moved_staging = tmp_path / "moved-staging"
+    replacement = tmp_path / "replacement"
+    replacement.mkdir(mode=0o700)
+    real_open = os.open
+    real_fstat = os.fstat
+    staging_descriptor: int | None = None
+    swapped = False
+
+    def recording_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        nonlocal staging_descriptor
+        descriptor = real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+        if kwargs.get("dir_fd") is None and Path(path) == staging:  # type: ignore[arg-type]
+            staging_descriptor = descriptor
+        return descriptor
+
+    def swapping_fstat(descriptor: int) -> os.stat_result:
+        nonlocal swapped
+        status = real_fstat(descriptor)
+        if descriptor == staging_descriptor and not swapped:
+            staging.rename(moved_staging)
+            staging.symlink_to(replacement, target_is_directory=True)
+            swapped = True
+        return status
+
+    monkeypatch.setattr(wheels_module.os, "open", recording_open)
+    monkeypatch.setattr(wheels_module.os, "fstat", swapping_fstat)
+
+    with pytest.raises(DownloadValidationError, match="identity changed"):
+        WheelDownloader(
+            staging,
+            runner=FakeRunner(write_one("demo-1.2.3-py3-none-any.whl")),
+        ).download_one(package(), profile_cp311_arm64, tmp_path / "out", lambda: False)
+
+    assert staging_descriptor is not None
+    with pytest.raises(OSError):
+        real_fstat(staging_descriptor)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX private mode check")
+def test_worker_staging_root_must_be_private(
+    profile_cp311_arm64: TargetProfile, tmp_path: Path
+) -> None:
+    staging = tmp_path / "staging"
+    staging.mkdir(mode=0o755)
+
+    with pytest.raises(ValueError, match="private"):
+        WheelDownloader(
+            staging,
+            runner=FakeRunner(write_one("demo-1.2.3-py3-none-any.whl")),
+        )
+
+
+def test_worker_staging_root_must_not_use_a_symlink(
+    profile_cp311_arm64: TargetProfile, tmp_path: Path
+) -> None:
+    staging = tmp_path / "staging"
+    staging.mkdir(mode=0o700)
+    linked_staging = tmp_path / "linked-staging"
+    linked_staging.symlink_to(staging, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        WheelDownloader(
+            linked_staging,
+            runner=FakeRunner(write_one("demo-1.2.3-py3-none-any.whl")),
+        )
+
+
 def test_hash_and_byte_accounting_are_exact(
     profile_cp311_arm64: TargetProfile, tmp_path: Path
 ) -> None:
@@ -273,6 +463,77 @@ def test_whole_download_failure_removes_only_wheels_published_by_this_call(
         )
     assert preserved.read_bytes() == b"do not remove"
     assert not (destination / "alpha-1.0-py3-none-any.whl").exists()
+
+
+def test_rollback_preserves_a_replacement_of_an_invocation_published_wheel(
+    profile_cp311_arm64: TargetProfile, tmp_path: Path
+) -> None:
+    destination = tmp_path / "out"
+    replacement = b"replacement owned by another actor"
+    replaced = False
+
+    def action(argv: list[str], _cwd: Path) -> object:
+        nonlocal replaced
+        if argv[-1] == "alpha==1.0":
+            return write_one("alpha-1.0-py3-none-any.whl")(argv, _cwd)
+        if not replaced:
+            published = destination / "alpha-1.0-py3-none-any.whl"
+            published.unlink()
+            published.write_bytes(replacement)
+            replaced = True
+        return 1
+
+    with pytest.raises(WheelDownloadError):
+        WheelDownloader(tmp_path, runner=FakeRunner(action)).download(
+            resolution(package("alpha", "1.0"), package("beta", "2.0")),
+            profile_cp311_arm64,
+            destination,
+            lambda: False,
+        )
+
+    assert (destination / "alpha-1.0-py3-none-any.whl").read_bytes() == replacement
+
+
+def test_publication_failure_preserves_a_replacement_file(
+    profile_cp311_arm64: TargetProfile,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "out"
+    replacement = b"replacement after exclusive create"
+
+    def replace_then_fail(observed: object, descriptor: int) -> None:
+        os.close(descriptor)
+        final_path = destination / "demo-1.2.3-py3-none-any.whl"
+        final_path.unlink()
+        final_path.write_bytes(replacement)
+        raise DownloadValidationError("injected copy failure")
+
+    monkeypatch.setattr(wheels_module, "_copy_verified", replace_then_fail)
+
+    with pytest.raises(DownloadValidationError, match="injected copy failure"):
+        WheelDownloader(
+            tmp_path,
+            runner=FakeRunner(write_one("demo-1.2.3-py3-none-any.whl")),
+        ).download_one(package(), profile_cp311_arm64, destination, lambda: False)
+
+    assert (destination / "demo-1.2.3-py3-none-any.whl").read_bytes() == replacement
+
+
+def test_duplicate_canonical_package_name_across_versions_is_rejected_before_download(
+    profile_cp311_arm64: TargetProfile, tmp_path: Path
+) -> None:
+    runner = FakeRunner(lambda _argv, _cwd: AssertionError("runner must not be called"))
+
+    with pytest.raises(DownloadValidationError, match="duplicate"):
+        WheelDownloader(tmp_path, runner=runner).download(
+            resolution(package("demo", "1.0"), package("demo", "2.0")),
+            profile_cp311_arm64,
+            tmp_path / "out",
+            lambda: False,
+        )
+
+    assert runner.calls == []
 
 
 @pytest.mark.parametrize(

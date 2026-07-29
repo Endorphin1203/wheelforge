@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import secrets
 import shutil
 import stat
 import sys
@@ -37,6 +38,16 @@ _PIP_ENVIRONMENT = {
 }
 _MAX_TIMEOUT = timedelta(minutes=10)
 _COPY_CHUNK_BYTES = 64 * 1024
+_DIRECTORY_HANDLE_SUPPORTED = bool(
+    os.name != "nt"
+    and hasattr(os, "O_DIRECTORY")
+    and os.open in os.supports_dir_fd
+    and os.stat in os.supports_dir_fd
+    and os.unlink in os.supports_dir_fd
+    and os.mkdir in os.supports_dir_fd
+    and os.rmdir in os.supports_dir_fd
+    and os.listdir in os.supports_fd
+)
 
 
 def _require_limit(name: str, value: int, maximum: int) -> None:
@@ -78,6 +89,95 @@ class DownloadedWheel:
     tags: frozenset[Tag]
 
 
+@dataclass(frozen=True, slots=True)
+class _FileIdentity:
+    device: int
+    inode: int
+
+
+@dataclass(slots=True)
+class _DestinationBinding:
+    path: Path
+    identity: _FileIdentity
+    descriptor: int | None
+
+    def revalidate(self) -> None:
+        try:
+            status = self.path.lstat()
+        except OSError as error:
+            raise DownloadValidationError("destination identity changed") from error
+        if (
+            not stat.S_ISDIR(status.st_mode)
+            or stat.S_ISLNK(status.st_mode)
+            or _identity(status) != self.identity
+        ):
+            raise DownloadValidationError("destination identity changed")
+        if self.descriptor is not None:
+            try:
+                descriptor_status = os.fstat(self.descriptor)
+            except OSError as error:
+                raise DownloadValidationError("destination handle is invalid") from error
+            if (
+                not stat.S_ISDIR(descriptor_status.st_mode)
+                or _identity(descriptor_status) != self.identity
+            ):
+                raise DownloadValidationError("destination handle identity changed")
+
+    def close(self) -> None:
+        if self.descriptor is not None:
+            os.close(self.descriptor)
+            self.descriptor = None
+
+
+@dataclass(slots=True)
+class _AttemptBinding:
+    name: str
+    path: Path
+    identity: _FileIdentity
+    descriptor: int | None
+
+    def revalidate(self, destination: _DestinationBinding) -> None:
+        destination.revalidate()
+        try:
+            if destination.descriptor is not None:
+                status = os.stat(
+                    self.name,
+                    dir_fd=destination.descriptor,
+                    follow_symlinks=False,
+                )
+            else:
+                status = self.path.lstat()
+        except OSError as error:
+            raise DownloadValidationError("download attempt identity changed") from error
+        if (
+            not stat.S_ISDIR(status.st_mode)
+            or stat.S_ISLNK(status.st_mode)
+            or _identity(status) != self.identity
+        ):
+            raise DownloadValidationError("download attempt identity changed")
+        if self.descriptor is not None:
+            try:
+                descriptor_status = os.fstat(self.descriptor)
+            except OSError as error:
+                raise DownloadValidationError("download attempt handle is invalid") from error
+            if (
+                not stat.S_ISDIR(descriptor_status.st_mode)
+                or _identity(descriptor_status) != self.identity
+            ):
+                raise DownloadValidationError("download attempt handle identity changed")
+
+    def close(self) -> None:
+        if self.descriptor is not None:
+            os.close(self.descriptor)
+            self.descriptor = None
+
+
+@dataclass(frozen=True, slots=True)
+class _Publication:
+    wheel: DownloadedWheel
+    identity: _FileIdentity
+
+
 class WheelDownloadError(RuntimeError):
     """A Wheel could not be acquired from any configured source."""
 
@@ -101,11 +201,28 @@ class WheelDownloader:
     ) -> None:
         if not isinstance(work_directory, Path) or not work_directory.is_dir():
             raise ValueError("work directory must be an existing directory")
+        work_directory = work_directory.absolute()
+        if _has_symlink_component(work_directory):
+            raise ValueError("work directory must not contain symlinks")
+        try:
+            work_status = work_directory.lstat()
+        except OSError as error:
+            raise ValueError("work directory could not be inspected") from error
+        if not stat.S_ISDIR(work_status.st_mode) or stat.S_ISLNK(work_status.st_mode):
+            raise ValueError("work directory must not be a symlink")
+        if os.name != "nt" and stat.S_IMODE(work_status.st_mode) & 0o077:
+            raise ValueError("work directory must be private")
+        if (
+            hasattr(os, "geteuid")
+            and hasattr(work_status, "st_uid")
+            and work_status.st_uid != os.geteuid()
+        ):
+            raise ValueError("work directory must be owned by the Worker user")
         if not isinstance(timeout, timedelta) or not timedelta(0) < timeout <= _MAX_TIMEOUT:
             raise ValueError("download timeout must be positive and at most 10 minutes")
         if not isinstance(limits, DownloadLimits):
             raise ValueError("download limits are required")
-        self._work_directory = work_directory.resolve()
+        self._work_directory = work_directory
         self._runner = ProcessRunner() if runner is None else runner
         self._timeout = timeout
         self._limits = limits
@@ -121,26 +238,33 @@ class WheelDownloader:
         _validate_profile_and_cancel(profile, cancel)
         if len(packages) > self._limits.max_packages:
             raise DownloadValidationError("resolved package count exceeds the limit")
-        destination = self._prepare_destination(destination)
-        published: list[DownloadedWheel] = []
-        total = 0
+        staging = self._prepare_staging_root()
         try:
-            for package in packages:
-                _raise_if_cancelled(cancel)
-                wheel = self._download_one(
-                    package,
-                    profile,
-                    destination,
-                    cancel,
-                    self._limits.max_total_bytes - total,
-                )
-                total += wheel.byte_size
-                published.append(wheel)
-            return published
-        except BaseException:
-            for wheel in published:
-                _unlink_if_same_regular_file(wheel.path)
-            raise
+            destination_binding = self._prepare_destination(destination)
+            published: list[_Publication] = []
+            try:
+                total = 0
+                for package in packages:
+                    _raise_if_cancelled(cancel)
+                    publication = self._download_one(
+                        package,
+                        profile,
+                        staging,
+                        destination_binding,
+                        cancel,
+                        self._limits.max_total_bytes - total,
+                    )
+                    total += publication.wheel.byte_size
+                    published.append(publication)
+                return [publication.wheel for publication in published]
+            except BaseException:
+                for publication in reversed(published):
+                    _unlink_if_owned(destination_binding, publication)
+                raise
+            finally:
+                destination_binding.close()
+        finally:
+            staging.close()
 
     def download_one(
         self,
@@ -151,56 +275,81 @@ class WheelDownloader:
     ) -> DownloadedWheel:
         _validate_package(package)
         _validate_profile_and_cancel(profile, cancel)
-        destination = self._prepare_destination(destination)
-        return self._download_one(
-            package, profile, destination, cancel, self._limits.max_total_bytes
-        )
+        staging = self._prepare_staging_root()
+        try:
+            destination_binding = self._prepare_destination(destination)
+            try:
+                return self._download_one(
+                    package,
+                    profile,
+                    staging,
+                    destination_binding,
+                    cancel,
+                    self._limits.max_total_bytes,
+                ).wheel
+            finally:
+                destination_binding.close()
+        finally:
+            staging.close()
 
     def _download_one(
         self,
         package: ResolvedPackage,
         profile: TargetProfile,
-        destination: Path,
+        staging: _DestinationBinding,
+        destination: _DestinationBinding,
         cancel: Callable[[], bool],
         remaining_total: int,
-    ) -> DownloadedWheel:
+    ) -> _Publication:
         _validate_package(package)
         if remaining_total <= 0:
             raise DownloadValidationError("total downloaded Wheel byte limit exceeded")
         errors: list[str] = []
         for source in SOURCE_ORDER:
             _raise_if_cancelled(cancel)
-            attempt = Path(tempfile.mkdtemp(prefix=".download-", dir=destination))
+            staging.revalidate()
+            destination.revalidate()
+            attempt = _create_attempt(staging)
             try:
-                attempt.chmod(0o700)
-                argv = build_download_argv(package, profile, source, attempt)
+                attempt.revalidate(staging)
+                destination.revalidate()
+                argv = build_download_argv(package, profile, source, attempt.path)
                 try:
                     result = self._runner.run(
-                        argv, attempt, self._timeout, dict(_PIP_ENVIRONMENT)
+                        argv, attempt.path, self._timeout, dict(_PIP_ENVIRONMENT)
                     )
                 except (ProcessExecutionError, ProcessTimeoutError) as error:
+                    attempt.revalidate(staging)
+                    destination.revalidate()
                     errors.append(f"{source.value}: {error}")
                     continue
+                attempt.revalidate(staging)
+                destination.revalidate()
                 if result.return_code != 0:
                     errors.append(f"{source.value}: pip exited with {result.return_code}")
                     continue
                 _raise_if_cancelled(cancel)
                 observed = _inspect_attempt_output(
                     attempt,
+                    staging,
                     package,
                     profile,
                     min(self._limits.max_wheel_bytes, remaining_total),
                 )
                 _raise_if_cancelled(cancel)
-                return _publish_wheel(observed, destination, source, cancel)
+                attempt.revalidate(staging)
+                destination.revalidate()
+                return _publish_wheel(
+                    observed, staging, destination, source, cancel
+                )
             finally:
-                shutil.rmtree(attempt, ignore_errors=True)
+                _remove_attempt(staging, attempt)
         detail = "; ".join(errors)[:4096]
         raise WheelDownloadError(
             f"could not download {package.name}=={package.version} from configured sources: {detail}"
         )
 
-    def _prepare_destination(self, destination: Path) -> Path:
+    def _prepare_destination(self, destination: Path) -> _DestinationBinding:
         if not isinstance(destination, Path) or "\x00" in str(destination):
             raise ValueError("destination must be a trusted Path")
         if not destination.is_absolute():
@@ -215,7 +364,49 @@ class WheelDownloader:
             raise DownloadValidationError("destination could not be prepared") from error
         if not stat.S_ISDIR(status.st_mode) or stat.S_ISLNK(status.st_mode):
             raise DownloadValidationError("destination must be a real directory")
-        return destination
+        return _bind_directory(destination, status, "destination")
+
+    def _prepare_staging_root(self) -> _DestinationBinding:
+        try:
+            status = self._work_directory.lstat()
+        except OSError as error:
+            raise DownloadValidationError("staging root could not be inspected") from error
+        if (
+            not stat.S_ISDIR(status.st_mode)
+            or stat.S_ISLNK(status.st_mode)
+            or (os.name != "nt" and stat.S_IMODE(status.st_mode) & 0o077)
+        ):
+            raise DownloadValidationError("staging root is not private and stable")
+        return _bind_directory(self._work_directory, status, "staging root")
+
+
+def _bind_directory(
+    path: Path, status: os.stat_result, label: str
+) -> _DestinationBinding:
+    identity = _identity(status)
+    descriptor: int | None = None
+    if _DIRECTORY_HANDLE_SUPPORTED:
+        flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+            descriptor_status = os.fstat(descriptor)
+        except OSError as error:
+            if descriptor is not None:
+                os.close(descriptor)
+            raise DownloadValidationError(f"{label} could not be bound safely") from error
+        if (
+            not stat.S_ISDIR(descriptor_status.st_mode)
+            or _identity(descriptor_status) != identity
+        ):
+            os.close(descriptor)
+            raise DownloadValidationError(f"{label} changed while being bound")
+    binding = _DestinationBinding(path, identity, descriptor)
+    try:
+        binding.revalidate()
+    except BaseException:
+        binding.close()
+        raise
+    return binding
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,6 +418,8 @@ class _ObservedWheel:
     tags: frozenset[Tag]
     byte_size: int
     sha256: str
+    file_identity: _FileIdentity
+    attempt: _AttemptBinding
 
 
 def build_download_argv(
@@ -266,13 +459,12 @@ def _resolved_packages(resolved: ResolutionResult) -> tuple[ResolvedPackage, ...
     if not isinstance(resolved, ResolutionResult):
         raise ValueError("resolution result is required")
     packages = tuple(resolved.packages)
-    seen: set[tuple[str, Version]] = set()
+    seen: set[str] = set()
     for package in packages:
         _validate_package(package)
-        key = (package.name, package.version)
-        if key in seen:
+        if package.name in seen:
             raise DownloadValidationError("resolution result contains duplicate packages")
-        seen.add(key)
+        seen.add(package.name)
     return packages
 
 
@@ -299,24 +491,148 @@ def _raise_if_cancelled(cancel: Callable[[], bool]) -> None:
         raise DownloadCancelledError("download cancelled")
 
 
+def _identity(status: os.stat_result) -> _FileIdentity:
+    return _FileIdentity(status.st_dev, status.st_ino)
+
+
+def _create_attempt(destination: _DestinationBinding) -> _AttemptBinding:
+    if destination.descriptor is not None:
+        for _ in range(100):
+            name = f".download-{secrets.token_hex(8)}"
+            try:
+                os.mkdir(name, 0o700, dir_fd=destination.descriptor)
+            except FileExistsError:
+                continue
+            except OSError as error:
+                raise DownloadValidationError("download attempt could not be created") from error
+            descriptor: int | None = None
+            try:
+                status = os.stat(
+                    name,
+                    dir_fd=destination.descriptor,
+                    follow_symlinks=False,
+                )
+                flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+                descriptor = os.open(name, flags, dir_fd=destination.descriptor)
+                descriptor_status = os.fstat(descriptor)
+                if (
+                    not stat.S_ISDIR(status.st_mode)
+                    or stat.S_ISLNK(status.st_mode)
+                    or _identity(status) != _identity(descriptor_status)
+                ):
+                    raise DownloadValidationError("download attempt changed while being bound")
+                return _AttemptBinding(
+                    name,
+                    destination.path / name,
+                    _identity(status),
+                    descriptor,
+                )
+            except BaseException:
+                if descriptor is not None:
+                    os.close(descriptor)
+                try:
+                    os.rmdir(name, dir_fd=destination.descriptor)
+                except OSError:
+                    pass
+                raise
+        raise DownloadValidationError("download attempt name allocation was exhausted")
+
+    path = Path(tempfile.mkdtemp(prefix=".download-", dir=destination.path))
+    try:
+        path.chmod(0o700)
+        status = path.lstat()
+    except BaseException:
+        shutil.rmtree(path, ignore_errors=True)
+        raise
+    if not stat.S_ISDIR(status.st_mode) or stat.S_ISLNK(status.st_mode):
+        shutil.rmtree(path, ignore_errors=True)
+        raise DownloadValidationError("download attempt must be a real directory")
+    attempt = _AttemptBinding(path.name, path, _identity(status), None)
+    attempt.revalidate(destination)
+    return attempt
+
+
+def _remove_attempt(
+    destination: _DestinationBinding, attempt: _AttemptBinding
+) -> None:
+    try:
+        if destination.descriptor is not None and attempt.descriptor is not None:
+            try:
+                status = os.stat(
+                    attempt.name,
+                    dir_fd=destination.descriptor,
+                    follow_symlinks=False,
+                )
+                if _identity(status) != attempt.identity or not stat.S_ISDIR(status.st_mode):
+                    return
+                _clear_directory_handle(attempt.descriptor)
+                status = os.stat(
+                    attempt.name,
+                    dir_fd=destination.descriptor,
+                    follow_symlinks=False,
+                )
+                if _identity(status) == attempt.identity:
+                    os.rmdir(attempt.name, dir_fd=destination.descriptor)
+            except OSError:
+                pass
+            return
+
+        try:
+            attempt.revalidate(destination)
+        except DownloadValidationError:
+            return
+        shutil.rmtree(attempt.path, ignore_errors=True)
+    finally:
+        attempt.close()
+
+
+def _clear_directory_handle(descriptor: int) -> None:
+    for name in os.listdir(descriptor):
+        try:
+            status = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            if stat.S_ISDIR(status.st_mode) and not stat.S_ISLNK(status.st_mode):
+                flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+                child = os.open(name, flags, dir_fd=descriptor)
+                try:
+                    if _identity(os.fstat(child)) != _identity(status):
+                        continue
+                    _clear_directory_handle(child)
+                finally:
+                    os.close(child)
+                current = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                if _identity(current) == _identity(status):
+                    os.rmdir(name, dir_fd=descriptor)
+            else:
+                current = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                if _identity(current) == _identity(status):
+                    os.unlink(name, dir_fd=descriptor)
+        except OSError:
+            continue
+
+
 def _inspect_attempt_output(
-    attempt: Path,
+    attempt: _AttemptBinding,
+    staging: _DestinationBinding,
     package: ResolvedPackage,
     profile: TargetProfile,
     maximum_bytes: int,
 ) -> _ObservedWheel:
+    attempt.revalidate(staging)
     try:
-        entries = list(attempt.iterdir())
+        if attempt.descriptor is not None:
+            names = os.listdir(attempt.descriptor)
+        else:
+            names = [entry.name for entry in attempt.path.iterdir()]
     except OSError as error:
         raise DownloadValidationError("download output could not be inspected") from error
-    if len(entries) != 1:
+    if len(names) != 1:
         raise DownloadValidationError("successful source attempt must produce exactly one Wheel")
-    path = entries[0]
-    filename = path.name
+    filename = names[0]
+    path = attempt.path / filename
     if not _safe_filename(filename):
         raise DownloadValidationError("download output filename is unsafe")
     try:
-        file_status = path.lstat()
+        file_status = _stat_attempt_entry(attempt, filename)
     except OSError as error:
         raise DownloadValidationError("download output could not be inspected") from error
     if (
@@ -334,9 +650,21 @@ def _inspect_attempt_output(
         raise DownloadValidationError("download output does not match the resolved package")
     if not wheel_is_compatible(filename, profile):
         raise DownloadValidationError("download output is incompatible with the target")
-    size, digest = _hash_regular_file(path, file_status, maximum_bytes)
+    size, digest = _hash_regular_file(attempt, filename, file_status, maximum_bytes)
+    attempt.revalidate(staging)
+    current_status = _stat_attempt_entry(attempt, filename)
+    if _identity(current_status) != _identity(file_status):
+        raise DownloadValidationError("download output changed during inspection")
     return _ObservedWheel(
-        filename, path, package.name, package.version, frozenset(tags), size, digest
+        filename,
+        path,
+        package.name,
+        package.version,
+        frozenset(tags),
+        size,
+        digest,
+        _identity(file_status),
+        attempt,
     )
 
 
@@ -367,10 +695,27 @@ def _has_symlink_component(path: Path) -> bool:
     return False
 
 
-def _hash_regular_file(path: Path, expected: os.stat_result, maximum_bytes: int) -> tuple[int, str]:
+def _stat_attempt_entry(attempt: _AttemptBinding, filename: str) -> os.stat_result:
+    if attempt.descriptor is not None:
+        return os.stat(filename, dir_fd=attempt.descriptor, follow_symlinks=False)
+    return (attempt.path / filename).lstat()
+
+
+def _open_attempt_entry(attempt: _AttemptBinding, filename: str) -> int:
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    if attempt.descriptor is not None:
+        return os.open(filename, flags, dir_fd=attempt.descriptor)
+    return os.open(attempt.path / filename, flags)
+
+
+def _hash_regular_file(
+    attempt: _AttemptBinding,
+    filename: str,
+    expected: os.stat_result,
+    maximum_bytes: int,
+) -> tuple[int, str]:
     try:
-        descriptor = os.open(path, flags)
+        descriptor = _open_attempt_entry(attempt, filename)
     except OSError as error:
         raise DownloadValidationError("download output could not be opened safely") from error
     digest = hashlib.sha256()
@@ -399,40 +744,72 @@ def _hash_regular_file(path: Path, expected: os.stat_result, maximum_bytes: int)
 
 def _publish_wheel(
     observed: _ObservedWheel,
-    destination: Path,
+    staging: _DestinationBinding,
+    destination: _DestinationBinding,
     source: PackageSource,
     cancel: Callable[[], bool],
-) -> DownloadedWheel:
+) -> _Publication:
     _raise_if_cancelled(cancel)
+    observed.attempt.revalidate(staging)
     _reject_destination_collision(destination, observed.filename)
-    final_path = destination / observed.filename
+    destination.revalidate()
+    final_path = destination.path / observed.filename
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     try:
-        descriptor = os.open(final_path, flags, 0o600)
+        if destination.descriptor is not None:
+            descriptor = os.open(
+                observed.filename,
+                flags,
+                0o600,
+                dir_fd=destination.descriptor,
+            )
+        else:
+            descriptor = os.open(final_path, flags, 0o600)
+        published_identity = _identity(os.fstat(descriptor))
     except FileExistsError as error:
         raise DownloadValidationError("destination already contains this Wheel") from error
     except OSError as error:
         raise DownloadValidationError("Wheel could not be published") from error
     try:
         _copy_verified(observed, descriptor)
+        destination.revalidate()
+        published_status = _stat_destination_entry(destination, observed.filename)
+        if (
+            not stat.S_ISREG(published_status.st_mode)
+            or stat.S_ISLNK(published_status.st_mode)
+            or _identity(published_status) != published_identity
+        ):
+            raise DownloadValidationError("published Wheel identity changed")
     except BaseException:
-        final_path.unlink(missing_ok=True)
+        _unlink_destination_entry_if_identity(
+            destination, observed.filename, published_identity
+        )
         raise
-    return DownloadedWheel(
-        observed.package,
-        observed.version,
-        observed.filename,
-        final_path,
-        source,
-        observed.byte_size,
-        observed.sha256,
-        observed.tags,
+    return _Publication(
+        DownloadedWheel(
+            observed.package,
+            observed.version,
+            observed.filename,
+            final_path,
+            source,
+            observed.byte_size,
+            observed.sha256,
+            observed.tags,
+        ),
+        published_identity,
     )
 
 
-def _reject_destination_collision(destination: Path, filename: str) -> None:
+def _reject_destination_collision(
+    destination: _DestinationBinding, filename: str
+) -> None:
+    destination.revalidate()
     try:
-        names = [entry.name for entry in destination.iterdir() if not entry.name.startswith(".download-")]
+        if destination.descriptor is not None:
+            entries = os.listdir(destination.descriptor)
+        else:
+            entries = [entry.name for entry in destination.path.iterdir()]
+        names = [name for name in entries if not name.startswith(".download-")]
     except OSError as error:
         raise DownloadValidationError("destination could not be inspected") from error
     if filename in names or filename.casefold() in {name.casefold() for name in names}:
@@ -440,16 +817,21 @@ def _reject_destination_collision(destination: Path, filename: str) -> None:
 
 
 def _copy_verified(observed: _ObservedWheel, descriptor: int) -> None:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
-        source_descriptor = os.open(observed.path, flags)
+        source_descriptor = _open_attempt_entry(
+            observed.attempt, observed.filename
+        )
     except OSError as error:
         os.close(descriptor)
         raise DownloadValidationError("download output could not be published safely") from error
     try:
         with os.fdopen(source_descriptor, "rb") as source, os.fdopen(descriptor, "wb") as target:
             source_status = os.fstat(source.fileno())
-            if not stat.S_ISREG(source_status.st_mode) or source_status.st_nlink != 1:
+            if (
+                not stat.S_ISREG(source_status.st_mode)
+                or source_status.st_nlink != 1
+                or _identity(source_status) != observed.file_identity
+            ):
                 raise DownloadValidationError("download output changed before publication")
             copied = 0
             digest = hashlib.sha256()
@@ -465,10 +847,48 @@ def _copy_verified(observed: _ObservedWheel, descriptor: int) -> None:
         raise DownloadValidationError("Wheel could not be published") from error
 
 
-def _unlink_if_same_regular_file(path: Path) -> None:
+def _stat_destination_entry(
+    destination: _DestinationBinding, filename: str
+) -> os.stat_result:
+    if destination.descriptor is not None:
+        return os.stat(
+            filename,
+            dir_fd=destination.descriptor,
+            follow_symlinks=False,
+        )
+    return (destination.path / filename).lstat()
+
+
+def _unlink_destination_entry_if_identity(
+    destination: _DestinationBinding,
+    filename: str,
+    identity: _FileIdentity,
+) -> None:
     try:
-        status = path.lstat()
-        if stat.S_ISREG(status.st_mode) and not stat.S_ISLNK(status.st_mode):
-            path.unlink()
-    except FileNotFoundError:
-        pass
+        if destination.descriptor is None:
+            destination.revalidate()
+        status = _stat_destination_entry(destination, filename)
+        if (
+            not stat.S_ISREG(status.st_mode)
+            or stat.S_ISLNK(status.st_mode)
+            or _identity(status) != identity
+        ):
+            return
+        if destination.descriptor is not None:
+            current = _stat_destination_entry(destination, filename)
+            if _identity(current) == identity:
+                os.unlink(filename, dir_fd=destination.descriptor)
+        else:
+            current = (destination.path / filename).lstat()
+            if _identity(current) == identity:
+                (destination.path / filename).unlink()
+    except (FileNotFoundError, DownloadValidationError, OSError):
+        return
+
+
+def _unlink_if_owned(
+    destination: _DestinationBinding, publication: _Publication
+) -> None:
+    _unlink_destination_entry_if_identity(
+        destination, publication.wheel.filename, publication.identity
+    )
