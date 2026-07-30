@@ -5,8 +5,10 @@ import csv
 import hashlib
 import os
 import stat
+import struct
 import subprocess
 import sys
+import tracemalloc
 import zipfile
 from dataclasses import replace
 from io import StringIO
@@ -25,6 +27,7 @@ from wheelforge_worker.validation.archive import (
     ArchiveMetadataError,
     ArchiveResourceLimitError,
     UnsafeWheelArchive,
+    WheelArchiveValidationError,
     WheelRecordMismatch,
     validate_wheel_archive,
 )
@@ -97,6 +100,65 @@ def observed(path: Path, package: str = "demo", version: str = "1.2.3") -> Downl
         sha256=hashlib.file_digest(path.open("rb"), "sha256").hexdigest(),
         tags=frozenset({Tag("py3", "none", "any")}),
     )
+
+
+def _rewrite_wheel(path: Path, content: dict[str, bytes]) -> None:
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as archive:
+        for name, value in content.items():
+            archive.writestr(name, value)
+
+
+def _corrupt_first_member_payload(path: Path) -> None:
+    content = bytearray(path.read_bytes())
+    local_header = content.index(b"PK\x03\x04")
+    name_length, extra_length = struct.unpack_from("<HH", content, local_header + 26)
+    payload_offset = local_header + 30 + name_length + extra_length
+    content[payload_offset : payload_offset + 4] = b"\xff\xff\xff\xff"
+    path.write_bytes(content)
+
+
+def _make_zip64(path: Path, *, disk_number: int, total_disks: int) -> None:
+    content = bytearray(path.read_bytes())
+    eocd_offset = content.rfind(b"PK\x05\x06")
+    (
+        _signature,
+        _disk_number,
+        _central_disk,
+        entries_on_disk,
+        total_entries,
+        central_size,
+        central_offset,
+        comment_length,
+    ) = struct.unpack_from("<4s4H2LH", content, eocd_offset)
+    assert comment_length == 0
+    zip64_eocd = struct.pack(
+        "<IQHHIIQQQQ",
+        0x06064B50,
+        44,
+        45,
+        45,
+        disk_number,
+        disk_number,
+        entries_on_disk,
+        total_entries,
+        central_size,
+        central_offset,
+    )
+    zip64_locator = struct.pack(
+        "<IIQI", 0x07064B50, disk_number, eocd_offset, total_disks
+    )
+    struct.pack_into(
+        "<4H2L",
+        content,
+        eocd_offset + 4,
+        0,
+        0,
+        0xFFFF,
+        0xFFFF,
+        0xFFFFFFFF,
+        0xFFFFFFFF,
+    )
+    path.write_bytes(content[:eocd_offset] + zip64_eocd + zip64_locator + content[eocd_offset:])
 
 
 def test_valid_wheel_reports_static_metadata(tmp_path: Path) -> None:
@@ -222,6 +284,25 @@ def test_portable_topology_validation_has_linear_prefix_operations(
     assert prefix_checks <= report.entry_count * 4
 
 
+def test_deep_legal_member_path_has_bounded_topology_memory(tmp_path: Path) -> None:
+    deep_name = f"{'a/' * 1800}payload.py"
+    path = make_wheel(tmp_path, entries={deep_name: b"x"})
+
+    tracemalloc.start()
+    try:
+        report = validate_wheel_archive(path, observed(path), ArchiveLimits())
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    try:
+        assert peak < 3 * 1024 * 1024
+    finally:
+        snapshot = getattr(report, "snapshot", None)
+        if snapshot is not None:
+            snapshot.cleanup()
+
+
 @pytest.mark.parametrize(
     "member",
     [
@@ -285,6 +366,57 @@ def test_rejects_encrypted_flag_and_crc_failure(tmp_path: Path) -> None:
     corrupted.write_bytes(contents)
     with pytest.raises(UnsafeWheelArchive):
         validate_wheel_archive(corrupted, observed(corrupted), ArchiveLimits())
+
+
+@pytest.mark.parametrize(
+    "compression",
+    [zipfile.ZIP_DEFLATED, zipfile.ZIP_BZIP2, zipfile.ZIP_LZMA],
+)
+def test_codec_read_failures_are_typed_archive_errors(
+    tmp_path: Path, compression: int
+) -> None:
+    path = make_wheel(tmp_path, compression=compression)
+    _corrupt_first_member_payload(path)
+
+    with pytest.raises(WheelArchiveValidationError):
+        validate_wheel_archive(path, observed(path), ArchiveLimits())
+
+
+def test_nonempty_directory_member_is_rejected_before_packaging(tmp_path: Path) -> None:
+    path = make_wheel(tmp_path, entries={"payload/": b"bad"})
+    with zipfile.ZipFile(path, "r") as source:
+        content = {info.filename: source.read(info) for info in source.infolist()}
+    record_path = next(name for name in content if name.endswith("/RECORD"))
+    content[record_path] = b"".join(
+        line for line in content[record_path].splitlines(keepends=True)
+        if not line.startswith(b"payload/,")
+    )
+    _rewrite_wheel(path, content)
+
+    with pytest.raises(UnsafeWheelArchive):
+        validate_wheel_archive(path, observed(path), ArchiveLimits())
+
+
+def test_non_nfc_member_component_is_rejected(tmp_path: Path) -> None:
+    path = make_wheel(tmp_path, entries={"pkg/cafe\u0301.txt": b"x"})
+
+    with pytest.raises(UnsafeWheelArchive):
+        validate_wheel_archive(path, observed(path), ArchiveLimits())
+
+
+@pytest.mark.parametrize("zip64", [False, True])
+def test_multidisk_end_records_are_rejected(tmp_path: Path, zip64: bool) -> None:
+    path = make_wheel(tmp_path, compression=zipfile.ZIP_STORED)
+    if zip64:
+        _make_zip64(path, disk_number=1, total_disks=2)
+    else:
+        content = bytearray(path.read_bytes())
+        eocd_offset = content.rfind(b"PK\x05\x06")
+        struct.pack_into("<HH", content, eocd_offset + 4, 1, 1)
+        path.write_bytes(content)
+
+    with pytest.raises(UnsafeWheelArchive):
+        validate_wheel_archive(path, observed(path), ArchiveLimits())
 
 
 @pytest.mark.parametrize(
@@ -474,6 +606,73 @@ def test_rejects_malformed_record_rows(tmp_path: Path, record: bytes) -> None:
 
     with pytest.raises(WheelRecordMismatch):
         validate_wheel_archive(path, observed(path), ArchiveLimits())
+
+
+def test_record_rejects_first_invalid_digest_without_materializing_tail(
+    tmp_path: Path,
+) -> None:
+    first_row = b"demo/__init__.py,md5=bad,10\n"
+    filler = b"".join(
+        f"p{index:04d}/".encode() + b"a" * 4080 + b"," + b"A" * 4096 + b",1\n"
+        for index in range(1000)
+    )
+    path = make_wheel(
+        tmp_path,
+        record=first_row + filler,
+        compression=zipfile.ZIP_STORED,
+    )
+
+    tracemalloc.start()
+    try:
+        with pytest.raises(WheelRecordMismatch):
+            validate_wheel_archive(path, observed(path), ArchiveLimits())
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert peak < 16 * 1024 * 1024
+
+
+def test_validation_snapshot_is_bound_to_verified_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_dir = tmp_path / "original"
+    alternate_dir = tmp_path / "alternate"
+    original_dir.mkdir()
+    alternate_dir.mkdir()
+    path = make_wheel(
+        original_dir, entries={"payload.txt": b"A"}, compression=zipfile.ZIP_STORED
+    )
+    alternate = make_wheel(
+        alternate_dir, entries={"payload.txt": b"B"}, compression=zipfile.ZIP_STORED
+    )
+    original_bytes = path.read_bytes()
+    alternate_bytes = alternate.read_bytes()
+    assert len(original_bytes) == len(alternate_bytes)
+    expected = observed(path)
+    real_zip_file = zipfile.ZipFile
+    swapped = False
+
+    def swap_source_before_zip_parse(file: object, *args: object, **kwargs: object):
+        nonlocal swapped
+        if not swapped:
+            path.write_bytes(alternate_bytes)
+            swapped = True
+        return real_zip_file(file, *args, **kwargs)
+
+    monkeypatch.setattr(archive_module.zipfile, "ZipFile", swap_source_before_zip_parse)
+
+    report = validate_wheel_archive(path, expected, ArchiveLimits())
+
+    try:
+        assert swapped is True
+        assert path.read_bytes() == alternate_bytes
+        assert report.snapshot.path.read_bytes() == original_bytes
+        assert report.snapshot.sha256 == expected.sha256
+        assert stat.S_IMODE(report.snapshot.path.stat().st_mode) == 0o400
+    finally:
+        report.snapshot.cleanup()
+    assert not report.snapshot.path.exists()
 
 
 def test_rejects_report_claiming_install_verification() -> None:
