@@ -153,6 +153,20 @@ class ValidatedWheelSnapshot:
                 raise UnsafeWheelArchive("validated Wheel snapshot content changed")
             handle.seek(0)
             return handle
+        except WheelArchiveValidationError:
+            if handle is not None:
+                handle.close()
+            elif descriptor != -1:
+                os.close(descriptor)
+            raise
+        except Exception as error:
+            if handle is not None:
+                handle.close()
+            elif descriptor != -1:
+                os.close(descriptor)
+            raise UnsafeWheelArchive(
+                "validated Wheel snapshot revalidation failed"
+            ) from error
         except BaseException:
             if handle is not None:
                 handle.close()
@@ -432,6 +446,7 @@ def _create_verified_snapshot(
         ) from error
     snapshot_directory: Path | None = None
     snapshot_path: Path | None = None
+    snapshot_descriptor = -1
     try:
         opened = os.fstat(source_descriptor)
         if (
@@ -453,9 +468,12 @@ def _create_verified_snapshot(
         digest = hashlib.sha256()
         byte_size = 0
         try:
-            with os.fdopen(source_descriptor, "rb", closefd=True) as source:
-                source_descriptor = -1
-                with os.fdopen(snapshot_descriptor, "wb", closefd=True) as destination:
+            source = os.fdopen(source_descriptor, "rb", closefd=True)
+            source_descriptor = -1
+            with source:
+                destination = os.fdopen(snapshot_descriptor, "wb", closefd=True)
+                snapshot_descriptor = -1
+                with destination:
                     while block := source.read(_COPY_CHUNK_BYTES):
                         byte_size += len(block)
                         if byte_size > expected.byte_size:
@@ -487,6 +505,8 @@ def _create_verified_snapshot(
     except BaseException:
         if source_descriptor != -1:
             os.close(source_descriptor)
+        if snapshot_descriptor != -1:
+            os.close(snapshot_descriptor)
         if snapshot_path is not None:
             try:
                 snapshot_path.unlink(missing_ok=True)

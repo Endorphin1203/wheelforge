@@ -675,6 +675,84 @@ def test_validation_snapshot_is_bound_to_verified_bytes(
     assert not report.snapshot.path.exists()
 
 
+def test_snapshot_revalidation_wraps_digest_io_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = make_wheel(tmp_path)
+    report = validate_wheel_archive(path, observed(path), ArchiveLimits())
+
+    def fail_digest(*args: object, **kwargs: object) -> object:
+        raise OSError("snapshot read failed")
+
+    monkeypatch.setattr(archive_module.hashlib, "file_digest", fail_digest)
+
+    try:
+        with pytest.raises(UnsafeWheelArchive) as caught:
+            report.snapshot.open()
+        assert isinstance(caught.value.__cause__, OSError)
+    finally:
+        report.snapshot.cleanup()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [ArchiveMetadataError("typed failure"), KeyboardInterrupt(), SystemExit()],
+)
+def test_snapshot_revalidation_preserves_typed_and_process_control_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: BaseException
+) -> None:
+    path = make_wheel(tmp_path)
+    report = validate_wheel_archive(path, observed(path), ArchiveLimits())
+
+    def fail_digest(*args: object, **kwargs: object) -> object:
+        raise failure
+
+    monkeypatch.setattr(archive_module.hashlib, "file_digest", fail_digest)
+
+    try:
+        with pytest.raises(type(failure)) as caught:
+            report.snapshot.open()
+        assert caught.value is failure
+    finally:
+        report.snapshot.cleanup()
+
+
+@pytest.mark.parametrize("failed_transfer", [1, 2], ids=["source", "destination"])
+def test_snapshot_descriptor_closes_when_fdopen_rejects_transfer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_transfer: int
+) -> None:
+    path = make_wheel(tmp_path)
+    expected = observed(path)
+    real_fdopen = os.fdopen
+    call_count = 0
+    destination_descriptor: int | None = None
+
+    def reject_destination_transfer(
+        descriptor: int, *args: object, **kwargs: object
+    ) -> object:
+        nonlocal call_count, destination_descriptor
+        call_count += 1
+        if call_count == failed_transfer:
+            destination_descriptor = descriptor
+            raise OSError("destination fdopen failed")
+        return real_fdopen(descriptor, *args, **kwargs)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(archive_module.os, "fdopen", reject_destination_transfer)
+
+    with pytest.raises(UnsafeWheelArchive):
+        validate_wheel_archive(path, expected, ArchiveLimits())
+
+    assert destination_descriptor is not None
+    try:
+        with pytest.raises(OSError):
+            os.fstat(destination_descriptor)
+    finally:
+        try:
+            os.close(destination_descriptor)
+        except OSError:
+            pass
+
+
 def test_rejects_report_claiming_install_verification() -> None:
     with pytest.raises(ValueError):
         from wheelforge_worker.validation.archive import ArchiveValidationReport
