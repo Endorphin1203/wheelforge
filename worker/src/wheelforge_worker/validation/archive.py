@@ -66,6 +66,18 @@ class WheelRecordMismatch(WheelArchiveValidationError):
     """The Wheel RECORD does not account for its archive files faithfully."""
 
 
+def _close_snapshot_revalidation_resource(
+    handle: BinaryIO | None, descriptor: int
+) -> None:
+    try:
+        if handle is not None:
+            handle.close()
+        elif descriptor != -1:
+            os.close(descriptor)
+    except Exception:
+        pass
+
+
 def _bounded_positive_integer(name: str, value: int, maximum: int) -> None:
     if type(value) is not int or not 1 <= value <= maximum:
         raise ValueError(f"{name} must be a positive bounded integer")
@@ -153,25 +165,14 @@ class ValidatedWheelSnapshot:
                 raise UnsafeWheelArchive("validated Wheel snapshot content changed")
             handle.seek(0)
             return handle
-        except WheelArchiveValidationError:
-            if handle is not None:
-                handle.close()
-            elif descriptor != -1:
-                os.close(descriptor)
-            raise
-        except Exception as error:
-            if handle is not None:
-                handle.close()
-            elif descriptor != -1:
-                os.close(descriptor)
-            raise UnsafeWheelArchive(
-                "validated Wheel snapshot revalidation failed"
-            ) from error
-        except BaseException:
-            if handle is not None:
-                handle.close()
-            elif descriptor != -1:
-                os.close(descriptor)
+        except BaseException as error:
+            _close_snapshot_revalidation_resource(handle, descriptor)
+            if isinstance(error, WheelArchiveValidationError):
+                raise
+            if isinstance(error, Exception):
+                raise UnsafeWheelArchive(
+                    "validated Wheel snapshot revalidation failed"
+                ) from error
             raise
 
     def cleanup(self) -> None:

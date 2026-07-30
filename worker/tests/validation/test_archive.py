@@ -13,6 +13,7 @@ import zipfile
 from dataclasses import replace
 from io import StringIO
 from pathlib import Path
+from typing import BinaryIO, cast
 
 import pytest
 from packaging.tags import Tag
@@ -159,6 +160,59 @@ def _make_zip64(path: Path, *, disk_number: int, total_disks: int) -> None:
         0xFFFFFFFF,
     )
     path.write_bytes(content[:eocd_offset] + zip64_eocd + zip64_locator + content[eocd_offset:])
+
+
+class _FaultingBinaryFile:
+    def __init__(self, wrapped: BinaryIO, failing_method: str | None) -> None:
+        self._wrapped = wrapped
+        self._failing_method = failing_method
+
+    def __enter__(self) -> _FaultingBinaryFile:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._wrapped, name)
+
+    def read(self, size: int = -1) -> bytes:
+        self._fail("read")
+        return self._wrapped.read(size)
+
+    def write(self, value: bytes) -> int:
+        self._fail("write")
+        return self._wrapped.write(value)
+
+    def flush(self) -> None:
+        self._fail("flush")
+        self._wrapped.flush()
+
+    def fileno(self) -> int:
+        return self._wrapped.fileno()
+
+    def close(self) -> None:
+        self._wrapped.close()
+        self._fail("close")
+
+    def _fail(self, method: str) -> None:
+        if self._failing_method == method:
+            raise OSError(f"injected {method} failure")
+
+
+def _assert_file_descriptors_closed(descriptors: list[int]) -> None:
+    still_open: list[int] = []
+    for descriptor in descriptors:
+        try:
+            os.fstat(descriptor)
+        except OSError:
+            continue
+        still_open.append(descriptor)
+    try:
+        assert not still_open
+    finally:
+        for descriptor in still_open:
+            os.close(descriptor)
 
 
 def test_valid_wheel_reports_static_metadata(tmp_path: Path) -> None:
@@ -695,62 +749,146 @@ def test_snapshot_revalidation_wraps_digest_io_failure(
 
 
 @pytest.mark.parametrize(
-    "failure",
-    [ArchiveMetadataError("typed failure"), KeyboardInterrupt(), SystemExit()],
+    ("failure", "expected_type"),
+    [
+        (ArchiveMetadataError("typed failure"), ArchiveMetadataError),
+        (OSError("primary read failure"), UnsafeWheelArchive),
+        (KeyboardInterrupt(), KeyboardInterrupt),
+        (SystemExit(), SystemExit),
+    ],
 )
-def test_snapshot_revalidation_preserves_typed_and_process_control_errors(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: BaseException
+def test_snapshot_revalidation_close_failure_preserves_primary_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+    expected_type: type[BaseException],
 ) -> None:
     path = make_wheel(tmp_path)
     report = validate_wheel_archive(path, observed(path), ArchiveLimits())
+    real_fdopen = os.fdopen
 
     def fail_digest(*args: object, **kwargs: object) -> object:
         raise failure
 
+    def close_failing_fdopen(
+        descriptor: int, *args: object, **kwargs: object
+    ) -> _FaultingBinaryFile:
+        wrapped = cast(
+            BinaryIO,
+            real_fdopen(descriptor, *args, **kwargs),  # type: ignore[call-overload]
+        )
+        return _FaultingBinaryFile(wrapped, "close")
+
     monkeypatch.setattr(archive_module.hashlib, "file_digest", fail_digest)
+    monkeypatch.setattr(archive_module.os, "fdopen", close_failing_fdopen)
 
     try:
-        with pytest.raises(type(failure)) as caught:
+        with pytest.raises(expected_type) as caught:
             report.snapshot.open()
-        assert caught.value is failure
+        if isinstance(failure, OSError):
+            assert isinstance(caught.value, UnsafeWheelArchive)
+            assert caught.value.__cause__ is failure
+        else:
+            assert caught.value is failure
     finally:
         report.snapshot.cleanup()
 
 
 @pytest.mark.parametrize("failed_transfer", [1, 2], ids=["source", "destination"])
-def test_snapshot_descriptor_closes_when_fdopen_rejects_transfer(
+def test_fdopen_failure_closes_source_and_snapshot_descriptors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_transfer: int
 ) -> None:
     path = make_wheel(tmp_path)
     expected = observed(path)
+    real_open = os.open
     real_fdopen = os.fdopen
-    call_count = 0
-    destination_descriptor: int | None = None
+    opened_descriptors: list[int] = []
+    transfer_count = 0
 
-    def reject_destination_transfer(
+    def tracking_open(
+        file: object, flags: int, *args: object, **kwargs: object
+    ) -> int:
+        descriptor = real_open(  # type: ignore[call-overload]
+            file, flags, *args, **kwargs
+        )
+        opened_descriptors.append(descriptor)
+        return descriptor
+
+    def reject_transfer(
         descriptor: int, *args: object, **kwargs: object
     ) -> object:
-        nonlocal call_count, destination_descriptor
-        call_count += 1
-        if call_count == failed_transfer:
-            destination_descriptor = descriptor
-            raise OSError("destination fdopen failed")
+        nonlocal transfer_count
+        transfer_count += 1
+        if transfer_count == failed_transfer:
+            raise OSError("fdopen failed")
         return real_fdopen(descriptor, *args, **kwargs)  # type: ignore[call-overload]
 
-    monkeypatch.setattr(archive_module.os, "fdopen", reject_destination_transfer)
+    monkeypatch.setattr(archive_module.os, "open", tracking_open)
+    monkeypatch.setattr(archive_module.os, "fdopen", reject_transfer)
 
     with pytest.raises(UnsafeWheelArchive):
         validate_wheel_archive(path, expected, ArchiveLimits())
 
-    assert destination_descriptor is not None
-    try:
-        with pytest.raises(OSError):
-            os.fstat(destination_descriptor)
-    finally:
-        try:
-            os.close(destination_descriptor)
-        except OSError:
-            pass
+    assert len(opened_descriptors) == 2
+    _assert_file_descriptors_closed(opened_descriptors)
+    assert list(tmp_path.glob(".wheelforge-validated-*")) == []
+
+
+@pytest.mark.parametrize(
+    "failure_stage", ["source_read", "destination_write", "destination_flush", "fsync"]
+)
+def test_snapshot_copy_failure_closes_all_descriptors_and_removes_private_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_stage: str
+) -> None:
+    path = make_wheel(tmp_path)
+    expected = observed(path)
+    real_open = os.open
+    real_fdopen = os.fdopen
+    opened_descriptors: list[int] = []
+    call_count = 0
+
+    def tracking_open(
+        file: object, flags: int, *args: object, **kwargs: object
+    ) -> int:
+        descriptor = real_open(  # type: ignore[call-overload]
+            file, flags, *args, **kwargs
+        )
+        opened_descriptors.append(descriptor)
+        return descriptor
+
+    def faulting_fdopen(
+        descriptor: int, *args: object, **kwargs: object
+    ) -> _FaultingBinaryFile:
+        nonlocal call_count
+        call_count += 1
+        failing_method = None
+        if call_count == 1 and failure_stage == "source_read":
+            failing_method = "read"
+        elif call_count == 2 and failure_stage == "destination_write":
+            failing_method = "write"
+        elif call_count == 2 and failure_stage == "destination_flush":
+            failing_method = "flush"
+        wrapped = cast(
+            BinaryIO,
+            real_fdopen(descriptor, *args, **kwargs),  # type: ignore[call-overload]
+        )
+        return _FaultingBinaryFile(wrapped, failing_method)
+
+    def fail_fsync(descriptor: int) -> None:
+        raise OSError("injected fsync failure")
+
+    monkeypatch.setattr(archive_module.os, "open", tracking_open)
+    monkeypatch.setattr(archive_module.os, "fdopen", faulting_fdopen)
+    if failure_stage == "fsync":
+        monkeypatch.setattr(archive_module.os, "fsync", fail_fsync)
+
+    with pytest.raises(UnsafeWheelArchive) as caught:
+        validate_wheel_archive(path, expected, ArchiveLimits())
+
+    assert isinstance(caught.value.__cause__, OSError)
+    assert len(opened_descriptors) == 2
+    _assert_file_descriptors_closed(opened_descriptors)
+    assert list(tmp_path.glob(".wheelforge-validated-*")) == []
 
 
 def test_rejects_report_claiming_install_verification() -> None:
