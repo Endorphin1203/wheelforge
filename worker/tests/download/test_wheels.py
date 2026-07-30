@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import os
 import sys
 from collections.abc import Callable
@@ -214,12 +215,10 @@ def test_post_run_destination_symlink_swap_cannot_escape_bound_directory(
     profile_cp311_arm64: TargetProfile, tmp_path: Path
 ) -> None:
     destination = tmp_path / "out"
-    moved_destination = tmp_path / "moved-out"
     escape = tmp_path / "escape"
 
     def action(argv: list[str], _cwd: Path) -> object:
         attempt = Path(argv[argv.index("--dest") + 1])
-        destination.rename(moved_destination)
         escape.mkdir()
         destination.symlink_to(escape, target_is_directory=True)
         attempt.mkdir(exist_ok=True)
@@ -232,7 +231,6 @@ def test_post_run_destination_symlink_swap_cannot_escape_bound_directory(
         )
 
     assert list(escape.rglob("*.whl")) == []
-    assert not list(moved_destination.glob(".download-*"))
     assert not list(tmp_path.glob(".download-*"))
 
 
@@ -243,7 +241,6 @@ def test_destination_swap_is_rejected_by_cross_platform_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     destination = tmp_path / "out"
-    moved_destination = tmp_path / "moved-out"
     escape = tmp_path / "escape"
     monkeypatch.setattr(
         wheels_module, "_DIRECTORY_HANDLE_SUPPORTED", False, raising=False
@@ -251,7 +248,6 @@ def test_destination_swap_is_rejected_by_cross_platform_fallback(
 
     def action(argv: list[str], _cwd: Path) -> object:
         attempt = Path(argv[argv.index("--dest") + 1])
-        destination.rename(moved_destination)
         escape.mkdir()
         destination.symlink_to(escape, target_is_directory=True)
         attempt.mkdir(exist_ok=True)
@@ -274,7 +270,6 @@ def test_fallback_final_create_swap_leaves_no_wheel_in_replacement_destination(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     destination = tmp_path / "out"
-    moved_destination = tmp_path / "moved-out"
     escape = tmp_path / "escape"
     real_open = os.open
     swapped = False
@@ -291,7 +286,6 @@ def test_fallback_final_create_swap_leaves_no_wheel_in_replacement_destination(
             and Path(path).name == "demo-1.2.3-py3-none-any.whl"  # type: ignore[arg-type]
             and flags & os.O_EXCL
         ):
-            destination.rename(moved_destination)
             escape.mkdir()
             destination.symlink_to(escape, target_is_directory=True)
             swapped = True
@@ -307,7 +301,6 @@ def test_fallback_final_create_swap_leaves_no_wheel_in_replacement_destination(
 
     assert swapped is True
     assert list(escape.rglob("*.whl")) == []
-    assert list(moved_destination.rglob("*.whl")) == []
     assert not list(tmp_path.glob(".download-*"))
 
 
@@ -332,7 +325,7 @@ def test_download_succeeds_through_cross_platform_path_fallback(
     not wheels_module._DIRECTORY_HANDLE_SUPPORTED,
     reason="directory handles are unavailable",
 )
-def test_staging_and_destination_directory_handles_are_closed_independently(
+def test_staging_and_publication_directory_handles_are_closed_independently(
     profile_cp311_arm64: TargetProfile,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -341,14 +334,16 @@ def test_staging_and_destination_directory_handles_are_closed_independently(
     staging.mkdir(mode=0o700)
     destination = staging / "out"
     real_open = os.open
-    captured: dict[Path, int] = {}
+    captured: dict[str, int] = {}
 
     def recording_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
         descriptor = real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
-        if kwargs.get("dir_fd") is None and isinstance(path, (str, os.PathLike)):
+        if isinstance(path, (str, os.PathLike)) and flags & os.O_DIRECTORY:
             candidate = Path(path)
-            if candidate in {staging, destination} and flags & os.O_DIRECTORY:
-                captured[candidate] = descriptor
+            if kwargs.get("dir_fd") is None and candidate == staging:
+                captured["staging"] = descriptor
+            elif candidate.name.startswith(".publication-"):
+                captured["publication"] = descriptor
         return descriptor
 
     monkeypatch.setattr(wheels_module.os, "open", recording_open)
@@ -358,7 +353,7 @@ def test_staging_and_destination_directory_handles_are_closed_independently(
         runner=FakeRunner(write_one("demo-1.2.3-py3-none-any.whl")),
     ).download_one(package(), profile_cp311_arm64, destination, lambda: False)
 
-    assert set(captured) == {staging, destination}
+    assert set(captured) == {"staging", "publication"}
     for descriptor in captured.values():
         with pytest.raises(OSError):
             os.fstat(descriptor)
@@ -522,6 +517,7 @@ def test_rollback_preserves_a_replacement_of_an_invocation_published_wheel(
             return write_one("alpha-1.0-py3-none-any.whl")(argv, _cwd)
         if not replaced:
             published = destination / "alpha-1.0-py3-none-any.whl"
+            destination.mkdir(exist_ok=True)
             published.unlink(missing_ok=True)
             published.write_bytes(replacement)
             replaced = True
@@ -548,6 +544,7 @@ def test_publication_failure_preserves_a_replacement_file(
 
     def replace_then_fail(observed: object, descriptor: int) -> None:
         final_path = destination / "demo-1.2.3-py3-none-any.whl"
+        destination.mkdir(exist_ok=True)
         final_path.unlink(missing_ok=True)
         final_path.write_bytes(replacement)
         raise DownloadValidationError("injected copy failure")
@@ -584,6 +581,7 @@ def test_rollback_final_unlink_cannot_delete_a_replacement(
             return write_one("alpha-1.0-py3-none-any.whl")(argv, cwd)
         final_path = destination / "alpha-1.0-py3-none-any.whl"
         if not final_path.exists():
+            destination.mkdir(exist_ok=True)
             final_path.write_bytes(replacement)
             replaced = True
         return 1
@@ -666,6 +664,122 @@ def test_publication_fstat_failure_closes_descriptor_and_leaves_no_artifact(
         real_fstat(publication_descriptor)
     assert not destination.exists()
     assert list(tmp_path.rglob("*.whl")) == []
+
+
+def test_cleanup_rmdir_cannot_delete_a_replacement_destination(
+    profile_cp311_arm64: TargetProfile,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "out"
+    real_rmdir = os.rmdir
+    inserted_identity: tuple[int, int] | None = None
+
+    def action(_argv: list[str], _cwd: Path) -> object:
+        nonlocal inserted_identity
+        if not destination.exists():
+            destination.mkdir()
+            status = destination.lstat()
+            inserted_identity = (status.st_dev, status.st_ino)
+        return 1
+
+    def replacing_rmdir(
+        path: object, *args: object, **kwargs: object
+    ) -> None:
+        nonlocal inserted_identity
+        if Path(path).name == destination.name and inserted_identity is None:  # type: ignore[arg-type]
+            real_rmdir(path, *args, **kwargs)  # type: ignore[arg-type]
+            destination.mkdir()
+            status = destination.lstat()
+            inserted_identity = (status.st_dev, status.st_ino)
+        real_rmdir(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(wheels_module.os, "rmdir", replacing_rmdir)
+
+    with pytest.raises(WheelDownloadError):
+        WheelDownloader(tmp_path, runner=FakeRunner(action)).download_one(
+            package(), profile_cp311_arm64, destination, lambda: False
+        )
+
+    assert inserted_identity is not None
+    status = destination.lstat()
+    assert (status.st_dev, status.st_ino) == inserted_identity
+
+
+def test_commit_no_replace_preserves_empty_destination_inserted_at_boundary(
+    profile_cp311_arm64: TargetProfile,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "out"
+    real_commit = getattr(wheels_module, "_atomic_rename_no_replace", None)
+    inserted_identity: tuple[int, int] | None = None
+
+    def inserting_commit(*args: object, **kwargs: object) -> None:
+        nonlocal inserted_identity
+        destination.mkdir()
+        status = destination.lstat()
+        inserted_identity = (status.st_dev, status.st_ino)
+        assert real_commit is not None
+        real_commit(*args, **kwargs)
+
+    monkeypatch.setattr(
+        wheels_module,
+        "_atomic_rename_no_replace",
+        inserting_commit,
+        raising=False,
+    )
+
+    with pytest.raises(DownloadValidationError):
+        WheelDownloader(
+            tmp_path,
+            runner=FakeRunner(write_one("demo-1.2.3-py3-none-any.whl")),
+        ).download_one(package(), profile_cp311_arm64, destination, lambda: False)
+
+    assert inserted_identity is not None
+    status = destination.lstat()
+    assert (status.st_dev, status.st_ino) == inserted_identity
+    assert list(destination.iterdir()) == []
+
+
+def test_work_root_lock_is_held_for_the_full_download_lifetime(
+    profile_cp311_arm64: TargetProfile,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        wheels_module, "_TRANSACTION_LOCK_TIMEOUT_SECONDS", 0.05, raising=False
+    )
+
+    def action(argv: list[str], cwd: Path) -> object:
+        with pytest.raises(DownloadValidationError, match="busy"):
+            WheelDownloader(
+                tmp_path,
+                runner=FakeRunner(write_one("other-1.0-py3-none-any.whl")),
+            ).download_one(
+                package("other", "1.0"),
+                profile_cp311_arm64,
+                tmp_path / "other-out",
+                lambda: False,
+            )
+        return write_one("demo-1.2.3-py3-none-any.whl")(argv, cwd)
+
+    wheel = WheelDownloader(tmp_path, runner=FakeRunner(action)).download_one(
+        package(), profile_cp311_arm64, tmp_path / "out", lambda: False
+    )
+
+    assert wheel.path.read_bytes() == b"wheel"
+    assert not (tmp_path / "other-out").exists()
+
+
+def test_completed_work_root_locks_do_not_accumulate(tmp_path: Path) -> None:
+    lock = wheels_module._thread_lock_for(tmp_path)
+    assert tmp_path in wheels_module._ROOT_THREAD_LOCKS
+
+    del lock
+    gc.collect()
+
+    assert tmp_path not in wheels_module._ROOT_THREAD_LOCKS
 
 
 def test_duplicate_canonical_package_name_across_versions_is_rejected_before_download(

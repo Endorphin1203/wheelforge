@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import os
 import secrets
@@ -7,6 +9,9 @@ import shutil
 import stat
 import sys
 import tempfile
+import threading
+import time
+import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
@@ -38,6 +43,9 @@ _PIP_ENVIRONMENT = {
 }
 _MAX_TIMEOUT = timedelta(minutes=10)
 _COPY_CHUNK_BYTES = 64 * 1024
+_TRANSACTION_LOCK_FILENAME = ".wheelforge-download.lock"
+_TRANSACTION_LOCK_TIMEOUT_SECONDS = 5.0
+_TRANSACTION_LOCK_POLL_SECONDS = 0.01
 _DIRECTORY_HANDLE_SUPPORTED = bool(
     os.name != "nt"
     and hasattr(os, "O_DIRECTORY")
@@ -46,8 +54,11 @@ _DIRECTORY_HANDLE_SUPPORTED = bool(
     and os.unlink in os.supports_dir_fd
     and os.mkdir in os.supports_dir_fd
     and os.rmdir in os.supports_dir_fd
-    and os.rename in os.supports_dir_fd
     and os.listdir in os.supports_fd
+)
+_ROOT_THREAD_LOCKS_GUARD = threading.Lock()
+_ROOT_THREAD_LOCKS: weakref.WeakValueDictionary[Path, threading.Lock] = (
+    weakref.WeakValueDictionary()
 )
 
 
@@ -190,6 +201,47 @@ class DownloadValidationError(WheelDownloadError):
     pass
 
 
+@dataclass(slots=True)
+class _WorkRootTransactionLock:
+    staging: _DestinationBinding
+    descriptor: int | None = None
+    thread_lock: threading.Lock | None = None
+    thread_acquired: bool = False
+    file_acquired: bool = False
+
+    def acquire(self) -> None:
+        deadline = time.monotonic() + _TRANSACTION_LOCK_TIMEOUT_SECONDS
+        self.thread_lock = _thread_lock_for(self.staging.path)
+        if not self.thread_lock.acquire(timeout=_TRANSACTION_LOCK_TIMEOUT_SECONDS):
+            raise DownloadValidationError("Worker work directory is busy")
+        self.thread_acquired = True
+        try:
+            self.descriptor = _open_transaction_lock(self.staging)
+            while not _try_lock_descriptor(self.descriptor):
+                if time.monotonic() >= deadline:
+                    raise DownloadValidationError("Worker work directory is busy")
+                time.sleep(_TRANSACTION_LOCK_POLL_SECONDS)
+            self.file_acquired = True
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        try:
+            if self.descriptor is not None:
+                try:
+                    if self.file_acquired:
+                        _unlock_descriptor(self.descriptor)
+                finally:
+                    os.close(self.descriptor)
+                    self.descriptor = None
+                    self.file_acquired = False
+        finally:
+            if self.thread_acquired and self.thread_lock is not None:
+                self.thread_lock.release()
+                self.thread_acquired = False
+
+
 class WheelDownloader:
     def __init__(
         self,
@@ -259,11 +311,12 @@ class WheelDownloader:
         cancel: Callable[[], bool],
     ) -> list[DownloadedWheel]:
         staging = self._prepare_staging_root()
-        destination_binding: _DestinationBinding | None = None
+        transaction_lock = _WorkRootTransactionLock(staging)
         publication: _AttemptBinding | None = None
         committed = False
         try:
-            destination_binding = self._prepare_destination(destination, staging)
+            transaction_lock.acquire()
+            destination_path = self._prepare_destination(destination, staging)
             publication = _create_attempt(staging, prefix=".publication-")
             published: list[_Publication] = []
             total = 0
@@ -280,8 +333,8 @@ class WheelDownloader:
                 total += acquired.wheel.byte_size
                 published.append(acquired)
             _raise_if_cancelled(cancel)
-            wheels = _committed_wheels(published, destination_binding.path)
-            _commit_publication(staging, publication, destination_binding)
+            wheels = _committed_wheels(published, destination_path)
+            _commit_publication(staging, publication, destination_path)
             committed = True
             return wheels
         finally:
@@ -290,10 +343,7 @@ class WheelDownloader:
                     publication.close()
                 else:
                     _remove_attempt(staging, publication)
-            if destination_binding is not None:
-                if not committed:
-                    _remove_destination_reservation(staging, destination_binding)
-                destination_binding.close()
+            transaction_lock.close()
             staging.close()
 
     def _download_one(
@@ -355,7 +405,7 @@ class WheelDownloader:
 
     def _prepare_destination(
         self, destination: Path, staging: _DestinationBinding
-    ) -> _DestinationBinding:
+    ) -> Path:
         if not isinstance(destination, Path) or "\x00" in str(destination):
             raise ValueError("destination must be a trusted Path")
         if not destination.is_absolute():
@@ -374,26 +424,7 @@ class WheelDownloader:
             raise DownloadValidationError("destination could not be inspected") from error
         else:
             raise DownloadValidationError("destination must not already exist")
-        try:
-            if staging.descriptor is not None:
-                os.mkdir(destination.name, 0o700, dir_fd=staging.descriptor)
-                status = os.stat(
-                    destination.name,
-                    dir_fd=staging.descriptor,
-                    follow_symlinks=False,
-                )
-            else:
-                destination.mkdir(mode=0o700)
-                status = destination.lstat()
-        except OSError as error:
-            raise DownloadValidationError("destination could not be prepared") from error
-        if not stat.S_ISDIR(status.st_mode) or stat.S_ISLNK(status.st_mode):
-            raise DownloadValidationError("destination must be a real directory")
-        try:
-            return _bind_directory(destination, status, "destination")
-        except BaseException:
-            _remove_created_directory(staging, destination.name, _identity(status))
-            raise
+        return destination
 
     def _prepare_staging_root(self) -> _DestinationBinding:
         try:
@@ -436,6 +467,210 @@ def _bind_directory(
         binding.close()
         raise
     return binding
+
+
+def _thread_lock_for(path: Path) -> threading.Lock:
+    with _ROOT_THREAD_LOCKS_GUARD:
+        lock = _ROOT_THREAD_LOCKS.get(path)
+        if lock is None:
+            lock = threading.Lock()
+            _ROOT_THREAD_LOCKS[path] = lock
+        return lock
+
+
+def _open_transaction_lock(staging: _DestinationBinding) -> int:
+    staging.revalidate()
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        if staging.descriptor is not None:
+            descriptor = os.open(
+                _TRANSACTION_LOCK_FILENAME,
+                flags,
+                0o600,
+                dir_fd=staging.descriptor,
+            )
+        else:
+            descriptor = os.open(
+                staging.path / _TRANSACTION_LOCK_FILENAME, flags, 0o600
+            )
+    except OSError as error:
+        raise DownloadValidationError("Worker transaction lock could not be opened") from error
+    try:
+        status = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(status.st_mode)
+            or status.st_nlink != 1
+            or (os.name != "nt" and stat.S_IMODE(status.st_mode) & 0o077)
+        ):
+            raise DownloadValidationError("Worker transaction lock is not private")
+        if os.name == "nt" and status.st_size == 0:
+            os.write(descriptor, b"\0")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _try_lock_descriptor(descriptor: int) -> bool:
+    if os.name == "nt":
+        import msvcrt
+
+        try:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            msvcrt.locking(  # type: ignore[attr-defined]
+                descriptor, msvcrt.LK_NBLCK, 1  # type: ignore[attr-defined]
+            )
+            return True
+        except OSError as error:
+            if error.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                return False
+            raise DownloadValidationError("Worker transaction lock failed") from error
+    if os.name == "posix":
+        import fcntl
+
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError as error:
+            if error.errno in {errno.EACCES, errno.EAGAIN}:
+                return False
+            raise DownloadValidationError("Worker transaction lock failed") from error
+    raise DownloadValidationError("Worker transaction locking is unavailable")
+
+
+def _unlock_descriptor(descriptor: int) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        msvcrt.locking(  # type: ignore[attr-defined]
+            descriptor, msvcrt.LK_UNLCK, 1  # type: ignore[attr-defined]
+        )
+    elif os.name == "posix":
+        import fcntl
+
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+
+def _atomic_rename_no_replace(
+    staging: _DestinationBinding,
+    publication: _AttemptBinding,
+    destination: Path,
+) -> None:
+    try:
+        if sys.platform == "darwin":
+            _rename_no_replace_macos(staging, publication, destination)
+        elif sys.platform.startswith("linux"):
+            _rename_no_replace_linux(staging, publication, destination)
+        elif os.name == "nt":
+            os.rename(publication.path, destination)
+        else:
+            raise DownloadValidationError(
+                "atomic no-overwrite publication is unavailable on this platform"
+            )
+    except FileExistsError as error:
+        raise DownloadValidationError("destination appeared before commit") from error
+    except DownloadValidationError:
+        raise
+    except OSError as error:
+        if error.errno in {errno.EEXIST, errno.ENOTEMPTY}:
+            raise DownloadValidationError("destination appeared before commit") from error
+        raise DownloadValidationError(
+            "publication transaction could not be committed atomically"
+        ) from error
+
+
+def _rename_no_replace_macos(
+    staging: _DestinationBinding,
+    publication: _AttemptBinding,
+    destination: Path,
+) -> None:
+    library = ctypes.CDLL(None, use_errno=True)
+    rename_exclusive = 0x00000004
+    if staging.descriptor is not None:
+        renameatx = getattr(library, "renameatx_np", None)
+        if renameatx is None:
+            raise DownloadValidationError(
+                "atomic no-overwrite publication is unavailable on this platform"
+            )
+        renameatx.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameatx.restype = ctypes.c_int
+        result = renameatx(
+            staging.descriptor,
+            os.fsencode(publication.name),
+            staging.descriptor,
+            os.fsencode(destination.name),
+            rename_exclusive,
+        )
+    else:
+        renamex = getattr(library, "renamex_np", None)
+        if renamex is None:
+            raise DownloadValidationError(
+                "atomic no-overwrite publication is unavailable on this platform"
+            )
+        renamex.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        renamex.restype = ctypes.c_int
+        result = renamex(
+            os.fsencode(publication.path),
+            os.fsencode(destination),
+            rename_exclusive,
+        )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+
+def _rename_no_replace_linux(
+    staging: _DestinationBinding,
+    publication: _AttemptBinding,
+    destination: Path,
+) -> None:
+    library = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(library, "renameat2", None)
+    if renameat2 is None:
+        raise DownloadValidationError(
+            "atomic no-overwrite publication is unavailable on this platform"
+        )
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    if staging.descriptor is not None:
+        source_directory = staging.descriptor
+        destination_directory = staging.descriptor
+        source = os.fsencode(publication.name)
+        target = os.fsencode(destination.name)
+    else:
+        source_directory = -100
+        destination_directory = -100
+        source = os.fsencode(publication.path)
+        target = os.fsencode(destination)
+    result = renameat2(
+        source_directory,
+        source,
+        destination_directory,
+        target,
+        1,
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
 
 
 @dataclass(frozen=True, slots=True)
@@ -617,81 +852,24 @@ def _remove_attempt(
         attempt.close()
 
 
-def _remove_created_directory(
-    staging: _DestinationBinding, name: str, identity: _FileIdentity
-) -> bool:
-    try:
-        staging.revalidate()
-        if staging.descriptor is not None:
-            status = os.stat(
-                name,
-                dir_fd=staging.descriptor,
-                follow_symlinks=False,
-            )
-            if (
-                not stat.S_ISDIR(status.st_mode)
-                or stat.S_ISLNK(status.st_mode)
-                or _identity(status) != identity
-            ):
-                return False
-            os.rmdir(name, dir_fd=staging.descriptor)
-        else:
-            path = staging.path / name
-            status = path.lstat()
-            if (
-                not stat.S_ISDIR(status.st_mode)
-                or stat.S_ISLNK(status.st_mode)
-                or _identity(status) != identity
-            ):
-                return False
-            path.rmdir()
-        return True
-    except (FileNotFoundError, DownloadValidationError, OSError):
-        return False
-
-
-def _remove_destination_reservation(
-    staging: _DestinationBinding, destination: _DestinationBinding
-) -> None:
-    destination.close()
-    _remove_created_directory(staging, destination.path.name, destination.identity)
-
-
 def _commit_publication(
     staging: _DestinationBinding,
     publication: _AttemptBinding,
-    destination: _DestinationBinding,
+    destination: Path,
 ) -> None:
     staging.revalidate()
     publication.revalidate(staging)
-    destination.revalidate()
     try:
-        if destination.descriptor is not None:
-            if os.listdir(destination.descriptor):
-                raise DownloadValidationError("destination reservation is not empty")
-        elif list(destination.path.iterdir()):
-            raise DownloadValidationError("destination reservation is not empty")
+        destination.lstat()
+    except FileNotFoundError:
+        pass
     except OSError as error:
-        raise DownloadValidationError("destination reservation could not be inspected") from error
+        raise DownloadValidationError("destination could not be inspected before commit") from error
+    else:
+        raise DownloadValidationError("destination appeared before commit")
 
     publication.close()
-    destination.close()
-    if not _remove_created_directory(
-        staging, destination.path.name, destination.identity
-    ):
-        raise DownloadValidationError("destination reservation changed before commit")
-    try:
-        if staging.descriptor is not None:
-            os.rename(
-                publication.name,
-                destination.path.name,
-                src_dir_fd=staging.descriptor,
-                dst_dir_fd=staging.descriptor,
-            )
-        else:
-            os.rename(publication.path, destination.path)
-    except OSError as error:
-        raise DownloadValidationError("publication transaction could not be committed") from error
+    _atomic_rename_no_replace(staging, publication, destination)
 
 
 def _committed_wheels(
