@@ -5,14 +5,21 @@ import csv
 import hashlib
 import html
 import io
+import os
 import shutil
+import stat
 import sys
+import tempfile
+import uuid
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
 
 ZIP_TIMESTAMP = (2020, 1, 1, 0, 0, 0)
+MARKER_NAME = ".wheelforge-fixture-index.json"
+MARKER_CONTENT = b'{"owner":"wheelforge-fixture-builder","schema":1}\n'
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
 @dataclass(frozen=True)
@@ -92,12 +99,12 @@ def _wheel_bytes(spec: WheelSpec) -> bytes:
     files[record_path] = record.getvalue().encode("utf-8")
 
     output = io.BytesIO()
-    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_STORED) as archive:
         for path, content in sorted(files.items()):
             info = zipfile.ZipInfo(path, ZIP_TIMESTAMP)
-            info.compress_type = zipfile.ZIP_DEFLATED
+            info.compress_type = zipfile.ZIP_STORED
             info.external_attr = 0o100644 << 16
-            archive.writestr(info, content, compresslevel=9)
+            archive.writestr(info, content)
     return output.getvalue()
 
 
@@ -109,9 +116,7 @@ def _write_page(path: Path, links: list[tuple[str, str]]) -> None:
             page.write(f'<a href="{html.escape(href)}">{html.escape(label)}</a>\n')
 
 
-def build(output_root: Path) -> None:
-    if output_root.exists():
-        shutil.rmtree(output_root)
+def _populate(output_root: Path) -> None:
     package_root = output_root / "packages"
     simple_root = output_root / "simple"
     package_root.mkdir(parents=True)
@@ -130,9 +135,89 @@ def build(output_root: Path) -> None:
         simple_root / "index.html",
         [(f"{project}/", project) for project in sorted(projects)],
     )
+    (output_root / MARKER_NAME).write_bytes(MARKER_CONTENT)
+
+
+def _absolute_path(path: Path) -> Path:
+    return Path(os.path.abspath(os.fspath(path)))
+
+
+def _is_link_or_reparse_point(path: Path, status: os.stat_result) -> bool:
+    if stat.S_ISLNK(status.st_mode):
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if is_junction is not None and is_junction():
+        return True
+    attributes = getattr(status, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(attributes & reparse_flag)
+
+
+def _validate_ancestry(output_root: Path) -> None:
+    path_and_parents = (output_root, *output_root.parents)
+    for candidate in reversed(path_and_parents):
+        try:
+            status = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        if _is_link_or_reparse_point(candidate, status):
+            raise ValueError(f"output path traverses a link or reparse point: {candidate}")
+
+
+def _validate_output(output_root: Path) -> bool:
+    _validate_ancestry(output_root)
+    if output_root == Path(output_root.anchor):
+        raise ValueError(f"refusing filesystem root as output: {output_root}")
+    if output_root in {REPOSITORY_ROOT, _absolute_path(Path.home())}:
+        raise ValueError(f"refusing protected directory as output: {output_root}")
+
+    parent = output_root.parent
+    if not parent.is_dir():
+        raise ValueError(f"output parent must be an existing plain directory: {parent}")
+    if not output_root.exists():
+        return False
+    if not output_root.is_dir():
+        raise ValueError(f"output must be a directory: {output_root}")
+
+    marker = output_root / MARKER_NAME
+    if marker.is_symlink() or not marker.is_file() or marker.read_bytes() != MARKER_CONTENT:
+        raise ValueError(f"existing output is not owned by this fixture builder: {output_root}")
+    return True
+
+
+def _publish(staging_root: Path, output_root: Path, replacing: bool) -> None:
+    if not replacing:
+        os.replace(staging_root, output_root)
+        return
+
+    backup = output_root.parent / f".{output_root.name}.previous-{uuid.uuid4().hex}"
+    os.replace(output_root, backup)
+    try:
+        os.replace(staging_root, output_root)
+    except BaseException:
+        os.replace(backup, output_root)
+        raise
+    shutil.rmtree(backup)
+
+
+def build(output_root: Path) -> None:
+    output_root = _absolute_path(output_root)
+    replacing = _validate_output(output_root)
+    staging_root = Path(
+        tempfile.mkdtemp(prefix=f".{output_root.name}.build-", dir=output_root.parent)
+    )
+    try:
+        _populate(staging_root)
+        _publish(staging_root, output_root, replacing)
+    finally:
+        if staging_root.exists():
+            shutil.rmtree(staging_root)
 
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
         raise SystemExit("usage: build_fixtures.py OUTPUT_DIRECTORY")
-    build(Path(sys.argv[1]).resolve())
+    try:
+        build(Path(sys.argv[1]))
+    except (OSError, ValueError) as error:
+        raise SystemExit(str(error)) from error
