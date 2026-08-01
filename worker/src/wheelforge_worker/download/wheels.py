@@ -74,6 +74,8 @@ class _Runner(Protocol):
         cwd: Path,
         timeout: timedelta,
         env: dict[str, str],
+        *,
+        inherited_fds: tuple[int, ...] = (),
     ) -> ProcessResult: ...
 
 
@@ -250,11 +252,13 @@ class WheelDownloader:
         runner: _Runner | None = None,
         timeout: timedelta = timedelta(seconds=60),
         limits: DownloadLimits = DownloadLimits(),
+        inherited_fds: tuple[int, ...] = (),
+        trusted_fd_bound: bool = False,
     ) -> None:
         if not isinstance(work_directory, Path) or not work_directory.is_dir():
             raise ValueError("work directory must be an existing directory")
         work_directory = work_directory.absolute()
-        if _has_symlink_component(work_directory):
+        if not trusted_fd_bound and _has_symlink_component(work_directory):
             raise ValueError("work directory must not contain symlinks")
         try:
             work_status = work_directory.lstat()
@@ -278,6 +282,7 @@ class WheelDownloader:
         self._runner = ProcessRunner() if runner is None else runner
         self._timeout = timeout
         self._limits = limits
+        self._inherited_fds = inherited_fds
 
     def download(
         self,
@@ -369,9 +374,21 @@ class WheelDownloader:
                 publication.revalidate(staging)
                 argv = build_download_argv(package, profile, source, attempt.path)
                 try:
-                    result = self._runner.run(
-                        argv, attempt.path, self._timeout, dict(_PIP_ENVIRONMENT)
-                    )
+                    if self._inherited_fds:
+                        result = self._runner.run(
+                            argv,
+                            attempt.path,
+                            self._timeout,
+                            dict(_PIP_ENVIRONMENT),
+                            inherited_fds=self._inherited_fds,
+                        )
+                    else:
+                        result = self._runner.run(
+                            argv,
+                            attempt.path,
+                            self._timeout,
+                            dict(_PIP_ENVIRONMENT),
+                        )
                 except (ProcessExecutionError, ProcessTimeoutError) as error:
                     attempt.revalidate(staging)
                     publication.revalidate(staging)

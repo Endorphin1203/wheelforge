@@ -123,6 +123,48 @@ def test_workspace_is_a_private_generated_child_and_is_not_reused(
     second.cleanup()
 
 
+def test_workspace_allocation_closes_child_fd_when_parent_duplication_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir(mode=0o700)
+    manager = WorkspaceManager(root, uuid_factory=lambda: UUID(int=3))
+    original_open = os.open
+    original_dup = os.dup
+    duplicate_calls = 0
+    child_descriptor: int | None = None
+
+    def tracking_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal child_descriptor
+        descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+        if child_descriptor is None and str(path).startswith("wf-execution-"):
+            child_descriptor = descriptor
+        return descriptor
+
+    def fail_second_dup(descriptor: int) -> int:
+        nonlocal duplicate_calls
+        duplicate_calls += 1
+        if duplicate_calls == 2:
+            raise OSError("injected parent descriptor duplication failure")
+        return original_dup(descriptor)
+
+    monkeypatch.setattr(storage_module.os, "open", tracking_open)
+    monkeypatch.setattr(storage_module.os, "dup", fail_second_dup)
+
+    with pytest.raises(OSError, match="injected parent descriptor"):
+        manager.allocate()
+
+    assert child_descriptor is not None
+    with pytest.raises(OSError):
+        os.fstat(child_descriptor)
+
+
 def test_workspace_cleanup_refuses_replaced_directory(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     root.mkdir(mode=0o700)
@@ -332,6 +374,69 @@ def test_storage_and_workspace_manager_reject_operations_after_close(
         workspaces.allocate()
 
 
+def test_artifact_sweeper_prunes_empty_execution_and_task_directories(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "data"
+    root.mkdir()
+    storage = RootedLocalStorage(root)
+    task = "20000000-0000-4000-8000-000000000021"
+    execution = "10000000-0000-4000-8000-000000000021"
+    artifact = "30000000-0000-4000-8000-000000000021"
+    key = f"artifacts/{task}/{execution}/{artifact}.zip"
+    published = storage.publish_bytes(key, b"old")
+    old = 1_000_000_000
+    os.utime(root / published.object_key, (old, old))
+
+    storage.sweep_abandoned(
+        datetime.fromtimestamp(old + 1),
+        frozenset(),
+        active_execution_ids=frozenset(),
+        active_build_executions=frozenset(),
+    )
+
+    assert not (root / f"artifacts/{task}/{execution}").exists()
+    assert not (root / f"artifacts/{task}").exists()
+    assert (root / "artifacts").is_dir()
+
+
+def test_artifact_sweeper_preserves_nonempty_generated_directories(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "data"
+    root.mkdir()
+    storage = RootedLocalStorage(root)
+    task = "20000000-0000-4000-8000-000000000022"
+    stale_execution = "10000000-0000-4000-8000-000000000022"
+    live_execution = "10000000-0000-4000-8000-000000000023"
+    stale_key = (
+        f"artifacts/{task}/{stale_execution}/"
+        "30000000-0000-4000-8000-000000000022.zip"
+    )
+    live_key = (
+        f"artifacts/{task}/{live_execution}/"
+        "30000000-0000-4000-8000-000000000023.zip"
+    )
+    stale = storage.publish_bytes(stale_key, b"stale")
+    live = storage.publish_bytes(live_key, b"live")
+    concurrent = root / f"artifacts/{task}/{stale_execution}/keep.txt"
+    concurrent.write_bytes(b"concurrent")
+    old = 1_000_000_000
+    os.utime(root / stale.object_key, (old, old))
+    os.utime(root / live.object_key, (old, old))
+
+    storage.sweep_abandoned(
+        datetime.fromtimestamp(old + 1),
+        frozenset({live.object_key}),
+        active_execution_ids=frozenset(),
+        active_build_executions=frozenset(),
+    )
+
+    assert concurrent.read_bytes() == b"concurrent"
+    assert (root / live.object_key).read_bytes() == b"live"
+    assert (root / f"artifacts/{task}").is_dir()
+
+
 def test_windows_worker_host_fails_closed_before_path_fallback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -343,6 +448,15 @@ def test_windows_worker_host_fails_closed_before_path_fallback(
         RootedLocalStorage(root)
     with pytest.raises(RuntimeError, match="Windows Worker hosts are not supported"):
         WorkspaceManager(root)
+
+
+def test_external_stage_host_without_proc_fd_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(storage_module.sys, "platform", "darwin")
+
+    with pytest.raises(RuntimeError, match="Linux /proc/self/fd"):
+        storage_module.require_external_workspace_support()
 
 
 def test_publish_cleanup_failure_does_not_replace_writer_error(

@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import stat
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -36,6 +37,131 @@ class PublishedObject:
     object_key: str
     size_bytes: int
     sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalWorkspace:
+    path: Path
+    inherited_fds: tuple[int, ...]
+
+
+class WorkspaceCapability:
+    def __init__(
+        self, name: str, descriptor: int, identity: tuple[int, int]
+    ) -> None:
+        self.name = name
+        self._descriptor: int | None = descriptor
+        self._identity = identity
+
+    def close(self) -> None:
+        if self._descriptor is not None:
+            os.close(self._descriptor)
+            self._descriptor = None
+
+    def __del__(self) -> None:
+        descriptor = getattr(self, "_descriptor", None)
+        if descriptor is not None:
+            _best_effort(os.close, descriptor)
+
+    def mkdir(self, relative: str | Path) -> None:
+        parts = _workspace_parts(relative)
+        parent = self._open_parent(parts[:-1], create=True)
+        try:
+            os.mkdir(parts[-1], 0o700, dir_fd=parent)
+            _fsync_descriptor(parent)
+        finally:
+            os.close(parent)
+
+    def write_bytes(self, relative: str | Path, content: bytes) -> None:
+        if not isinstance(content, bytes):
+            raise TypeError("workspace content must be bytes")
+        parts = _workspace_parts(relative)
+        parent = self._open_parent(parts[:-1], create=True)
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(
+                parts[-1],
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_TRUNC
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=parent,
+            )
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise OSError("workspace object must be a regular file")
+            with os.fdopen(os.dup(descriptor), "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            _fsync_descriptor(parent)
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            os.close(parent)
+
+    def open_regular(self, relative: str | Path) -> int:
+        parts = _workspace_parts(relative)
+        parent = self._open_parent(parts[:-1], create=False)
+        try:
+            descriptor = os.open(
+                parts[-1],
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent,
+            )
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                os.close(descriptor)
+                raise OSError("workspace object must be a regular file")
+            return descriptor
+        finally:
+            os.close(parent)
+
+    def external(self, relative: str | Path = Path(".")) -> ExternalWorkspace:
+        descriptor = self._require_descriptor()
+        require_external_workspace_support()
+        base = Path(f"/proc/self/fd/{descriptor}")
+        try:
+            status = base.stat()
+        except OSError as error:
+            raise RuntimeError(
+                "external workspace stages require Linux /proc/self/fd support"
+            ) from error
+        if _identity(status) != self._identity:
+            raise RuntimeError("workspace descriptor path identity changed")
+        parts = _workspace_parts(relative, allow_current=True)
+        path = base.joinpath(*parts) if parts else base
+        return ExternalWorkspace(path, (descriptor,))
+
+    def _open_parent(self, parts: tuple[str, ...], *, create: bool) -> int:
+        descriptor = os.dup(self._require_descriptor())
+        try:
+            for part in parts:
+                if create:
+                    try:
+                        os.mkdir(part, 0o700, dir_fd=descriptor)
+                    except FileExistsError:
+                        pass
+                next_descriptor = os.open(
+                    part,
+                    os.O_RDONLY
+                    | os.O_DIRECTORY
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=descriptor,
+                )
+                os.close(descriptor)
+                descriptor = next_descriptor
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def _require_descriptor(self) -> int:
+        if self._descriptor is None:
+            raise RuntimeError("workspace capability is closed")
+        status = os.fstat(self._descriptor)
+        if not stat.S_ISDIR(status.st_mode) or _identity(status) != self._identity:
+            raise RuntimeError("workspace capability identity changed")
+        return self._descriptor
 
 
 @dataclass(slots=True)
@@ -166,6 +292,32 @@ class RootedLocalStorage:
             object_key, copy, owner_execution_id=owner_execution_id
         )
 
+    def publish_descriptor(
+        self,
+        object_key: str,
+        source_descriptor: int,
+        *,
+        owner_execution_id: str | None = None,
+    ) -> PublishedObject:
+        before = os.fstat(source_descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise OSError("artifact source must be a regular file")
+
+        def copy(handle: BinaryIO) -> tuple[int, str]:
+            digest = hashlib.sha256()
+            size = 0
+            with os.fdopen(os.dup(source_descriptor), "rb") as input_handle:
+                while chunk := input_handle.read(_CHUNK_SIZE):
+                    handle.write(chunk)
+                    digest.update(chunk)
+                    size += len(chunk)
+            _require_same_regular(before, os.fstat(source_descriptor))
+            return size, digest.hexdigest()
+
+        return self._publish(
+            object_key, copy, owner_execution_id=owner_execution_id
+        )
+
     def delete_if_owned(self, object_key: str, expected_sha256: str) -> bool:
         if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
             return False
@@ -271,6 +423,7 @@ class RootedLocalStorage:
     ) -> None:
         cutoff_timestamp = cutoff.timestamp()
         root_descriptor = self._duplicate_root()
+        prune_candidates: set[tuple[str, str | None]] = set()
         try:
             for directory, directories, filenames, descriptor in os.fwalk(
                 ".", topdown=True, follow_symlinks=False, dir_fd=root_descriptor
@@ -314,6 +467,14 @@ class RootedLocalStorage:
                         continue
                     os.unlink(name, dir_fd=descriptor)
                     _fsync_descriptor(descriptor)
+                    if artifact_match is not None:
+                        prune_candidates.add(
+                            (
+                                artifact_match.group("task"),
+                                artifact_match.group("owner"),
+                            )
+                        )
+            _prune_artifact_directories(root_descriptor, prune_candidates)
         finally:
             os.close(root_descriptor)
 
@@ -323,6 +484,7 @@ class OwnedWorkspace:
     path: Path
     _root_descriptor: int | None
     _identity: tuple[int, int]
+    capability: WorkspaceCapability
     _cleaned: bool = False
 
     def cleanup(self) -> None:
@@ -352,6 +514,7 @@ class OwnedWorkspace:
             os.close(root_descriptor)
 
     def close(self) -> None:
+        self.capability.close()
         if self._root_descriptor is not None:
             os.close(self._root_descriptor)
             self._root_descriptor = None
@@ -411,6 +574,9 @@ class WorkspaceManager:
                     os.mkdir(name, 0o700, dir_fd=root_descriptor)
                 except FileExistsError:
                     continue
+                child_descriptor: int | None = None
+                owned_root_descriptor: int | None = None
+                capability: WorkspaceCapability | None = None
                 try:
                     status = os.stat(
                         name, dir_fd=root_descriptor, follow_symlinks=False
@@ -424,12 +590,34 @@ class WorkspaceManager:
                             "allocated workspace is not a plain directory"
                         )
                     self._require_path_binding(path, _identity(status))
-                    return OwnedWorkspace(
-                        path,
-                        os.dup(root_descriptor),
-                        _identity(status),
+                    child_descriptor = os.open(
+                        name,
+                        os.O_RDONLY
+                        | os.O_DIRECTORY
+                        | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=root_descriptor,
                     )
+                    owned_root_descriptor = os.dup(root_descriptor)
+                    capability = WorkspaceCapability(
+                        name, child_descriptor, _identity(status)
+                    )
+                    child_descriptor = None
+                    owned = OwnedWorkspace(
+                        path,
+                        owned_root_descriptor,
+                        _identity(status),
+                        capability,
+                    )
+                    owned_root_descriptor = None
+                    capability = None
+                    return owned
                 except BaseException:
+                    if child_descriptor is not None:
+                        _best_effort(os.close, child_descriptor)
+                    if capability is not None:
+                        _best_effort(capability.close)
+                    if owned_root_descriptor is not None:
+                        _best_effort(os.close, owned_root_descriptor)
                     _best_effort(shutil.rmtree, name, dir_fd=root_descriptor)
                     raise
             raise RuntimeError("could not allocate a unique workspace")
@@ -488,14 +676,70 @@ def _object_key_parts(object_key: str) -> tuple[str, ...]:
     return parts
 
 
+def _workspace_parts(
+    relative: str | Path, *, allow_current: bool = False
+) -> tuple[str, ...]:
+    value = relative.as_posix() if isinstance(relative, Path) else relative
+    if allow_current and value == ".":
+        return ()
+    return _object_key_parts(value)
+
+
+def _prune_artifact_directories(
+    root_descriptor: int, candidates: set[tuple[str, str | None]]
+) -> None:
+    if not candidates:
+        return
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        artifacts_descriptor = os.open("artifacts", flags, dir_fd=root_descriptor)
+    except FileNotFoundError:
+        return
+    try:
+        for task, execution in sorted(candidates):
+            try:
+                task_descriptor = os.open(
+                    task, flags, dir_fd=artifacts_descriptor
+                )
+            except OSError:
+                continue
+            try:
+                if execution is not None:
+                    _rmdir_if_empty(task_descriptor, execution)
+            finally:
+                os.close(task_descriptor)
+            _rmdir_if_empty(artifacts_descriptor, task)
+    finally:
+        os.close(artifacts_descriptor)
+
+
+def _rmdir_if_empty(parent_descriptor: int, name: str) -> None:
+    try:
+        os.rmdir(name, dir_fd=parent_descriptor)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        if error.errno in {errno.ENOTEMPTY, errno.EEXIST}:
+            return
+        raise
+    _fsync_descriptor(parent_descriptor)
+
+
 def _require_supported_host() -> None:
     if os.name == "nt":
         raise RuntimeError(
             "Windows Worker hosts are not supported; Windows remains a target platform"
         )
-    required = (os.open, os.stat, os.mkdir, os.unlink, os.link)
+    required = (os.open, os.stat, os.mkdir, os.unlink, os.rmdir, os.link)
     if any(operation not in os.supports_dir_fd for operation in required):
         raise RuntimeError("safe descriptor-relative filesystem operations are unavailable")
+
+
+def require_external_workspace_support() -> None:
+    if not sys.platform.startswith("linux") or not Path("/proc/self/fd").is_dir():
+        raise RuntimeError(
+            "external workspace stages require Linux /proc/self/fd support"
+        )
 
 
 def _open_stable_root(path: Path, label: str) -> tuple[Path, int]:

@@ -71,11 +71,14 @@ class ProcessRunner:
         cwd: Path,
         timeout: timedelta,
         env: Mapping[str, str],
+        *,
+        inherited_fds: tuple[int, ...] = (),
     ) -> ProcessResult:
         command = _validate_invocation(argv, cwd, timeout, env)
+        inherited_fds = _validate_inherited_fds(inherited_fds)
         started = _monotonic()
         try:
-            process = _spawn_process_group(command, cwd, env)
+            process = _spawn_process_group(command, cwd, env, inherited_fds)
         except OSError as error:
             raise ProcessExecutionError("process could not be started") from error
 
@@ -202,9 +205,16 @@ def _drain_pipe(stream: IO[Any], capture: _PipeCapture) -> None:
 
 
 def _spawn_process_group(
-    command: tuple[str, ...], cwd: Path, env: Mapping[str, str]
+    command: tuple[str, ...],
+    cwd: Path,
+    env: Mapping[str, str],
+    inherited_fds: tuple[int, ...],
 ) -> subprocess.Popen[bytes]:
     if os.name == "nt":
+        if inherited_fds:
+            raise ProcessValidationError(
+                "explicit descriptor inheritance is unavailable on Windows"
+            )
         return subprocess.Popen(
             command,
             cwd=cwd,
@@ -224,7 +234,23 @@ def _spawn_process_group(
         shell=False,
         bufsize=0,
         start_new_session=True,
+        pass_fds=inherited_fds,
     )
+
+
+def _validate_inherited_fds(values: tuple[int, ...]) -> tuple[int, ...]:
+    if not isinstance(values, tuple) or any(
+        type(value) is not int or value < 0 for value in values
+    ):
+        raise ProcessValidationError("inherited_fds must be nonnegative descriptors")
+    if len(set(values)) != len(values):
+        raise ProcessValidationError("inherited_fds must be unique")
+    for descriptor in values:
+        try:
+            os.fstat(descriptor)
+        except OSError as error:
+            raise ProcessValidationError("inherited descriptor is not open") from error
+    return values
 
 
 def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:

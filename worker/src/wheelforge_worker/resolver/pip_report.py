@@ -85,6 +85,8 @@ class _Runner(Protocol):
         cwd: Path,
         timeout: timedelta,
         env: dict[str, str],
+        *,
+        inherited_fds: tuple[int, ...] = (),
     ) -> ProcessResult: ...
 
 
@@ -167,6 +169,7 @@ class StrictResolver:
         *,
         runner: _Runner | None = None,
         timeout: timedelta = timedelta(seconds=60),
+        inherited_fds: tuple[int, ...] = (),
     ) -> None:
         if not isinstance(work_directory, Path) or not work_directory.is_dir():
             raise ValueError("work directory must be an existing directory")
@@ -174,9 +177,10 @@ class StrictResolver:
             raise ValueError("resolver timeout must be a timedelta")
         if timeout.total_seconds() <= 0 or timeout > MAX_RESOLVER_TIMEOUT:
             raise ValueError("resolver timeout must be positive and at most 10 minutes")
-        self._work_directory = work_directory.resolve()
+        self._work_directory = work_directory
         self._runner = ProcessRunner() if runner is None else runner
         self._timeout = timeout
+        self._inherited_fds = inherited_fds
 
     def resolve(
         self,
@@ -196,9 +200,21 @@ class StrictResolver:
                 requirements_path, report_path, profile, source
             )
             try:
-                result = self._runner.run(
-                    argv, attempt_directory, self._timeout, dict(_PIP_ENVIRONMENT)
-                )
+                if self._inherited_fds:
+                    result = self._runner.run(
+                        argv,
+                        attempt_directory,
+                        self._timeout,
+                        dict(_PIP_ENVIRONMENT),
+                        inherited_fds=self._inherited_fds,
+                    )
+                else:
+                    result = self._runner.run(
+                        argv,
+                        attempt_directory,
+                        self._timeout,
+                        dict(_PIP_ENVIRONMENT),
+                    )
             except (ProcessTimeoutError, ProcessExecutionError) as error:
                 raise ResolverProcessError("pip dry-run could not be executed") from error
             if result.return_code != 0:

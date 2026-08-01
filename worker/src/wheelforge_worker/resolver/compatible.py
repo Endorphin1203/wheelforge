@@ -103,11 +103,16 @@ class _BoundedRejections(list[CandidateRejection]):
 
 @dataclass(slots=True)
 class _ObservationBudget:
+    limit: int
     accepted: int = 0
     truncated: bool = False
 
+    @property
+    def remaining(self) -> int:
+        return self.limit - self.accepted
+
     def reserve(self) -> bool:
-        if self.accepted >= MAX_RESOLUTION_OBSERVATIONS:
+        if self.accepted >= self.limit:
             self.truncated = True
             return False
         self.accepted += 1
@@ -121,12 +126,19 @@ class CompatibleResolver:
         candidate_provider: CandidateProvider,
         *,
         clock: _Clock = time.monotonic,
+        max_observations: int = MAX_RESOLUTION_OBSERVATIONS,
     ) -> None:
         if not callable(clock):
             raise ValueError("clock must be callable")
         self._strict_resolver = strict_resolver
         self._candidate_provider = candidate_provider
         self._clock = clock
+        if (
+            type(max_observations) is not int
+            or not 1 <= max_observations <= MAX_RESOLUTION_OBSERVATIONS
+        ):
+            raise ValueError("observation limit is out of bounds")
+        self._max_observations = max_observations
 
     def resolve(
         self,
@@ -146,7 +158,7 @@ class CompatibleResolver:
         started = self._clock()
         attempts: list[ResolutionAttempt] = []
         rejections = _BoundedRejections()
-        observation_budget = _ObservationBudget()
+        observation_budget = _ObservationBudget(self._max_observations)
         pins = _relaxable_pins(parsed)
         original_versions = tuple(pin.original for pin in pins)
 
@@ -318,8 +330,18 @@ class CompatibleResolver:
         observations: list[_Observation] = []
         for source in sources:
             self._guard(started, attempts, limits)
+            if observation_budget.remaining == 0:
+                observation_budget.truncated = True
+                raise _StopResolution(CompatibilityFailureCode.RESOURCE_LIMIT)
             try:
-                releases = self._candidate_provider.candidates(pin.package, source)
+                bounded = getattr(
+                    self._candidate_provider, "candidates_bounded", None
+                )
+                releases = (
+                    bounded(pin.package, source, observation_budget.remaining)
+                    if callable(bounded)
+                    else self._candidate_provider.candidates(pin.package, source)
+                )
                 observations.extend(
                     _bounded_observations(
                         pin.package,
@@ -339,6 +361,9 @@ class CompatibleResolver:
                         f"candidate provider failed: {type(error).__name__}",
                     )
                 )
+            if observation_budget.remaining == 0:
+                observation_budget.truncated = True
+                raise _StopResolution(CompatibilityFailureCode.RESOURCE_LIMIT)
 
         original_is_yanked = {
             source: any(

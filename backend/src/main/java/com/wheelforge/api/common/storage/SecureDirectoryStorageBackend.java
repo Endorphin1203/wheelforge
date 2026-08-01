@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.channels.Channels;
 import java.nio.channels.SeekableByteChannel;
+import java.nio.file.DirectoryNotEmptyException;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
@@ -18,6 +19,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
+import java.util.regex.Pattern;
 
 final class SecureDirectoryStorageBackend implements LocalStorageBackend {
   private static final int TEMP_NAME_ATTEMPTS = 5;
@@ -25,6 +27,8 @@ final class SecureDirectoryStorageBackend implements LocalStorageBackend {
       Set.of(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS);
   private static final Set<OpenOption> READ_OPTIONS =
       Set.of(StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS);
+  private static final Pattern UUID_NAME =
+      Pattern.compile("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}");
 
   private final Path root;
   private final SecureDirectoryStream<Path> rootDirectory;
@@ -87,17 +91,45 @@ final class SecureDirectoryStorageBackend implements LocalStorageBackend {
   @Override
   public void deleteIfExists(String key) {
     StorageObjectKey objectKey = StorageObjectKey.parse(key);
-    try (OpenedDirectory parent = openDirectory(objectKey.parent())) {
-      if (!requireRegularObjectIfPresent(parent.directory(), objectKey.fileName())) {
-        return;
+    try {
+      try (OpenedDirectory parent = openDirectory(objectKey.parent())) {
+        if (requireRegularObjectIfPresent(parent.directory(), objectKey.fileName())) {
+          parent.directory().deleteFile(objectKey.fileName());
+        }
       }
-      parent.directory().deleteFile(objectKey.fileName());
+      pruneGeneratedArtifactDirectories(objectKey);
     } catch (NoSuchFileException ignored) {
       return;
     } catch (IllegalArgumentException exception) {
       throw exception;
     } catch (IOException exception) {
       throw new LocalFileStorage.StorageException("Could not delete local object", exception);
+    }
+  }
+
+  private void pruneGeneratedArtifactDirectories(StorageObjectKey objectKey) throws IOException {
+    GeneratedArtifactPath generated = GeneratedArtifactPath.parse(objectKey.relative());
+    if (generated == null) {
+      return;
+    }
+    try (OpenedDirectory task = openDirectory(Path.of("artifacts").resolve(generated.task()))) {
+      deleteDirectoryIfEmpty(task.directory(), Path.of(generated.execution()));
+    } catch (NoSuchFileException ignored) {
+      return;
+    }
+    try (OpenedDirectory artifacts = openDirectory(Path.of("artifacts"))) {
+      deleteDirectoryIfEmpty(artifacts.directory(), Path.of(generated.task()));
+    } catch (NoSuchFileException ignored) {
+      // A concurrent delete already pruned the generated task directory.
+    }
+  }
+
+  private static void deleteDirectoryIfEmpty(SecureDirectoryStream<Path> parent, Path directory)
+      throws IOException {
+    try {
+      parent.deleteDirectory(directory);
+    } catch (NoSuchFileException | DirectoryNotEmptyException ignored) {
+      // Concurrent or sibling content keeps the generated directory live.
     }
   }
 
@@ -233,6 +265,24 @@ final class SecureDirectoryStorageBackend implements LocalStorageBackend {
   }
 
   private record TemporaryFile(Path name, SeekableByteChannel channel) {}
+
+  private record GeneratedArtifactPath(String task, String execution) {
+    private static GeneratedArtifactPath parse(Path relative) {
+      if (relative.getNameCount() != 4
+          || !relative.getName(0).toString().equals("artifacts")
+          || !UUID_NAME.matcher(relative.getName(1).toString()).matches()
+          || !UUID_NAME.matcher(relative.getName(2).toString()).matches()) {
+        return null;
+      }
+      String filename = relative.getName(3).toString();
+      if (!filename.endsWith(".zip")
+          || !UUID_NAME.matcher(filename.substring(0, filename.length() - 4)).matches()) {
+        return null;
+      }
+      return new GeneratedArtifactPath(
+          relative.getName(1).toString(), relative.getName(2).toString());
+    }
+  }
 
   private record OpenedDirectory(
       SecureDirectoryStream<Path> directory, List<SecureDirectoryStream<Path>> opened)

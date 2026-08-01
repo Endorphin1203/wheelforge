@@ -11,7 +11,11 @@ from wheelforge_worker.jobs.consumer import JobConsumer
 from wheelforge_worker.jobs.maintenance import MaintenanceService
 from wheelforge_worker.jobs.pipeline import DefaultBuildStages, JobPipeline
 from wheelforge_worker.jobs.repository import JobRepository
-from wheelforge_worker.jobs.storage import RootedLocalStorage, WorkspaceManager
+from wheelforge_worker.jobs.storage import (
+    RootedLocalStorage,
+    WorkspaceManager,
+    require_external_workspace_support,
+)
 from wheelforge_worker.settings import Settings
 
 
@@ -35,6 +39,7 @@ def create_consumer(settings: Settings, stop: threading.Event) -> JobConsumer:
         workspaces = WorkspaceManager(settings.workspace_root)
         if storage.root_identity == workspaces.root_identity:
             raise ValueError("WF_DATA_ROOT and WF_WORKSPACE_ROOT must be different")
+        require_external_workspace_support()
         maintenance = MaintenanceService(
             repository,
             storage,

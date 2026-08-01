@@ -1373,7 +1373,7 @@ def _build_package_resolution_audit(
         "rejections": rejections.entries,
         "omitted": {
             "attempts": attempts.omitted,
-            "rejections": rejections.omitted + resolution.rejections_omitted,
+            "rejections": rejections.omitted,
         },
         "truncated": {
             "observations": resolution.observations_truncated,

@@ -24,6 +24,7 @@ class CompatibilityFailureCode(StrEnum):
     EXHAUSTED = "EXHAUSTED"
     ATTEMPT_LIMIT = "ATTEMPT_LIMIT"
     TIMEOUT = "TIMEOUT"
+    RESOURCE_LIMIT = "RESOURCE_LIMIT"
 
 
 class VersionChangeKind(StrEnum):

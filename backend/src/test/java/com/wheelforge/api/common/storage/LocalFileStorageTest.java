@@ -202,6 +202,45 @@ class LocalFileStorageTest {
   }
 
   @Test
+  void artifactDeletePrunesOnlyEmptyGeneratedExecutionAndTaskDirectories() throws Exception {
+    String task = "20000000-0000-4000-8000-000000000021";
+    String execution = "10000000-0000-4000-8000-000000000021";
+    String artifact = "30000000-0000-4000-8000-000000000021.zip";
+    String key = "artifacts/" + task + "/" + execution + "/" + artifact;
+    var storage = secureStorage(tempDir.toAbsolutePath());
+    storage.putAtomically(key, new ByteArrayInputStream(new byte[] {1}), 1);
+
+    storage.deleteIfExists(key);
+
+    assertThat(tempDir.resolve("artifacts").resolve(task).resolve(execution)).doesNotExist();
+    assertThat(tempDir.resolve("artifacts").resolve(task)).doesNotExist();
+    assertThat(tempDir.resolve("artifacts")).isDirectory();
+  }
+
+  @Test
+  void artifactDeletePreservesSiblingAndConcurrentDirectoryContent() throws Exception {
+    String task = "20000000-0000-4000-8000-000000000022";
+    String execution = "10000000-0000-4000-8000-000000000022";
+    String first =
+        "artifacts/" + task + "/" + execution + "/30000000-0000-4000-8000-000000000022.zip";
+    String sibling =
+        "artifacts/" + task + "/" + execution + "/30000000-0000-4000-8000-000000000023.zip";
+    var storage = secureStorage(tempDir.toAbsolutePath());
+    storage.putAtomically(first, new ByteArrayInputStream(new byte[] {1}), 1);
+    storage.putAtomically(sibling, new ByteArrayInputStream(new byte[] {2}), 1);
+    Path concurrent =
+        tempDir.resolve("artifacts").resolve(task).resolve(execution).resolve("keep.txt");
+    Files.writeString(concurrent, "keep");
+
+    storage.deleteIfExists(first);
+    storage.deleteIfExists(sibling);
+
+    assertThat(concurrent).hasContent("keep");
+    assertThat(tempDir.resolve("artifacts").resolve(task).resolve(execution)).isDirectory();
+    assertThat(tempDir.resolve("artifacts").resolve(task)).isDirectory();
+  }
+
+  @Test
   void keepsAnOpenedReadValidAfterItsParentPathIsReplaced() throws Exception {
     Path root = Files.createDirectory(tempDir.resolve("root"));
     String key = "users/user-id/requirements/file-id/original.txt";

@@ -671,13 +671,54 @@ def test_high_cardinality_audit_streams_into_fixed_size_accumulators(
     summary = repository_module._resolution_summary_audit(resolution)
 
     assert maximum_retained < 100
-    assert package_audit["omitted"]["rejections"] >= 123
+    assert package_audit["omitted"]["rejections"] > 0
+    assert package_audit["truncated"]["globalRejections"] == 123
     assert summary["truncated"] == {
         "observations": True,
         "rejections": 123,
     }
     assert len(json.dumps(package_audit, ensure_ascii=True).encode()) <= MAX_PACKAGE_AUDIT_BYTES
     assert len(json.dumps(summary, ensure_ascii=True).encode()) <= MAX_BUILD_AUDIT_BYTES
+
+
+def test_package_audit_keeps_local_and_global_rejection_omissions_distinct() -> None:
+    packages = tuple(
+        ResolvedPackage(
+            name,
+            Version("1.0"),
+            True,
+            f"https://example/{name}",
+            f"{name}.whl",
+            (),
+            None,
+            (),
+        )
+        for name in ("alpha", "beta")
+    )
+    resolution = ResolutionResult(
+        "1",
+        packages,
+        rejections=tuple(
+            CandidateRejection(
+                "beta",
+                str(index),
+                PackageSource.PYPI,
+                CandidateRejectionCode.NO_TARGET_WHEEL,
+                "beta rejection" * 100,
+            )
+            for index in range(100)
+        ),
+        rejections_omitted=123,
+    )
+
+    audits = repository_module._package_resolution_audits(
+        resolution, ("alpha", "beta")
+    )
+
+    assert audits["alpha"]["omitted"]["rejections"] == 0
+    assert audits["beta"]["omitted"]["rejections"] > 0
+    assert audits["alpha"]["truncated"]["globalRejections"] == 123
+    assert audits["beta"]["truncated"]["globalRejections"] == 123
 
 
 def test_persist_resolution_rejects_package_count_before_database_writes() -> None:

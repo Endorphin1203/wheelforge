@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
 from threading import Event
@@ -14,6 +15,12 @@ from urllib.parse import quote
 from uuid import UUID, uuid4
 
 from pydantic import ValidationError
+from sqlalchemy.exc import (
+    DBAPIError,
+    IntegrityError,
+    OperationalError,
+    TimeoutError as SQLAlchemyTimeoutError,
+)
 
 from wheelforge_worker.artifact import (
     ArtifactBuildContext,
@@ -66,7 +73,7 @@ from .repository import (
     LostLeaseError,
 )
 from .heartbeat import LeaseHeartbeat
-from .storage import RootedLocalStorage, WorkspaceManager
+from .storage import RootedLocalStorage, WorkspaceCapability, WorkspaceManager
 
 
 _MAX_INDEX_BYTES = 8 * 1024 * 1024
@@ -120,14 +127,17 @@ class _Downloader(Protocol):
 
 class BuildStages(Protocol):
     def resolve(
-        self, parsed: ParsedRequirements, target: TargetProfile, workspace: Path
+        self,
+        parsed: ParsedRequirements,
+        target: TargetProfile,
+        workspace: WorkspaceCapability,
     ) -> ResolutionResult: ...
 
     def download(
         self,
         resolution: ResolutionResult,
         target: TargetProfile,
-        workspace: Path,
+        workspace: WorkspaceCapability,
         cancel: Callable[[], bool],
     ) -> BuildDownload: ...
 
@@ -139,7 +149,7 @@ class BuildStages(Protocol):
     ) -> BuildValidation: ...
 
     def package(
-        self, context: ArtifactBuildContext, output_directory: Path
+        self, context: ArtifactBuildContext, workspace: WorkspaceCapability
     ) -> BuiltArtifact: ...
 
 
@@ -150,8 +160,15 @@ class BuiltinCandidateProvider:
     def candidates(
         self, package: str, source: PackageSource
     ) -> Iterable[CandidateMetadata]:
+        return self.candidates_bounded(package, source, 2000)
+
+    def candidates_bounded(
+        self, package: str, source: PackageSource, limit: int
+    ) -> Iterable[CandidateMetadata]:
         if source not in _INDEX_JSON_BASES:
             raise ValueError("source must be a builtin package source")
+        if type(limit) is not int or not 1 <= limit <= 2000:
+            raise ValueError("candidate observation limit is out of bounds")
         safe_package = quote(package, safe="")
         url = f"{_INDEX_JSON_BASES[source]}/{safe_package}/json"
         request = urllib.request.Request(
@@ -208,6 +225,8 @@ class BuiltinCandidateProvider:
                     wheel_filenames=filenames,
                 )
             )
+            if len(result) >= limit:
+                break
         return tuple(result)
 
 
@@ -216,15 +235,21 @@ class DefaultBuildStages:
         self,
         candidate_provider: BuiltinCandidateProvider | None = None,
         *,
-        downloader_factory: Callable[[Path], _Downloader] = WheelDownloader,
+        downloader_factory: Callable[[Path], _Downloader] | None = None,
     ) -> None:
         self._candidate_provider = candidate_provider or BuiltinCandidateProvider()
         self._downloader_factory = downloader_factory
 
     def resolve(
-        self, parsed: ParsedRequirements, target: TargetProfile, workspace: Path
+        self,
+        parsed: ParsedRequirements,
+        target: TargetProfile,
+        workspace: WorkspaceCapability,
     ) -> ResolutionResult:
-        strict = StrictResolver(workspace)
+        external = workspace.external()
+        strict = StrictResolver(
+            external.path, inherited_fds=external.inherited_fds
+        )
         resolver = CompatibleResolver(strict, self._candidate_provider)
         return resolver.resolve(parsed, target, SOURCE_ORDER, ResolveLimits())
 
@@ -232,14 +257,23 @@ class DefaultBuildStages:
         self,
         resolution: ResolutionResult,
         target: TargetProfile,
-        workspace: Path,
+        workspace: WorkspaceCapability,
         cancel: Callable[[], bool],
     ) -> BuildDownload:
-        download_root = workspace / "download-work"
-        download_root.mkdir(mode=0o700)
+        workspace.mkdir("download-work")
+        external = workspace.external("download-work")
+        download_root = external.path
         if len(resolution.packages) > 500:
             raise ValueError("resolved package count exceeds the limit")
-        downloader = self._downloader_factory(download_root)
+        downloader = (
+            WheelDownloader(
+                download_root,
+                inherited_fds=external.inherited_fds,
+                trusted_fd_bound=True,
+            )
+            if self._downloader_factory is None
+            else self._downloader_factory(download_root)
+        )
         wheels: list[DownloadedWheel] = []
         failures: list[PackageFailure] = []
         total_bytes = 0
@@ -294,9 +328,11 @@ class DefaultBuildStages:
         )
 
     def package(
-        self, context: ArtifactBuildContext, output_directory: Path
+        self, context: ArtifactBuildContext, workspace: WorkspaceCapability
     ) -> BuiltArtifact:
-        return ArtifactBuilder().build(context, output_directory)
+        external = workspace.external("artifact")
+        built = ArtifactBuilder().build(context, external.path)
+        return replace(built, path=Path("artifact") / built.path.name)
 
 
 class JobPipeline:
@@ -457,7 +493,9 @@ class JobPipeline:
             )
             resolution = self._during_lease(
                 lease,
-                lambda: self._stages.resolve(parsed, target, owned_workspace.path),
+                lambda: self._stages.resolve(
+                    parsed, target, owned_workspace.capability
+                ),
             )
             if len(resolution.packages) > MAX_RESOLVED_PACKAGES:
                 raise ValueError("resolved package count exceeds the limit")
@@ -477,7 +515,7 @@ class JobPipeline:
                 lambda: self._stages.download(
                     resolution,
                     target,
-                    owned_workspace.path,
+                    owned_workspace.capability,
                     lambda: self._repository.is_cancel_requested(lease),
                 ),
             )
@@ -524,8 +562,7 @@ class JobPipeline:
             self._repository.advance_build(
                 lease, "PACKAGING", 85, "PACKAGING", "Packaging offline artifact"
             )
-            output = owned_workspace.path / "artifact"
-            output.mkdir(mode=0o700)
+            owned_workspace.capability.mkdir("artifact")
             context = ArtifactBuildContext(
                 build_id=lease.subject_id,
                 original_requirements=original_text,
@@ -536,7 +573,10 @@ class JobPipeline:
                 wheels=validation.wheels,
             )
             built = self._during_lease(
-                lease, lambda: self._stages.package(context, output)
+                lease,
+                lambda: self._stages.package(
+                    context, owned_workspace.capability
+                ),
             )
             cancelled = self._cancel_if_requested(lease)
             if cancelled is not None:
@@ -546,14 +586,18 @@ class JobPipeline:
             object_key = (
                 f"artifacts/{lease.subject_id}/{lease.execution_id}/{artifact_id}.zip"
             )
-            published = self._during_lease(
-                lease,
-                lambda: self._storage.publish_file(
-                    object_key,
-                    built.path,
-                    owner_execution_id=lease.execution_id,
-                ),
-            )
+            source_descriptor = owned_workspace.capability.open_regular(built.path)
+            try:
+                published = self._during_lease(
+                    lease,
+                    lambda: self._storage.publish_descriptor(
+                        object_key,
+                        source_descriptor,
+                        owner_execution_id=lease.execution_id,
+                    ),
+                )
+            finally:
+                os.close(source_descriptor)
             if published.sha256 != built.sha256:
                 raise OSError("artifact digest changed during local publication")
             cancelled = self._cancel_if_requested(lease)
@@ -655,6 +699,12 @@ def _retryable(error: BaseException) -> bool:
         )
     if isinstance(error, LostLeaseError):
         return False
+    if isinstance(error, IntegrityError):
+        return False
+    if isinstance(error, (OperationalError, SQLAlchemyTimeoutError)):
+        return True
+    if isinstance(error, DBAPIError):
+        return bool(error.connection_invalidated)
     if isinstance(error, (OSError, ResolverError, RuntimeError)):
         return True
     return False

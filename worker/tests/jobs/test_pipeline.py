@@ -8,13 +8,14 @@ from itertools import count
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from uuid import UUID
 
 import pytest
 from packaging.tags import Tag
 from packaging.version import Version
 from sqlalchemy import create_engine, func, insert, select, update
+from sqlalchemy.exc import IntegrityError, OperationalError, TimeoutError as SATimeoutError
 from sqlalchemy.pool import StaticPool
 
 from wheelforge_worker.artifact import ArtifactBuildContext, BuiltArtifact, ValidatedWheel
@@ -117,13 +118,71 @@ class RecordingStages:
         return BuildValidation((), StaticValidationReport((), True))
 
     def package(
-        self, context: ArtifactBuildContext, output_directory: Path
+        self, context: ArtifactBuildContext, workspace: object
     ) -> BuiltArtifact:
         self.calls.append("package")
-        path = output_directory / "result.zip"
+        path = Path("artifact/result.zip")
         content = b"verified zip bytes"
-        path.write_bytes(content)
+        workspace.write_bytes(path, content)  # type: ignore[attr-defined]
         return BuiltArtifact(path, hashlib.sha256(content).hexdigest(), {})
+
+
+class PathWorkspaceCapability:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.name = path.name
+
+    def mkdir(self, relative: str | Path) -> None:
+        (self.path / relative).mkdir(mode=0o700)
+
+    def external(self, relative: str | Path = Path(".")) -> object:
+        path = self.path if Path(relative) == Path(".") else self.path / relative
+        return SimpleNamespace(path=path, inherited_fds=())
+
+
+class RootReplacingStages(RecordingStages):
+    def __init__(self, stage: str, workspace_root: Path) -> None:
+        super().__init__()
+        self._replacement_stage = stage
+        self._workspace_root = workspace_root
+        self.replacement_workspace: Path | None = None
+
+    def _replace_root(self, workspace: object) -> None:
+        held = self._workspace_root.with_name("workspace-held")
+        self._workspace_root.rename(held)
+        self._workspace_root.mkdir(mode=0o700)
+        name = workspace.name  # type: ignore[attr-defined]
+        self.replacement_workspace = self._workspace_root / name
+        self.replacement_workspace.mkdir(mode=0o700)
+
+    def resolve(
+        self, parsed: object, target: object, workspace: object
+    ) -> ResolutionResult:
+        if self._replacement_stage == "resolve":
+            self._replace_root(workspace)
+        workspace.write_bytes("resolve.marker", b"original")  # type: ignore[attr-defined]
+        return super().resolve(parsed, target, workspace)  # type: ignore[arg-type]
+
+    def download(
+        self,
+        resolution: ResolutionResult,
+        target: object,
+        workspace: object,
+        cancel: object,
+    ) -> BuildDownload:
+        if self._replacement_stage == "download":
+            self._replace_root(workspace)
+        workspace.write_bytes("download.marker", b"original")  # type: ignore[attr-defined]
+        return super().download(  # type: ignore[arg-type]
+            resolution, target, workspace, cancel
+        )
+
+    def package(
+        self, context: ArtifactBuildContext, workspace: object
+    ) -> BuiltArtifact:
+        if self._replacement_stage == "package":
+            self._replace_root(workspace)
+        return super().package(context, workspace)
 
 
 @dataclass
@@ -195,7 +254,7 @@ def test_default_download_retains_successes_when_later_package_is_missing(
     result = stages.download(
         ResolutionResult("1", (first, second)),
         cast(TargetProfile, object()),
-        work,
+        cast(Any, PathWorkspaceCapability(work)),
         lambda: False,
     )
 
@@ -668,6 +727,28 @@ def test_successful_build_publishes_artifact_and_terminal_states(
     assert list(workspaces.root.iterdir()) == []
 
 
+@pytest.mark.parametrize("replacement_stage", ["resolve", "download", "package"])
+def test_external_stages_remain_bound_to_workspace_child_after_root_replacement(
+    tmp_path: Path, replacement_stage: str
+) -> None:
+    repository, storage, workspaces = _environment(tmp_path)
+    _publish_build_inputs(storage)
+    lease = _seed_build(repository)
+    stages = RootReplacingStages(replacement_stage, workspaces.root)
+
+    result = JobPipeline(repository, storage, workspaces, stages).run(lease)
+
+    assert result.status is BuildStatus.SUCCESS
+    assert stages.replacement_workspace is not None
+    assert not (stages.replacement_workspace / "resolve.marker").exists()
+    assert not (stages.replacement_workspace / "download.marker").exists()
+    assert not (stages.replacement_workspace / "artifact/result.zip").exists()
+    with repository.engine.connect() as connection:
+        object_key = connection.scalar(select(artifacts.c.object_key))
+    assert object_key is not None
+    assert storage.read_bytes(object_key) == b"verified zip bytes"
+
+
 def test_build_rejects_oversized_resolution_before_package_audit(
     tmp_path: Path,
 ) -> None:
@@ -719,7 +800,7 @@ def test_partial_build_publishes_verified_successes_and_package_audit(
         ) -> BuildDownload:
             self.calls.append("download")
             package = resolution.packages[0]
-            path = workspace / package.wheel_filename
+            path = tmp_path / package.wheel_filename
             path.write_bytes(b"wheel")
             wheel = DownloadedWheel(
                 package=package.name,
@@ -901,20 +982,22 @@ def test_artifact_file_is_compensated_when_database_publication_rolls_back(
 
 
 class CleanupFailureWorkspace:
-    def __init__(self, root: Path) -> None:
-        self.path = root / "wf-execution-cleanup-failure"
-        self.path.mkdir()
+    def __init__(self, owned: object) -> None:
+        self.path = owned.path  # type: ignore[attr-defined]
+        self.capability = owned.capability  # type: ignore[attr-defined]
+        self._owned = owned
 
     def cleanup(self) -> None:
         raise RuntimeError("workspace cleanup failed")
 
 
 class CleanupFailureWorkspaceManager:
-    def __init__(self, root: Path) -> None:
-        self.root = root
+    def __init__(self, manager: WorkspaceManager) -> None:
+        self.root = manager.root
+        self._manager = manager
 
     def allocate(self, execution_id: str | None = None) -> CleanupFailureWorkspace:
-        return CleanupFailureWorkspace(self.root)
+        return CleanupFailureWorkspace(self._manager.allocate(execution_id))
 
 
 def test_workspace_cleanup_failure_does_not_replace_success_result(
@@ -926,7 +1009,7 @@ def test_workspace_cleanup_failure_does_not_replace_success_result(
     pipeline = JobPipeline(
         repository,
         storage,
-        cast(WorkspaceManager, CleanupFailureWorkspaceManager(workspaces.root)),
+        cast(WorkspaceManager, CleanupFailureWorkspaceManager(workspaces)),
         RecordingStages(),
     )
 
@@ -988,6 +1071,26 @@ def test_mixed_permanent_exception_group_is_not_retryable() -> None:
     assert pipeline_module._retryable(
         ExceptionGroup("mixed", [OSError("network"), ValueError("bad archive")])
     ) is False
+
+
+def test_transient_sqlalchemy_failures_are_recursively_retryable() -> None:
+    error = ExceptionGroup(
+        "database infrastructure",
+        [
+            OperationalError(
+                "insert artifact", {}, OSError("connection reset")
+            ),
+            SATimeoutError("pool timeout"),
+        ],
+    )
+
+    assert pipeline_module._retryable(error) is True
+
+
+def test_sqlalchemy_integrity_error_is_not_blindly_retried() -> None:
+    error = IntegrityError("insert artifact", {}, ValueError("duplicate key"))
+
+    assert pipeline_module._retryable(error) is False
 
 
 def test_build_logs_receive_strictly_increasing_sequences(tmp_path: Path) -> None:

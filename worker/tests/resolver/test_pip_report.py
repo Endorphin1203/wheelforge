@@ -209,6 +209,35 @@ def test_runner_uses_tokenized_argv_and_complete_environment(
         )
 
 
+@pytest.mark.skipif(os.name != "posix", reason="pass_fds is POSIX-only")
+def test_runner_explicitly_inherits_only_requested_workspace_descriptor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    observed: dict[str, object] = {}
+    real_popen = subprocess.Popen
+
+    def observing_popen(
+        args: tuple[str, ...], **kwargs: Any
+    ) -> subprocess.Popen[bytes]:
+        observed.update(kwargs)
+        return cast(Any, real_popen(args, **kwargs))
+
+    monkeypatch.setattr(process_module.subprocess, "Popen", observing_popen)
+    descriptor = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        ProcessRunner().run(
+            [sys.executable, "-c", "print('ok')"],
+            tmp_path,
+            timedelta(seconds=1),
+            {},
+            inherited_fds=(descriptor,),
+        )
+    finally:
+        os.close(descriptor)
+
+    assert observed["pass_fds"] == (descriptor,)
+
+
 @pytest.mark.parametrize(
     ("script", "return_code"),
     [("print('pipe output')", 0), ("import sys; sys.exit(7)", 7)],

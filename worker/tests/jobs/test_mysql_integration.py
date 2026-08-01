@@ -13,9 +13,9 @@ from uuid import UUID, uuid4
 
 import pytest
 from packaging.version import Version
-from sqlalchemy import Engine, create_engine, event, insert, select, text
+from sqlalchemy import Engine, create_engine, event, func, insert, select, text
 from sqlalchemy.engine import make_url
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from wheelforge_worker.artifact import ArtifactBuildContext, BuiltArtifact
 from wheelforge_worker.contracts import BuildStatus, JobPayload
@@ -70,6 +70,38 @@ TABLES = (
     "requirement_files",
     "users",
 )
+
+
+class PackagingStages:
+    def resolve(
+        self, parsed: object, target: object, workspace: object
+    ) -> ResolutionResult:
+        return ResolutionResult("1", ())
+
+    def download(
+        self,
+        resolution: ResolutionResult,
+        target: object,
+        workspace: object,
+        cancel: object,
+    ) -> BuildDownload:
+        return BuildDownload((), ())
+
+    def validate(
+        self,
+        resolution: ResolutionResult,
+        wheels: tuple[object, ...],
+        target: object,
+    ) -> BuildValidation:
+        return BuildValidation((), StaticValidationReport((), True))
+
+    def package(
+        self, context: ArtifactBuildContext, workspace: object
+    ) -> BuiltArtifact:
+        path = Path("artifact/bundle.zip")
+        content = b"mysql compensation artifact"
+        workspace.write_bytes(path, content)  # type: ignore[attr-defined]
+        return BuiltArtifact(path, hashlib.sha256(content).hexdigest(), {})
 
 
 @pytest.fixture(scope="module")
@@ -321,37 +353,6 @@ def test_mysql_metadata_failure_allows_exact_local_artifact_compensation(
     storage.publish_bytes("requirements/7/original.txt", MYSQL_REQUIREMENTS)
     storage.publish_bytes("requirements/7/normalized.txt", MYSQL_REQUIREMENTS)
 
-    class PackagingStages:
-        def resolve(
-            self, parsed: object, target: object, workspace: Path
-        ) -> ResolutionResult:
-            return ResolutionResult("1", ())
-
-        def download(
-            self,
-            resolution: ResolutionResult,
-            target: object,
-            workspace: Path,
-            cancel: object,
-        ) -> BuildDownload:
-            return BuildDownload((), ())
-
-        def validate(
-            self,
-            resolution: ResolutionResult,
-            wheels: tuple[object, ...],
-            target: object,
-        ) -> BuildValidation:
-            return BuildValidation((), StaticValidationReport((), True))
-
-        def package(
-            self, context: ArtifactBuildContext, output_directory: Path
-        ) -> BuiltArtifact:
-            path = output_directory / "bundle.zip"
-            content = b"mysql compensation artifact"
-            path.write_bytes(content)
-            return BuiltArtifact(path, hashlib.sha256(content).hexdigest(), {})
-
     pipeline = JobPipeline(
         repository,
         storage,
@@ -369,6 +370,78 @@ def test_mysql_metadata_failure_allows_exact_local_artifact_compensation(
         assert connection.scalar(select(build_jobs.c.status)) == "FAILED"
         assert connection.scalar(select(build_tasks.c.status)) == "FAILED"
         assert connection.scalar(select(artifacts.c.id)) == duplicate_id
+
+
+def test_mysql_transient_artifact_failure_compensates_then_retry_publishes_once(
+    mysql_engine: Engine, tmp_path: Path
+) -> None:
+    _job_id, task_id = _seed_build(mysql_engine, ordinal=8)
+    repository = JobRepository(mysql_engine, lease_seconds=60, clock=lambda: NOW)
+    first = repository.claim_next("worker-a")
+    assert first is not None
+    root = tmp_path / "data"
+    workspace_root = tmp_path / "workspace"
+    root.mkdir()
+    workspace_root.mkdir()
+    storage = RootedLocalStorage(root)
+    workspaces = WorkspaceManager(workspace_root)
+    storage.publish_bytes("requirements/8/original.txt", MYSQL_REQUIREMENTS)
+    storage.publish_bytes("requirements/8/normalized.txt", MYSQL_REQUIREMENTS)
+    artifact_ids = iter((uuid4(), uuid4()))
+    failed_once = False
+
+    def fail_first_artifact_insert(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        nonlocal failed_once
+        if not failed_once and "INSERT INTO artifacts" in statement:
+            failed_once = True
+            raise OperationalError(
+                statement,
+                parameters,
+                TimeoutError("temporary MySQL timeout"),
+            )
+
+    event.listen(mysql_engine, "before_cursor_execute", fail_first_artifact_insert)
+    try:
+        first_result = JobPipeline(
+            repository,
+            storage,
+            workspaces,
+            PackagingStages(),
+            uuid_factory=lambda: next(artifact_ids),
+        ).run(first)
+
+        assert first_result.status is BuildStatus.QUEUED
+        assert list(root.glob("artifacts/**/*.zip")) == []
+        with mysql_engine.connect() as connection:
+            assert connection.scalar(select(func.count()).select_from(artifacts)) == 0
+            assert connection.scalar(select(build_jobs.c.status)) == "READY"
+            assert connection.scalar(select(build_tasks.c.status)) == "QUEUED"
+
+        second = repository.claim_next("worker-b")
+        assert second is not None
+        second_result = JobPipeline(
+            repository,
+            storage,
+            workspaces,
+            PackagingStages(),
+            uuid_factory=lambda: next(artifact_ids),
+        ).run(second)
+    finally:
+        event.remove(mysql_engine, "before_cursor_execute", fail_first_artifact_insert)
+
+    assert second_result.status is BuildStatus.SUCCESS
+    with mysql_engine.connect() as connection:
+        assert connection.scalar(select(func.count()).select_from(artifacts)) == 1
+        assert connection.scalar(select(build_jobs.c.status)) == "COMPLETED"
+        assert connection.scalar(select(build_tasks.c.status)) == "SUCCESS"
+    assert len(list(root.glob("artifacts/**/*.zip"))) == 1
 
 
 def _seed_build(engine: Engine, *, ordinal: int) -> tuple[str, str]:

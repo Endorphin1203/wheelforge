@@ -884,8 +884,45 @@ def test_high_cardinality_provider_has_global_observation_and_rejection_budgets(
 
     failure = captured.value
     assert len(failure.rejections) <= MAX_RESOLUTION_REJECTIONS
-    assert failure.rejections_omitted > 0
+    assert failure.code is CompatibilityFailureCode.RESOURCE_LIMIT
     assert failure.observations_truncated is True
+
+
+def test_observation_budget_stops_before_next_provider_with_resource_limit() -> None:
+    parsed = parse_requirements(b"alpha==1.0\nbeta==1.0\n")
+    strict = RecordingStrictResolver(lambda _requirements, _source: None)
+
+    class BoundedProvider:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, PackageSource, int]] = []
+
+        def candidates_bounded(
+            self, package: str, source: PackageSource, limit: int
+        ) -> Iterable[CandidateMetadata]:
+            self.calls.append((package, source, limit))
+            return (candidate("1.1", wheels=(f"{package}-1.1-py3-none-any.whl",)),)
+
+        def candidates(
+            self, package: str, source: PackageSource
+        ) -> Iterable[CandidateMetadata]:
+            raise AssertionError("bounded provider path must be used")
+
+    provider = BoundedProvider()
+    with pytest.raises(CompatibilityResolutionError) as captured:
+        CompatibleResolver(
+            strict,
+            provider,
+            max_observations=1,
+        ).resolve(
+            parsed,
+            profile(),
+            (PackageSource.PYPI, PackageSource.ALIYUN),
+            ResolveLimits(),
+        )
+
+    assert captured.value.code is CompatibilityFailureCode.RESOURCE_LIMIT
+    assert provider.calls == [("alpha", PackageSource.PYPI, 1)]
+    assert captured.value.observations_truncated is True
 
 
 def test_target_profile_is_never_mutated_or_substituted() -> None:
