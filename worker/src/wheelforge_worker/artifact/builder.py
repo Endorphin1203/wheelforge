@@ -56,6 +56,8 @@ class _WindowsApi(Protocol):
 
     def descriptor_handle(self, descriptor: int) -> int: ...
 
+    def descriptor_native_handle(self, descriptor: int) -> int: ...
+
     def handle_identity(self, handle: int) -> _FileIdentity: ...
 
     def handle_is_reparse(self, handle: int) -> bool: ...
@@ -405,8 +407,10 @@ class _WindowsPublicationBackend:
 
     def cleanup_unbound_stage(self, descriptor: int, staged: Path) -> None:
         try:
-            self._api.delete_handle(self._stage_handle(descriptor))
-        except (OSError, ArtifactBuildError):
+            self._api.delete_handle(
+                self._api.descriptor_native_handle(descriptor)
+            )
+        except BaseException:
             pass
 
     def publish(
@@ -599,13 +603,7 @@ class _WindowsNativeApi:
             self._raise_last_error("could not close Windows file handle")
 
     def descriptor_handle(self, descriptor: int) -> int:
-        try:
-            import msvcrt
-        except ImportError as error:
-            raise ArtifactBuildError(
-                "safe Windows publication backend is unavailable"
-            ) from error
-        source = msvcrt.get_osfhandle(descriptor)  # type: ignore[attr-defined]
+        source = self.descriptor_native_handle(descriptor)
         handle = self._kernel32.ReOpenFile(
             source,
             self._GENERIC_READ
@@ -618,6 +616,15 @@ class _WindowsNativeApi:
         if handle == self._INVALID_HANDLE_VALUE:
             self._raise_last_error("could not bind staged ZIP handle")
         return int(handle)
+
+    def descriptor_native_handle(self, descriptor: int) -> int:
+        try:
+            import msvcrt
+        except ImportError as error:
+            raise ArtifactBuildError(
+                "safe Windows publication backend is unavailable"
+            ) from error
+        return int(msvcrt.get_osfhandle(descriptor))  # type: ignore[attr-defined]
 
     def handle_identity(self, handle: int) -> _FileIdentity:
         information = self._handle_information(handle)

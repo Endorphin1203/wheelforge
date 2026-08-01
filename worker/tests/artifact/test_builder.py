@@ -110,6 +110,7 @@ class FakeWindowsNativeApi:
         self.staged = staged
         self.final = final
         self.directory_handle = 101
+        self.original_stage_handle = 201
         self.stage_handle = 202
         self.directory_identity = (11, 12)
         self.stage_identity = (21, 22)
@@ -129,6 +130,8 @@ class FakeWindowsNativeApi:
             self.FILE_SHARE_READ | self.FILE_SHARE_WRITE | self.FILE_SHARE_DELETE
         )
         self.created_stages: list[Path] = []
+        self.descriptor_handle_calls = 0
+        self.delete_failures: set[int] = set()
 
     def create_stage(self, path: Path) -> int:
         self.paths.pop(self.staged, None)
@@ -148,9 +151,14 @@ class FakeWindowsNativeApi:
 
     def descriptor_handle(self, descriptor: int) -> int:
         assert descriptor == 7
+        self.descriptor_handle_calls += 1
         if not self.stage_share & self.FILE_SHARE_DELETE:
             raise OSError(errno.EACCES, "simulated sharing violation")
         return self.stage_handle
+
+    def descriptor_native_handle(self, descriptor: int) -> int:
+        assert descriptor == 7
+        return self.original_stage_handle
 
     def handle_identity(self, handle: int) -> tuple[int, int]:
         if handle == self.directory_handle:
@@ -175,6 +183,8 @@ class FakeWindowsNativeApi:
 
     def delete_handle(self, handle: int) -> None:
         self.deleted.append(handle)
+        if handle in self.delete_failures:
+            raise RuntimeError("injected exact-handle delete failure")
         for path, identity in tuple(self.paths.items()):
             if identity == self.stage_identity:
                 self.paths[path] = None
@@ -1635,14 +1645,21 @@ def test_windows_backend_reopen_fails_when_stage_does_not_share_delete(
     final = output / "artifact.zip"
     api = FakeWindowsNativeApi(output, initial_stage, final)
     api.stage_share = api.FILE_SHARE_READ | api.FILE_SHARE_WRITE
+    api.delete_failures.add(api.original_stage_handle)
     backend = builder_module._WindowsPublicationBackend(output, api)
     descriptor, staged = backend.create_stage()
 
     with pytest.raises(OSError, match="sharing violation"):
-        backend.stage_identity(descriptor, staged)
+        try:
+            backend.stage_identity(descriptor, staged)
+        except BaseException:
+            backend.cleanup_unbound_stage(descriptor, staged)
+            raise
 
-    backend.cleanup_unbound_stage(descriptor, staged)
+    assert api.descriptor_handle_calls == 1
+    assert api.deleted == [api.original_stage_handle]
     backend.close()
+    assert api.original_stage_handle not in api.closed
 
 
 def test_windows_backend_rejects_reparse_output_handle_at_initialization(
