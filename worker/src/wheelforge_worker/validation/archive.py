@@ -364,6 +364,48 @@ def validate_wheel_archive(
     supplied = Path(path)
     _require_expected_path(supplied, expected)
     snapshot = _create_verified_snapshot(supplied, expected)
+    return _validate_snapshot(snapshot, expected, limits)
+
+
+def validate_wheel_archive_descriptor(
+    descriptor: int,
+    expected: DownloadedWheel,
+    limits: ArchiveLimits,
+    snapshot_parent: Path,
+) -> ArchiveValidationReport:
+    """Validate an exact open Wheel supplied by a trusted directory capability."""
+    if type(descriptor) is not int or descriptor < 0:
+        raise ValueError("descriptor must be an open file descriptor")
+    if not isinstance(expected, DownloadedWheel):
+        raise ValueError("expected must be a DownloadedWheel")
+    if not isinstance(limits, ArchiveLimits):
+        raise ValueError("limits must be ArchiveLimits")
+    if expected.path.name != expected.filename:
+        raise UnsafeWheelArchive("downloaded Wheel filename differs from observation")
+    if not _valid_sha256(expected.sha256):
+        raise UnsafeWheelArchive("downloaded Wheel SHA-256 observation is invalid")
+    parent = Path(snapshot_parent)
+    try:
+        parent_status = parent.lstat()
+    except OSError as error:
+        raise UnsafeWheelArchive("snapshot parent is unavailable") from error
+    if not stat.S_ISDIR(parent_status.st_mode) or stat.S_ISLNK(parent_status.st_mode):
+        raise UnsafeWheelArchive("snapshot parent must be a real directory")
+    try:
+        owned_descriptor = os.dup(descriptor)
+    except OSError as error:
+        raise UnsafeWheelArchive("downloaded Wheel descriptor is unavailable") from error
+    snapshot = _create_verified_snapshot_from_descriptor(
+        owned_descriptor, parent, expected, expected_identity=None
+    )
+    return _validate_snapshot(snapshot, expected, limits)
+
+
+def _validate_snapshot(
+    snapshot: ValidatedWheelSnapshot,
+    expected: DownloadedWheel,
+    limits: ArchiveLimits,
+) -> ArchiveValidationReport:
     try:
         with snapshot.open() as handle:
             _validate_zip_end_records(handle)
@@ -445,6 +487,21 @@ def _create_verified_snapshot(
         raise UnsafeWheelArchive(
             "downloaded Wheel cannot be opened without following links"
         ) from error
+    return _create_verified_snapshot_from_descriptor(
+        source_descriptor,
+        path.parent,
+        expected,
+        expected_identity=(before.st_dev, before.st_ino),
+    )
+
+
+def _create_verified_snapshot_from_descriptor(
+    source_descriptor: int,
+    snapshot_parent: Path,
+    expected: DownloadedWheel,
+    *,
+    expected_identity: tuple[int, int] | None,
+) -> ValidatedWheelSnapshot:
     snapshot_directory: Path | None = None
     snapshot_path: Path | None = None
     snapshot_descriptor = -1
@@ -453,13 +510,18 @@ def _create_verified_snapshot(
         if (
             not stat.S_ISREG(opened.st_mode)
             or getattr(opened, "st_nlink", 1) != 1
-            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            or (
+                expected_identity is not None
+                and (opened.st_dev, opened.st_ino) != expected_identity
+            )
         ):
             raise UnsafeWheelArchive("downloaded Wheel identity changed before validation")
         if opened.st_size != expected.byte_size:
             raise UnsafeWheelArchive("downloaded Wheel byte size differs from observation")
+        if os.lseek(source_descriptor, 0, os.SEEK_CUR) != 0:
+            raise UnsafeWheelArchive("downloaded Wheel descriptor must start at offset zero")
         snapshot_directory = Path(
-            tempfile.mkdtemp(prefix=".wheelforge-validated-", dir=path.parent)
+            tempfile.mkdtemp(prefix=".wheelforge-validated-", dir=snapshot_parent)
         )
         os.chmod(snapshot_directory, 0o700)
         snapshot_path = snapshot_directory / expected.filename

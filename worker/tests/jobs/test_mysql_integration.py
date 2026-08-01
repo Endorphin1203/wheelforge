@@ -419,6 +419,8 @@ def test_mysql_transient_artifact_failure_compensates_then_retry_publishes_once(
 
         assert first_result.status is BuildStatus.QUEUED
         assert list(root.glob("artifacts/**/*.zip")) == []
+        assert not (root / "artifacts" / task_id / first.execution_id).exists()
+        assert not (root / "artifacts" / task_id).exists()
         with mysql_engine.connect() as connection:
             assert connection.scalar(select(func.count()).select_from(artifacts)) == 0
             assert connection.scalar(select(build_jobs.c.status)) == "READY"

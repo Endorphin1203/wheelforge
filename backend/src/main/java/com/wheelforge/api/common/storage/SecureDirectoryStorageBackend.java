@@ -19,7 +19,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
-import java.util.regex.Pattern;
 
 final class SecureDirectoryStorageBackend implements LocalStorageBackend {
   private static final int TEMP_NAME_ATTEMPTS = 5;
@@ -27,8 +26,6 @@ final class SecureDirectoryStorageBackend implements LocalStorageBackend {
       Set.of(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS);
   private static final Set<OpenOption> READ_OPTIONS =
       Set.of(StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS);
-  private static final Pattern UUID_NAME =
-      Pattern.compile("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}");
 
   private final Path root;
   private final SecureDirectoryStream<Path> rootDirectory;
@@ -265,24 +262,6 @@ final class SecureDirectoryStorageBackend implements LocalStorageBackend {
   }
 
   private record TemporaryFile(Path name, SeekableByteChannel channel) {}
-
-  private record GeneratedArtifactPath(String task, String execution) {
-    private static GeneratedArtifactPath parse(Path relative) {
-      if (relative.getNameCount() != 4
-          || !relative.getName(0).toString().equals("artifacts")
-          || !UUID_NAME.matcher(relative.getName(1).toString()).matches()
-          || !UUID_NAME.matcher(relative.getName(2).toString()).matches()) {
-        return null;
-      }
-      String filename = relative.getName(3).toString();
-      if (!filename.endsWith(".zip")
-          || !UUID_NAME.matcher(filename.substring(0, filename.length() - 4)).matches()) {
-        return null;
-      }
-      return new GeneratedArtifactPath(
-          relative.getName(1).toString(), relative.getName(2).toString());
-    }
-  }
 
   private record OpenedDirectory(
       SecureDirectoryStream<Path> directory, List<SecureDirectoryStream<Path>> opened)

@@ -107,6 +107,21 @@ class RecordingProvider:
         return self.releases.get((package, source), ())
 
 
+class BoundedRecordingProvider(RecordingProvider):
+    def __init__(
+        self,
+        releases: dict[tuple[str, PackageSource], Iterable[CandidateMetadata]],
+    ) -> None:
+        super().__init__(releases)
+        self.bounded_calls: list[tuple[str, PackageSource, int]] = []
+
+    def candidates_bounded(
+        self, package: str, source: PackageSource, limit: int
+    ) -> Iterable[CandidateMetadata]:
+        self.bounded_calls.append((package, source, limit))
+        return tuple(self.releases.get((package, source), ()))[:limit]
+
+
 class RecordingStrictResolver:
     def __init__(
         self,
@@ -886,6 +901,94 @@ def test_high_cardinality_provider_has_global_observation_and_rejection_budgets(
     assert len(failure.rejections) <= MAX_RESOLUTION_REJECTIONS
     assert failure.code is CompatibilityFailureCode.RESOURCE_LIMIT
     assert failure.observations_truncated is True
+
+
+def test_single_source_candidate_at_exact_observation_boundary_can_succeed() -> None:
+    parsed = parse_requirements(b"demo==1.0\n")
+    strict = RecordingStrictResolver(
+        lambda requirements, _source: result_for(demo="1.1")
+        if pinned_versions(requirements) == {"demo": "1.1"}
+        else None
+    )
+    provider = BoundedRecordingProvider(
+        {("demo", PackageSource.PYPI): (candidate("1.1"),)}
+    )
+
+    result = CompatibleResolver(strict, provider, max_observations=1).resolve(
+        parsed,
+        profile(),
+        (PackageSource.PYPI,),
+        ResolveLimits(),
+    )
+
+    assert [(item.name, str(item.version)) for item in result.packages] == [
+        ("demo", "1.1")
+    ]
+    assert provider.bounded_calls == [("demo", PackageSource.PYPI, 1)]
+
+
+def test_multiple_sources_can_succeed_when_final_batch_exactly_fills_budget() -> None:
+    parsed = parse_requirements(b"demo==1.0\n")
+    strict = RecordingStrictResolver(
+        lambda requirements, source: result_for(demo="1.1")
+        if pinned_versions(requirements) == {"demo": "1.1"}
+        and source == PackageSource.ALIYUN.value
+        else None
+    )
+    provider = BoundedRecordingProvider(
+        {
+            ("demo", PackageSource.PYPI): (candidate("1.2"),),
+            ("demo", PackageSource.ALIYUN): (candidate("1.1"),),
+        }
+    )
+
+    result = CompatibleResolver(strict, provider, max_observations=2).resolve(
+        parsed,
+        profile(),
+        (PackageSource.PYPI, PackageSource.ALIYUN),
+        ResolveLimits(),
+    )
+
+    assert [(item.name, str(item.version)) for item in result.packages] == [
+        ("demo", "1.1")
+    ]
+    assert provider.bounded_calls == [
+        ("demo", PackageSource.PYPI, 2),
+        ("demo", PackageSource.ALIYUN, 1),
+    ]
+
+
+def test_exact_budget_fails_only_after_collected_pin_cannot_avoid_next_pin() -> None:
+    parsed = parse_requirements(b"alpha==1.0\nbeta==1.0\n")
+    strict = RecordingStrictResolver(
+        lambda requirements, _source: result_for(alpha="1.1", beta="1.1")
+        if pinned_versions(requirements) == {"alpha": "1.1", "beta": "1.1"}
+        else None
+    )
+    provider = BoundedRecordingProvider(
+        {
+            ("alpha", PackageSource.PYPI): (
+                candidate("1.1", wheels=("alpha-1.1-py3-none-any.whl",)),
+            ),
+            ("beta", PackageSource.PYPI): (
+                candidate("1.1", wheels=("beta-1.1-py3-none-any.whl",)),
+            ),
+        }
+    )
+
+    with pytest.raises(CompatibilityResolutionError) as captured:
+        CompatibleResolver(strict, provider, max_observations=1).resolve(
+            parsed,
+            profile(),
+            (PackageSource.PYPI,),
+            ResolveLimits(),
+        )
+
+    assert captured.value.code is CompatibilityFailureCode.RESOURCE_LIMIT
+    assert provider.bounded_calls == [("alpha", PackageSource.PYPI, 1)]
+    assert {"alpha": "1.1", "beta": "1.0"} in [
+        pinned_versions(call[0]) for call in strict.calls
+    ]
 
 
 def test_observation_budget_stops_before_next_provider_with_resource_limit() -> None:

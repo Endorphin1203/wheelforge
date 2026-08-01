@@ -951,6 +951,10 @@ def test_cancellation_at_each_publication_boundary_never_leaves_artifact(
     assert not artifact_directory.exists() or not list(
         artifact_directory.rglob("*.zip")
     )
+    assert not (
+        artifact_directory / lease.subject_id / lease.execution_id
+    ).exists()
+    assert not (artifact_directory / lease.subject_id).exists()
     assert list(workspaces.root.iterdir()) == []
 
 
@@ -979,6 +983,10 @@ def test_artifact_file_is_compensated_when_database_publication_rolls_back(
     assert not artifact_directory.exists() or not list(
         artifact_directory.rglob("*.zip")
     )
+    assert not (
+        artifact_directory / lease.subject_id / lease.execution_id
+    ).exists()
+    assert not (artifact_directory / lease.subject_id).exists()
 
 
 class CleanupFailureWorkspace:

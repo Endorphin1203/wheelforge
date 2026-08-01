@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import stat
+import sys
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterable
@@ -60,9 +62,11 @@ from wheelforge_worker.target import TargetProfile
 from wheelforge_worker.validation import (
     ArchiveLimits,
     StaticValidationReport,
+    UnsafeWheelArchive,
     WheelArchiveValidationError,
     validate_closure,
     validate_wheel_archive,
+    validate_wheel_archive_descriptor,
 )
 
 from .errors import contains_exception, sanitize_error
@@ -305,10 +309,25 @@ class DefaultBuildStages:
         validated: list[ValidatedWheel] = []
         try:
             for wheel in wheels:
+                descriptor = _open_fd_bound_wheel(wheel.path)
+                try:
+                    report = (
+                        validate_wheel_archive(wheel.path, wheel, ArchiveLimits())
+                        if descriptor is None
+                        else validate_wheel_archive_descriptor(
+                            descriptor,
+                            wheel,
+                            ArchiveLimits(),
+                            wheel.path.parent,
+                        )
+                    )
+                finally:
+                    if descriptor is not None:
+                        os.close(descriptor)
                 validated.append(
                     ValidatedWheel(
                         wheel,
-                        validate_wheel_archive(wheel.path, wheel, ArchiveLimits()),
+                        report,
                     )
                 )
             static_report = validate_closure(resolution, wheels, target)
@@ -333,6 +352,35 @@ class DefaultBuildStages:
         external = workspace.external("artifact")
         built = ArtifactBuilder().build(context, external.path)
         return replace(built, path=Path("artifact") / built.path.name)
+
+
+def _open_fd_bound_wheel(path: Path) -> int | None:
+    absolute = Path(path).absolute()
+    parts = absolute.parts
+    prefix = (absolute.anchor, "proc", "self", "fd")
+    if len(parts) < 6 or parts[:4] != prefix:
+        return None
+    if not sys.platform.startswith("linux"):
+        raise UnsafeWheelArchive("fd-bound Wheel paths require a Linux Worker host")
+    try:
+        workspace_descriptor = int(parts[4])
+        opened_workspace = os.fstat(workspace_descriptor)
+        proc_workspace = Path(*parts[:5]).stat()
+    except (OSError, ValueError) as error:
+        raise UnsafeWheelArchive("fd-bound Wheel workspace is unavailable") from error
+    if (
+        workspace_descriptor < 0
+        or not stat.S_ISDIR(opened_workspace.st_mode)
+        or (opened_workspace.st_dev, opened_workspace.st_ino)
+        != (proc_workspace.st_dev, proc_workspace.st_ino)
+    ):
+        raise UnsafeWheelArchive("fd-bound Wheel workspace identity changed")
+    try:
+        return os.open(
+            absolute, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        )
+    except OSError as error:
+        raise UnsafeWheelArchive("fd-bound Wheel cannot be opened safely") from error
 
 
 class JobPipeline:

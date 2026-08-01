@@ -102,6 +102,52 @@ def test_compensation_deletes_only_the_exact_owned_content(
         storage.read_bytes("artifacts/a.zip")
 
 
+def test_compensation_delete_prunes_empty_execution_and_task_directories(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "data"
+    root.mkdir()
+    storage = RootedLocalStorage(root)
+    task = "20000000-0000-4000-8000-000000000031"
+    execution = "10000000-0000-4000-8000-000000000031"
+    artifact = "30000000-0000-4000-8000-000000000031"
+    published = storage.publish_bytes(
+        f"artifacts/{task}/{execution}/{artifact}.zip", b"artifact"
+    )
+
+    assert storage.delete_if_owned(published.object_key, published.sha256) is True
+
+    assert not (root / f"artifacts/{task}/{execution}").exists()
+    assert not (root / f"artifacts/{task}").exists()
+    assert (root / "artifacts").is_dir()
+
+
+def test_compensation_delete_preserves_sibling_execution_directory(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "data"
+    root.mkdir()
+    storage = RootedLocalStorage(root)
+    task = "20000000-0000-4000-8000-000000000032"
+    execution = "10000000-0000-4000-8000-000000000032"
+    sibling_execution = "10000000-0000-4000-8000-000000000033"
+    artifact = "30000000-0000-4000-8000-000000000032"
+    sibling_artifact = "30000000-0000-4000-8000-000000000033"
+    published = storage.publish_bytes(
+        f"artifacts/{task}/{execution}/{artifact}.zip", b"artifact"
+    )
+    sibling = storage.publish_bytes(
+        f"artifacts/{task}/{sibling_execution}/{sibling_artifact}.zip",
+        b"sibling",
+    )
+
+    assert storage.delete_if_owned(published.object_key, published.sha256) is True
+
+    assert not (root / f"artifacts/{task}/{execution}").exists()
+    assert storage.read_bytes(sibling.object_key) == b"sibling"
+    assert (root / f"artifacts/{task}/{sibling_execution}").is_dir()
+
+
 def test_workspace_is_a_private_generated_child_and_is_not_reused(
     tmp_path: Path,
 ) -> None:

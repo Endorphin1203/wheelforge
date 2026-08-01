@@ -289,6 +289,74 @@ class LocalFileStorageTest {
   }
 
   @Test
+  void portableArtifactDeletePrunesOnlyEmptyGeneratedDirectories() throws Exception {
+    Path root = Files.createDirectory(tempDir.resolve("portable-prune-root"));
+    String task = "20000000-0000-4000-8000-000000000031";
+    String execution = "10000000-0000-4000-8000-000000000031";
+    String key =
+        "artifacts/" + task + "/" + execution + "/30000000-0000-4000-8000-000000000031.zip";
+
+    try (var storage = ordinaryStorage(root)) {
+      storage.putAtomically(key, new ByteArrayInputStream(new byte[] {1}), 1);
+
+      storage.deleteIfExists(key);
+
+      assertThat(root.resolve("artifacts").resolve(task).resolve(execution)).doesNotExist();
+      assertThat(root.resolve("artifacts").resolve(task)).doesNotExist();
+      assertThat(root.resolve("artifacts")).isDirectory();
+    }
+  }
+
+  @Test
+  void portableArtifactDeletePreservesBarrierControlledConcurrentSibling() throws Exception {
+    Path root = Files.createDirectory(tempDir.resolve("portable-concurrent-root"));
+    String task = "20000000-0000-4000-8000-000000000032";
+    String execution = "10000000-0000-4000-8000-000000000032";
+    String first =
+        "artifacts/" + task + "/" + execution + "/30000000-0000-4000-8000-000000000032.zip";
+    String sibling =
+        "artifacts/" + task + "/" + execution + "/30000000-0000-4000-8000-000000000033.zip";
+    var stream = new BlockingInputStream(new byte[] {2});
+    var executor = Executors.newSingleThreadExecutor();
+
+    try (var storage = ordinaryStorage(root)) {
+      storage.putAtomically(first, new ByteArrayInputStream(new byte[] {1}), 1);
+      var publication = executor.submit(() -> storage.putAtomically(sibling, stream, 1));
+      assertThat(stream.readStarted.await(5, TimeUnit.SECONDS)).isTrue();
+
+      storage.deleteIfExists(first);
+      assertThat(root.resolve("artifacts").resolve(task).resolve(execution)).isDirectory();
+
+      stream.continueRead.countDown();
+      assertThat(publication.get(5, TimeUnit.SECONDS).key()).isEqualTo(sibling);
+      assertThat(storage.open(sibling).readAllBytes()).containsExactly(2);
+      assertThat(root.resolve("artifacts").resolve(task).resolve(execution)).isDirectory();
+      assertThat(root.resolve("artifacts").resolve(task)).isDirectory();
+    } finally {
+      stream.continueRead.countDown();
+      executor.shutdownNow();
+      assertThat(executor.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
+    }
+  }
+
+  @Test
+  void portableDeleteDoesNotPruneDirectoriesForNoncanonicalArtifactKey() throws Exception {
+    Path root = Files.createDirectory(tempDir.resolve("portable-noncanonical-root"));
+    String key =
+        "artifacts/not-a-task/10000000-0000-4000-8000-000000000034/"
+            + "30000000-0000-4000-8000-000000000034.zip";
+
+    try (var storage = ordinaryStorage(root)) {
+      storage.putAtomically(key, new ByteArrayInputStream(new byte[] {1}), 1);
+      storage.deleteIfExists(key);
+
+      assertThat(root.resolve("artifacts/not-a-task/10000000-0000-4000-8000-000000000034"))
+          .isDirectory();
+      assertThat(root.resolve("artifacts/not-a-task")).isDirectory();
+    }
+  }
+
+  @Test
   void fallbackRejectsEscapingKeysAndStaticSymlinkParents() throws Exception {
     Path root = Files.createDirectory(tempDir.resolve("fallback-root"));
     Path outside = Files.createDirectory(tempDir.resolve("fallback-outside"));

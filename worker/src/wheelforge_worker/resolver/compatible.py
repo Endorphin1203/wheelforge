@@ -186,9 +186,12 @@ class CompatibleResolver:
                     )
 
             candidate_options: list[_CandidateOptions] = []
-            for pin in pins:
+            attempted_candidates: set[
+                tuple[tuple[Version, ...], PackageSource]
+            ] = set()
+            for pin_index, pin in enumerate(pins):
                 self._guard(started, attempts, limits)
-                alternatives = self._discover_candidates(
+                alternatives, discovery_incomplete = self._discover_candidates(
                     pin,
                     profile,
                     source_order,
@@ -199,41 +202,43 @@ class CompatibleResolver:
                     observation_budget,
                 )
                 candidate_options.append(alternatives)
-
-            version_options = [
-                (pin.original, *options.versions)
-                for pin, options in zip(pins, candidate_options, strict=True)
-            ]
-            for versions in product(*version_options):
-                if versions == original_versions:
-                    continue
-                candidate_parsed = _rebuild_requirements(parsed, pins, versions)
-                selections = _selections(pins, versions)
-                for source in source_order:
-                    if not _source_supports_substitutions(
-                        source, pins, versions, candidate_options
-                    ):
-                        continue
-                    self._guard(started, attempts, limits)
-                    result = self._attempt(
-                        candidate_parsed,
+                if discovery_incomplete or observation_budget.remaining == 0:
+                    result = self._attempt_discovered_candidates(
+                        parsed,
                         profile,
-                        source,
-                        selections,
+                        source_order,
+                        pins,
+                        candidate_options,
                         attempts,
                         started,
                         limits,
+                        rejections,
+                        observation_budget,
+                        attempted_candidates,
                     )
                     if result is not None:
-                        return _successful_result(
-                            result,
-                            candidate_parsed,
-                            source,
-                            attempts,
-                            rejections,
-                            observation_budget,
-                            original=parsed,
+                        return result
+                    if discovery_incomplete or pin_index < len(pins) - 1:
+                        observation_budget.truncated = True
+                        raise _StopResolution(
+                            CompatibilityFailureCode.RESOURCE_LIMIT
                         )
+
+            result = self._attempt_discovered_candidates(
+                parsed,
+                profile,
+                source_order,
+                pins,
+                candidate_options,
+                attempts,
+                started,
+                limits,
+                rejections,
+                observation_budget,
+                attempted_candidates,
+            )
+            if result is not None:
+                return result
         except _StopResolution as stopped:
             raise _resolution_failure(
                 stopped.code,
@@ -244,12 +249,74 @@ class CompatibleResolver:
             ) from None
 
         raise _resolution_failure(
-            CompatibilityFailureCode.EXHAUSTED,
+            CompatibilityFailureCode.RESOURCE_LIMIT
+            if observation_budget.truncated
+            else CompatibilityFailureCode.EXHAUSTED,
             parsed,
             attempts,
             rejections,
             observation_budget,
         )
+
+    def _attempt_discovered_candidates(
+        self,
+        parsed: ParsedRequirements,
+        profile: TargetProfile,
+        source_order: tuple[PackageSource, ...],
+        pins: tuple[_RelaxablePin, ...],
+        discovered: list[_CandidateOptions],
+        attempts: list[ResolutionAttempt],
+        started: float,
+        limits: ResolveLimits,
+        rejections: _BoundedRejections,
+        observation_budget: _ObservationBudget,
+        attempted: set[tuple[tuple[Version, ...], PackageSource]],
+    ) -> ResolutionResult | None:
+        options = [
+            *discovered,
+            *(
+                _CandidateOptions((), ())
+                for _unused in range(len(pins) - len(discovered))
+            ),
+        ]
+        original_versions = tuple(pin.original for pin in pins)
+        version_options = [
+            (pin.original, *candidate_options.versions)
+            for pin, candidate_options in zip(pins, options, strict=True)
+        ]
+        for versions in product(*version_options):
+            if versions == original_versions:
+                continue
+            candidate_parsed = _rebuild_requirements(parsed, pins, versions)
+            selections = _selections(pins, versions)
+            for source in source_order:
+                key = (versions, source)
+                if key in attempted or not _source_supports_substitutions(
+                    source, pins, versions, options
+                ):
+                    continue
+                attempted.add(key)
+                self._guard(started, attempts, limits)
+                result = self._attempt(
+                    candidate_parsed,
+                    profile,
+                    source,
+                    selections,
+                    attempts,
+                    started,
+                    limits,
+                )
+                if result is not None:
+                    return _successful_result(
+                        result,
+                        candidate_parsed,
+                        source,
+                        attempts,
+                        rejections,
+                        observation_budget,
+                        original=parsed,
+                    )
+        return None
 
     def _guard(
         self,
@@ -326,9 +393,9 @@ class CompatibleResolver:
         attempts: list[ResolutionAttempt],
         rejections: _BoundedRejections,
         observation_budget: _ObservationBudget,
-    ) -> _CandidateOptions:
+    ) -> tuple[_CandidateOptions, bool]:
         observations: list[_Observation] = []
-        for source in sources:
+        for source_index, source in enumerate(sources):
             self._guard(started, attempts, limits)
             if observation_budget.remaining == 0:
                 observation_budget.truncated = True
@@ -361,10 +428,34 @@ class CompatibleResolver:
                         f"candidate provider failed: {type(error).__name__}",
                     )
                 )
-            if observation_budget.remaining == 0:
+            if (
+                observation_budget.remaining == 0
+                and source_index < len(sources) - 1
+            ):
                 observation_budget.truncated = True
-                raise _StopResolution(CompatibilityFailureCode.RESOURCE_LIMIT)
+                return (
+                    _candidate_options_for_observations(
+                        pin, profile, sources, limits, rejections, observations
+                    ),
+                    True,
+                )
 
+        return (
+            _candidate_options_for_observations(
+                pin, profile, sources, limits, rejections, observations
+            ),
+            observation_budget.truncated,
+        )
+
+
+def _candidate_options_for_observations(
+    pin: _RelaxablePin,
+    profile: TargetProfile,
+    sources: tuple[PackageSource, ...],
+    limits: ResolveLimits,
+    rejections: _BoundedRejections,
+    observations: list[_Observation],
+) -> _CandidateOptions:
         original_is_yanked = {
             source: any(
                 observation.source is source

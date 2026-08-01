@@ -322,6 +322,7 @@ class RootedLocalStorage:
         if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
             return False
         parts = _object_key_parts(object_key)
+        deleted = False
         try:
             parent = self._open_parent(parts[:-1], create=False)
         except FileNotFoundError:
@@ -342,11 +343,22 @@ class RootedLocalStorage:
                     return False
                 _unlink_named(parent, parts[-1])
                 _fsync_parent(parent)
-                return True
+                deleted = True
             finally:
                 os.close(descriptor)
         finally:
             parent.close()
+        artifact = _GENERATED_ARTIFACT.fullmatch(object_key)
+        if deleted and artifact is not None and artifact.group("owner") is not None:
+            root_descriptor = self._duplicate_root()
+            try:
+                _prune_artifact_directories(
+                    root_descriptor,
+                    {(artifact.group("task"), artifact.group("owner"))},
+                )
+            finally:
+                os.close(root_descriptor)
+        return deleted
 
     def _publish(
         self,

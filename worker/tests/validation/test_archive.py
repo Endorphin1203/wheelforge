@@ -31,6 +31,7 @@ from wheelforge_worker.validation.archive import (
     WheelArchiveValidationError,
     WheelRecordMismatch,
     validate_wheel_archive,
+    validate_wheel_archive_descriptor,
 )
 
 
@@ -228,6 +229,31 @@ def test_valid_wheel_reports_static_metadata(tmp_path: Path) -> None:
     assert report.requires_dist == ("dep>=1",)
     assert report.tags == frozenset({Tag("py3", "none", "any")})
     assert report.entry_count == 4
+
+
+def test_descriptor_validation_accepts_exact_file_without_trusting_path_ancestors(
+    tmp_path: Path,
+) -> None:
+    owned = tmp_path / "owned"
+    owned.mkdir()
+    path = make_wheel(owned)
+    unsafe_parent = tmp_path / "linked"
+    unsafe_parent.symlink_to(owned, target_is_directory=True)
+    expected = replace(observed(path), path=unsafe_parent / path.name)
+    snapshots = tmp_path / "snapshots"
+    snapshots.mkdir()
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+
+    try:
+        report = validate_wheel_archive_descriptor(
+            descriptor, expected, ArchiveLimits(), snapshots
+        )
+        assert report.name == "demo"
+        assert report.snapshot is not None
+        os.fstat(descriptor)
+        report.snapshot.cleanup()
+    finally:
+        os.close(descriptor)
 
 
 @pytest.mark.parametrize("field", ["path", "filename", "byte_size", "sha256"])

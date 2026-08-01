@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.channels.Channels;
 import java.nio.channels.SeekableByteChannel;
+import java.nio.file.DirectoryNotEmptyException;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
@@ -13,6 +14,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 
@@ -24,9 +26,17 @@ final class PortableFileStorageBackend implements LocalStorageBackend {
       Set.of(StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS);
 
   private final Path realRoot;
+  private final Object rootIdentity;
 
   PortableFileStorageBackend(Path realRoot) {
     this.realRoot = realRoot;
+    try {
+      BasicFileAttributes attributes = identifiedDirectory(realRoot);
+      rootIdentity = attributes.fileKey();
+    } catch (IOException exception) {
+      throw new LocalFileStorage.StorageException(
+          "Portable storage requires stable filesystem identities", exception);
+    }
   }
 
   @Override
@@ -86,12 +96,48 @@ final class PortableFileStorageBackend implements LocalStorageBackend {
       }
       requireRegularObject(object);
       Files.delete(object);
+      pruneGeneratedArtifactDirectories(objectKey);
     } catch (NoSuchFileException ignored) {
       // Deletion is idempotent.
     } catch (IllegalArgumentException exception) {
       throw exception;
     } catch (IOException exception) {
       throw new LocalFileStorage.StorageException("Could not delete local object", exception);
+    }
+  }
+
+  private void pruneGeneratedArtifactDirectories(StorageObjectKey objectKey) throws IOException {
+    GeneratedArtifactPath generated = GeneratedArtifactPath.parse(objectKey.relative());
+    if (generated == null) {
+      return;
+    }
+    Path artifacts = validateExistingParent(Path.of("artifacts"));
+    Path task = resolveWithinRoot(artifacts, Path.of(generated.task()));
+    BasicFileAttributes taskIdentity;
+    try {
+      taskIdentity = identifiedDirectory(task);
+    } catch (NoSuchFileException ignored) {
+      return;
+    }
+    Path execution = resolveWithinRoot(task, Path.of(generated.execution()));
+    try {
+      deleteEmptyDirectoryWithIdentity(execution, identifiedDirectory(execution));
+    } catch (NoSuchFileException ignored) {
+      // A concurrent compensation already removed the execution directory.
+    }
+    deleteEmptyDirectoryWithIdentity(task, taskIdentity);
+  }
+
+  private static void deleteEmptyDirectoryWithIdentity(Path directory, BasicFileAttributes expected)
+      throws IOException {
+    try {
+      BasicFileAttributes current = identifiedDirectory(directory);
+      if (!Objects.equals(current.fileKey(), expected.fileKey())) {
+        throw new IllegalArgumentException("Generated artifact directory identity changed");
+      }
+      Files.delete(directory);
+    } catch (NoSuchFileException | DirectoryNotEmptyException ignored) {
+      // Concurrent removal or sibling content keeps the generated directory safe.
     }
   }
 
@@ -141,7 +187,10 @@ final class PortableFileStorageBackend implements LocalStorageBackend {
 
   private void validateRoot() {
     try {
-      requireSafeDirectory(realRoot);
+      BasicFileAttributes current = identifiedDirectory(realRoot);
+      if (!Objects.equals(current.fileKey(), rootIdentity)) {
+        throw new IllegalArgumentException("Storage root identity changed");
+      }
       if (!realRoot.toRealPath().equals(realRoot)) {
         throw new IllegalArgumentException("Storage root no longer resolves to its startup path");
       }
@@ -162,14 +211,22 @@ final class PortableFileStorageBackend implements LocalStorageBackend {
   }
 
   private void requireSafeDirectory(Path directory) throws IOException {
+    identifiedDirectory(directory);
+    if (!directory.toRealPath().startsWith(realRoot)) {
+      throw new IllegalArgumentException("Object key escapes the storage root");
+    }
+  }
+
+  private static BasicFileAttributes identifiedDirectory(Path directory) throws IOException {
     BasicFileAttributes attributes =
         Files.readAttributes(directory, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
     if (attributes.isSymbolicLink() || !attributes.isDirectory()) {
       throw new IllegalArgumentException("Object key contains an unsafe directory");
     }
-    if (!directory.toRealPath().startsWith(realRoot)) {
-      throw new IllegalArgumentException("Object key escapes the storage root");
+    if (attributes.fileKey() == null) {
+      throw new IllegalArgumentException("Portable storage requires stable filesystem identities");
     }
+    return attributes;
   }
 
   private void requireRegularObject(Path object) throws IOException {

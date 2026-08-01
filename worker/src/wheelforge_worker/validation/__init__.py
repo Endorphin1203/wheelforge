@@ -9,6 +9,7 @@ from .archive import (
     WheelArchiveValidationError,
     WheelRecordMismatch,
     validate_wheel_archive,
+    validate_wheel_archive_descriptor,
 )
 
 __all__ = [
@@ -25,4 +26,5 @@ __all__ = [
     "WheelRecordMismatch",
     "validate_closure",
     "validate_wheel_archive",
+    "validate_wheel_archive_descriptor",
 ]
