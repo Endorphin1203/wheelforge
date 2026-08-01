@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
+from packaging.utils import canonicalize_name
 from sqlalchemy import (
     JSON,
     BigInteger,
@@ -42,6 +43,11 @@ from .storage import PublishedObject
 
 
 metadata = MetaData()
+MAX_RESOLVED_PACKAGES = 500
+MAX_PACKAGE_AUDIT_BYTES = 4096
+MAX_BUILD_AUDIT_BYTES = 6000
+_AUDIT_SECTION_BYTES = 1600
+_BUILD_AUDIT_SECTION_BYTES = 2600
 
 requirement_files = Table(
     "requirement_files",
@@ -791,8 +797,45 @@ class JobRepository:
             )
 
     def persist_resolution(self, lease: JobLease, resolution: ResolutionResult) -> None:
+        if len(resolution.packages) > MAX_RESOLVED_PACKAGES:
+            raise ValueError("resolved package count exceeds the limit")
         changes = {change.package: change for change in resolution.changes}
-        audit = _resolution_audit(resolution)
+        audits = _package_resolution_audits(
+            resolution, tuple(package.name for package in resolution.packages)
+        )
+        summary_audit = _resolution_summary_audit(resolution)
+        rows: list[dict[str, Any]] = []
+        for package in resolution.packages:
+            change = changes.get(package.name)
+            rows.append(
+                {
+                    "id": str(self._uuid_factory()),
+                    "build_task_id": lease.subject_id,
+                    "normalized_name": package.name,
+                    "final_version": str(package.version),
+                    "dependency_type": "DIRECT" if package.requested else "TRANSITIVE",
+                    "original_constraint": (
+                        change.original_constraint if change else None
+                    ),
+                    "strict_version": (
+                        str(change.original_version)
+                        if change and change.original_version is not None
+                        else None
+                    ),
+                    "change_direction": (
+                        change.kind.value
+                        if change is not None
+                        else VersionChangeKind.UNCHANGED.value
+                    ),
+                    "change_reason": change.reason if change else None,
+                    "attempts_json": audits[canonicalize_name(package.name)],
+                    "wheel_filename": package.wheel_filename,
+                    "package_source_code": (
+                        resolution.source.value if resolution.source else None
+                    ),
+                    "wheel_status": "RESOLVED",
+                }
+            )
         now = self._clock()
         with self.engine.begin() as connection:
             if not self._owns(connection, lease, now):
@@ -802,37 +845,17 @@ class JobRepository:
                     resolved_packages.c.build_task_id == lease.subject_id
                 )
             )
-            for package in resolution.packages:
-                change = changes.get(package.name)
-                connection.execute(
-                    insert(resolved_packages).values(
-                        id=str(self._uuid_factory()),
-                        build_task_id=lease.subject_id,
-                        normalized_name=package.name,
-                        final_version=str(package.version),
-                        dependency_type="DIRECT" if package.requested else "TRANSITIVE",
-                        original_constraint=(
-                            change.original_constraint if change else None
-                        ),
-                        strict_version=(
-                            str(change.original_version)
-                            if change and change.original_version is not None
-                            else None
-                        ),
-                        change_direction=(
-                            change.kind.value
-                            if change is not None
-                            else VersionChangeKind.UNCHANGED.value
-                        ),
-                        change_reason=(change.reason if change else None),
-                        attempts_json=audit,
-                        wheel_filename=package.wheel_filename,
-                        package_source_code=(
-                            resolution.source.value if resolution.source else None
-                        ),
-                        wheel_status="RESOLVED",
-                    )
-                )
+            if rows:
+                connection.execute(insert(resolved_packages), rows)
+            self._append_log(
+                connection,
+                lease,
+                "RESOLUTION_AUDIT",
+                "INFO",
+                "Resolution audit recorded",
+                {"audit": summary_audit},
+                now,
+            )
 
     def persist_package_results(
         self,
@@ -964,8 +987,12 @@ class JobRepository:
     def maintenance_snapshot(self) -> MaintenanceSnapshot:
         now = self._clock()
         with self.engine.connect() as connection:
-            active = connection.scalars(
-                select(build_jobs.c.execution_id).where(
+            active = connection.execute(
+                select(
+                    build_jobs.c.execution_id,
+                    build_jobs.c.job_type,
+                    build_jobs.c.subject_id,
+                ).where(
                     build_jobs.c.status == "RUNNING",
                     build_jobs.c.execution_id.is_not(None),
                     build_jobs.c.lease_expires_at > now,
@@ -975,7 +1002,10 @@ class JobRepository:
                 select(artifacts.c.object_key).where(artifacts.c.cleaned_at.is_(None))
             ).all()
         return MaintenanceSnapshot(
-            frozenset(str(value) for value in active if value is not None),
+            frozenset(str(row.execution_id) for row in active),
+            frozenset(
+                str(row.subject_id) for row in active if row.job_type == "BUILD"
+            ),
             frozenset(str(value) for value in referenced),
         )
 
@@ -1222,27 +1252,172 @@ def _bounded(value: str, limit: int) -> str:
     return sanitized[:limit]
 
 
-def _resolution_audit(resolution: ResolutionResult) -> list[dict[str, Any]]:
-    attempts = [
+def _package_resolution_audit(
+    resolution: ResolutionResult, package: str
+) -> dict[str, Any]:
+    return _package_resolution_audits(resolution, (package,))[canonicalize_name(package)]
+
+
+def _resolution_summary_audit(resolution: ResolutionResult) -> dict[str, Any]:
+    attempt_entries = [
         {
             "source": attempt.source.value,
             "failure": attempt.failure.value if attempt.failure else None,
-            "reason": sanitize_text(attempt.reason, limit=1000),
+            "reason": _json_string_prefix(
+                sanitize_text(attempt.reason, limit=1000), 240
+            ),
+            "selectionCount": len(attempt.selections),
             "selections": [
-                {"package": item.package, "version": str(item.version)}
-                for item in attempt.selections[:500]
+                {
+                    "package": _json_string_prefix(
+                        canonicalize_name(selection.package), 120
+                    ),
+                    "version": _json_string_prefix(str(selection.version), 120),
+                }
+                for selection in attempt.selections[:2]
             ],
         }
-        for attempt in resolution.attempts[:100]
+        for attempt in resolution.attempts
     ]
-    rejections = [
+    rejection_entries = [
         {
-            "package": item.package,
-            "version": item.version,
+            "package": _json_string_prefix(canonicalize_name(item.package), 120),
+            "version": _json_string_prefix(item.version, 120),
             "source": item.source.value,
             "code": item.code.value,
-            "reason": sanitize_text(item.reason, limit=1000),
+            "reason": _json_string_prefix(
+                sanitize_text(item.reason, limit=1000), 240
+            ),
         }
-        for item in resolution.rejections[:2000]
+        for item in resolution.rejections
     ]
-    return [{"attempts": attempts, "rejections": rejections}]
+    attempts = _fit_audit_entries(attempt_entries, _BUILD_AUDIT_SECTION_BYTES)
+    rejections = _fit_audit_entries(
+        rejection_entries, _BUILD_AUDIT_SECTION_BYTES
+    )
+    audit: dict[str, Any] = {
+        "version": 1,
+        "totals": {
+            "attempts": len(attempt_entries),
+            "rejections": len(rejection_entries),
+        },
+        "attempts": attempts,
+        "rejections": rejections,
+        "omitted": {
+            "attempts": len(attempt_entries) - len(attempts),
+            "rejections": len(rejection_entries) - len(rejections),
+        },
+    }
+    while _json_bytes(audit) > MAX_BUILD_AUDIT_BYTES:
+        if audit["rejections"]:
+            audit["rejections"].pop()
+            audit["omitted"]["rejections"] += 1
+        elif audit["attempts"]:
+            audit["attempts"].pop()
+            audit["omitted"]["attempts"] += 1
+        else:
+            raise ValueError("resolution audit metadata exceeds the byte limit")
+    return audit
+
+
+def _package_resolution_audits(
+    resolution: ResolutionResult, packages: tuple[str, ...]
+) -> dict[str, dict[str, Any]]:
+    requested = {canonicalize_name(package) for package in packages}
+    attempt_entries: dict[str, list[dict[str, Any]]] = {
+        package: [] for package in requested
+    }
+    for attempt in resolution.attempts:
+        reason = _json_string_prefix(sanitize_text(attempt.reason, limit=1000), 300)
+        for selection in attempt.selections:
+            package = canonicalize_name(selection.package)
+            if package not in requested:
+                continue
+            attempt_entries[package].append(
+                {
+                    "source": attempt.source.value,
+                    "failure": attempt.failure.value if attempt.failure else None,
+                    "selectedVersion": _json_string_prefix(
+                        str(selection.version), 200
+                    ),
+                    "reason": reason,
+                }
+            )
+    rejection_entries: dict[str, list[dict[str, Any]]] = {
+        package: [] for package in requested
+    }
+    for item in resolution.rejections:
+        package = canonicalize_name(item.package)
+        if package not in requested:
+            continue
+        rejection_entries[package].append({
+            "version": _json_string_prefix(item.version, 200),
+            "source": item.source.value,
+            "code": item.code.value,
+            "reason": _json_string_prefix(
+                sanitize_text(item.reason, limit=1000), 300
+            ),
+        })
+    return {
+        package: _build_package_resolution_audit(
+            package, attempt_entries[package], rejection_entries[package]
+        )
+        for package in requested
+    }
+
+
+def _build_package_resolution_audit(
+    package: str,
+    attempt_entries: list[dict[str, Any]],
+    rejection_entries: list[dict[str, Any]],
+) -> dict[str, Any]:
+    attempts = _fit_audit_entries(attempt_entries, _AUDIT_SECTION_BYTES)
+    rejections = _fit_audit_entries(rejection_entries, _AUDIT_SECTION_BYTES)
+    audit: dict[str, Any] = {
+        "version": 1,
+        "package": _json_string_prefix(package, 300),
+        "attempts": attempts,
+        "rejections": rejections,
+        "omitted": {
+            "attempts": len(attempt_entries) - len(attempts),
+            "rejections": len(rejection_entries) - len(rejections),
+        },
+    }
+    while _json_bytes(audit) > MAX_PACKAGE_AUDIT_BYTES:
+        if audit["rejections"]:
+            audit["rejections"].pop()
+            audit["omitted"]["rejections"] += 1
+        elif audit["attempts"]:
+            audit["attempts"].pop()
+            audit["omitted"]["attempts"] += 1
+        else:
+            raise ValueError("package audit metadata exceeds the byte limit")
+    return audit
+
+
+def _fit_audit_entries(
+    entries: list[dict[str, Any]], byte_limit: int
+) -> list[dict[str, Any]]:
+    included: list[dict[str, Any]] = []
+    for entry in entries:
+        candidate = [*included, entry]
+        if _json_bytes(candidate) > byte_limit:
+            break
+        included.append(entry)
+    return included
+
+
+def _json_string_prefix(value: str, byte_limit: int) -> str:
+    result: list[str] = []
+    size = 0
+    for character in value:
+        encoded_size = len(json.dumps(character, ensure_ascii=True).encode("utf-8")) - 2
+        if size + encoded_size > byte_limit:
+            break
+        result.append(character)
+        size += encoded_size
+    return "".join(result)
+
+
+def _json_bytes(value: object) -> int:
+    return len(json.dumps(value, ensure_ascii=True).encode("utf-8"))

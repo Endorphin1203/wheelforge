@@ -30,6 +30,7 @@ class JobConsumer:
         *,
         poll_seconds: int,
         wait: Callable[[float], bool | None] = time.sleep,
+        maintenance: Callable[[], object] | None = None,
     ) -> None:
         if not worker_id or len(worker_id) > 100:
             raise ValueError("worker_id must contain at most 100 characters")
@@ -40,6 +41,7 @@ class JobConsumer:
         self._worker_id = worker_id
         self._poll_seconds = poll_seconds
         self._wait = wait
+        self._maintenance = maintenance or _no_maintenance
 
     def run_once(self) -> bool:
         lease = self._repository.claim_next(self._worker_id)
@@ -59,6 +61,7 @@ class JobConsumer:
 
     def run_forever(self) -> None:
         while True:
+            self._maintenance()
             if self.run_once():
                 continue
             if self._wait(float(self._poll_seconds)):
@@ -79,3 +82,7 @@ def build_consumer(
         poll_seconds=poll_seconds,
         wait=wait,
     )
+
+
+def _no_maintenance() -> None:
+    pass

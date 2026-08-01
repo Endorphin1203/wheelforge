@@ -1,7 +1,9 @@
 from pathlib import Path
+from threading import Event
 
 import pytest
 
+from wheelforge_worker.__main__ import create_consumer
 from wheelforge_worker.settings import Settings
 
 
@@ -135,3 +137,42 @@ def test_settings_reject_maintenance_age_under_one_hour(
 
     with pytest.raises(ValueError, match="at least 3600 seconds"):
         Settings.from_env()
+
+
+def test_settings_preserves_configured_root_symlink_for_adapter_validation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    configure_environment(monkeypatch, tmp_path)
+    target = tmp_path / "real-data"
+    target.mkdir()
+    configured = tmp_path / "data-link"
+    configured.symlink_to(target, target_is_directory=True)
+    (tmp_path / "work").mkdir()
+    monkeypatch.setenv("WF_DATA_ROOT", str(configured))
+
+    settings = Settings.from_env()
+
+    assert settings.data_root == configured
+    assert settings.data_root.is_symlink()
+    with pytest.raises(ValueError, match="data root must not traverse links"):
+        create_consumer(settings, Event())
+
+
+def test_create_consumer_rejects_root_beneath_linked_ancestor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    configure_environment(monkeypatch, tmp_path)
+    real_parent = tmp_path / "real-parent"
+    data = real_parent / "data"
+    data.mkdir(parents=True)
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.setenv("WF_DATA_ROOT", str(linked_parent / "data"))
+
+    settings = Settings.from_env()
+
+    assert settings.data_root == linked_parent / "data"
+    with pytest.raises(ValueError, match="data root must not traverse links"):
+        create_consumer(settings, Event())

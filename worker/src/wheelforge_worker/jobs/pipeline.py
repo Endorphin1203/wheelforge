@@ -59,7 +59,12 @@ from wheelforge_worker.validation import (
 )
 
 from .errors import contains_exception, sanitize_error
-from .repository import JobLease, JobRepository, LostLeaseError
+from .repository import (
+    MAX_RESOLVED_PACKAGES,
+    JobLease,
+    JobRepository,
+    LostLeaseError,
+)
 from .heartbeat import LeaseHeartbeat
 from .storage import RootedLocalStorage, WorkspaceManager
 
@@ -78,6 +83,10 @@ _HeartbeatWait = Callable[[Event, float], bool]
 class PipelineResult:
     status: BuildStatus
     artifact_id: str | None
+
+
+class SubjectIntegrityError(ValueError):
+    pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -349,16 +358,24 @@ class JobPipeline:
                 payload.original_object_key != subject.original_object_key
                 or payload.normalized_object_key != subject.normalized_object_key
             ):
-                raise ValueError("parse payload disagrees with database subject")
+                raise SubjectIntegrityError(
+                    "parse payload disagrees with database subject"
+                )
             original = self._storage.read_bytes(subject.original_object_key)
             _require_file_observation(
                 original, subject.size_bytes, subject.sha256, "original requirements"
             )
             parsed = parse_requirements(original)
-            published = self._storage.publish_or_reuse_bytes(
-                subject.normalized_object_key,
-                parsed.normalized_text.encode("utf-8"),
-            )
+            try:
+                published = self._storage.publish_or_reuse_bytes(
+                    subject.normalized_object_key,
+                    parsed.normalized_text.encode("utf-8"),
+                    owner_execution_id=lease.execution_id,
+                )
+            except FileExistsError as error:
+                raise SubjectIntegrityError(
+                    "normalized requirements object conflicts with parsed content"
+                ) from error
             completed = self._repository.complete_parse(
                 lease, parsed, subject.normalized_object_key
             )
@@ -368,6 +385,12 @@ class JobPipeline:
         except RequirementsParseError as error:
             self._repository.fail_terminal(
                 lease, "INVALID_REQUIREMENTS", sanitize_error(error)
+            )
+            return PipelineResult(BuildStatus.FAILED, None)
+        except SubjectIntegrityError as error:
+            code = "PARSE_SUBJECT_INTEGRITY_FAILURE"
+            self._repository.fail_terminal(
+                lease, code, f"{code}: {sanitize_error(error)}"
             )
             return PipelineResult(BuildStatus.FAILED, None)
         except BaseException as error:
@@ -380,18 +403,16 @@ class JobPipeline:
                 )
             if isinstance(error, (KeyboardInterrupt, SystemExit)):
                 raise
-            self._repository.retry_or_fail(
-                lease,
-                sanitize_error(error),
-                retryable=not isinstance(error, LostLeaseError),
+            if _contains_lost_lease(error):
+                return PipelineResult(BuildStatus.FAILED, None)
+            retryable = _retryable(error)
+            updated = self._repository.retry_or_fail(
+                lease, sanitize_error(error), retryable=retryable
             )
-            status = (
-                BuildStatus.QUEUED
-                if lease.attempts < lease.max_attempts
-                and not isinstance(error, LostLeaseError)
-                else BuildStatus.FAILED
+            queued = updated and retryable and lease.attempts < lease.max_attempts
+            return PipelineResult(
+                BuildStatus.QUEUED if queued else BuildStatus.FAILED, None
             )
-            return PipelineResult(status, None)
 
     def _run_build(self, lease: JobLease, payload: BuildPayload) -> PipelineResult:
         subject = self._repository.claim_build_subject(lease)
@@ -438,7 +459,12 @@ class JobPipeline:
                 lease,
                 lambda: self._stages.resolve(parsed, target, owned_workspace.path),
             )
-            self._repository.persist_resolution(lease, resolution)
+            if len(resolution.packages) > MAX_RESOLVED_PACKAGES:
+                raise ValueError("resolved package count exceeds the limit")
+            self._during_lease(
+                lease,
+                lambda: self._repository.persist_resolution(lease, resolution),
+            )
             cancelled = self._cancel_if_requested(lease)
             if cancelled is not None:
                 return cancelled
@@ -520,7 +546,11 @@ class JobPipeline:
             object_key = f"artifacts/{lease.subject_id}/{artifact_id}.zip"
             published = self._during_lease(
                 lease,
-                lambda: self._storage.publish_file(object_key, built.path),
+                lambda: self._storage.publish_file(
+                    object_key,
+                    built.path,
+                    owner_execution_id=lease.execution_id,
+                ),
             )
             if published.sha256 != built.sha256:
                 raise OSError("artifact digest changed during local publication")
@@ -611,7 +641,9 @@ def _require_file_observation(
     content: bytes, expected_size: int, expected_sha256: str, label: str
 ) -> None:
     if len(content) != expected_size or hashlib.sha256(content).hexdigest() != expected_sha256:
-        raise ValueError(f"{label} does not match its database observation")
+        raise SubjectIntegrityError(
+            f"{label} does not match its database observation"
+        )
 
 
 def _retryable(error: BaseException) -> bool:

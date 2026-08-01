@@ -17,10 +17,12 @@ from uuid import UUID, uuid4
 _DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
 _CHUNK_SIZE = 64 * 1024
 _UUID_PATTERN = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
-_GENERATED_STAGE = re.compile(rf"\.wf-stage-{_UUID_PATTERN}\Z")
+_GENERATED_STAGE = re.compile(
+    rf"\.wf-stage-(?:(?P<owner>{_UUID_PATTERN})-)?{_UUID_PATTERN}\Z"
+)
 _GENERATED_WORKSPACE = re.compile(rf"wf-execution-({_UUID_PATTERN})\Z")
 _GENERATED_ARTIFACT = re.compile(
-    rf"artifacts/{_UUID_PATTERN}/{_UUID_PATTERN}\.zip\Z"
+    rf"artifacts/(?P<task>{_UUID_PATTERN})/{_UUID_PATTERN}\.zip\Z"
 )
 
 
@@ -76,16 +78,32 @@ class RootedLocalStorage:
         finally:
             parent.close()
 
-    def publish_bytes(self, object_key: str, content: bytes) -> PublishedObject:
+    def publish_bytes(
+        self,
+        object_key: str,
+        content: bytes,
+        *,
+        owner_execution_id: str | None = None,
+    ) -> PublishedObject:
         if not isinstance(content, bytes):
             raise TypeError("content must be bytes")
-        return self._publish(object_key, lambda handle: _write_bytes(handle, content))
+        return self._publish(
+            object_key,
+            lambda handle: _write_bytes(handle, content),
+            owner_execution_id=owner_execution_id,
+        )
 
     def publish_or_reuse_bytes(
-        self, object_key: str, content: bytes
+        self,
+        object_key: str,
+        content: bytes,
+        *,
+        owner_execution_id: str | None = None,
     ) -> PublishedObject:
         try:
-            return self.publish_bytes(object_key, content)
+            return self.publish_bytes(
+                object_key, content, owner_execution_id=owner_execution_id
+            )
         except FileExistsError:
             observed = self.read_bytes(object_key)
             digest = hashlib.sha256(content).hexdigest()
@@ -93,7 +111,13 @@ class RootedLocalStorage:
                 raise
             return PublishedObject(object_key, len(content), digest)
 
-    def publish_file(self, object_key: str, source: Path) -> PublishedObject:
+    def publish_file(
+        self,
+        object_key: str,
+        source: Path,
+        *,
+        owner_execution_id: str | None = None,
+    ) -> PublishedObject:
         source = Path(source)
 
         def copy(handle: BinaryIO) -> tuple[int, str]:
@@ -116,7 +140,9 @@ class RootedLocalStorage:
             finally:
                 os.close(source_descriptor)
 
-        return self._publish(object_key, copy)
+        return self._publish(
+            object_key, copy, owner_execution_id=owner_execution_id
+        )
 
     def delete_if_owned(self, object_key: str, expected_sha256: str) -> bool:
         if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
@@ -152,10 +178,15 @@ class RootedLocalStorage:
         self,
         object_key: str,
         writer: Callable[[BinaryIO], tuple[int, str]],
+        *,
+        owner_execution_id: str | None,
     ) -> PublishedObject:
         parts = _object_key_parts(object_key)
         parent = self._open_parent(parts[:-1], create=True)
-        stage_name = f".wf-stage-{self._uuid_factory()}"
+        owner = str(UUID(owner_execution_id)) if owner_execution_id else None
+        stage_name = ".wf-stage-{}{}".format(
+            f"{owner}-" if owner else "", self._uuid_factory()
+        )
         descriptor: int | None = None
         staged = False
         try:
@@ -228,6 +259,7 @@ class RootedLocalStorage:
         referenced_artifact_keys: frozenset[str],
         *,
         active_execution_ids: frozenset[str],
+        active_build_task_ids: frozenset[str],
     ) -> None:
         self._require_root()
         cutoff_timestamp = cutoff.timestamp()
@@ -243,13 +275,19 @@ class RootedLocalStorage:
             relative_directory = Path(directory).relative_to(self.root)
             for name in filenames:
                 relative = (relative_directory / name).as_posix()
-                generated_stage = _GENERATED_STAGE.fullmatch(name) is not None
-                generated_artifact = _GENERATED_ARTIFACT.fullmatch(relative) is not None
-                if not generated_stage and not generated_artifact:
+                stage_match = _GENERATED_STAGE.fullmatch(name)
+                artifact_match = _GENERATED_ARTIFACT.fullmatch(relative)
+                if stage_match is None and artifact_match is None:
                     continue
-                if active_execution_ids:
+                if (
+                    stage_match is not None
+                    and stage_match.group("owner") in active_execution_ids
+                ):
                     continue
-                if generated_artifact and relative in referenced_artifact_keys:
+                if artifact_match is not None and (
+                    relative in referenced_artifact_keys
+                    or artifact_match.group("task") in active_build_task_ids
+                ):
                     continue
                 status = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
                 if not stat.S_ISREG(status.st_mode) or status.st_mtime > cutoff_timestamp:
@@ -400,6 +438,9 @@ def _require_supported_host() -> None:
 def _require_stable_root(path: Path, label: str) -> Path:
     if not path.is_absolute():
         raise ValueError(f"{label} must be absolute")
+    configured_status = path.lstat()
+    if stat.S_ISLNK(configured_status.st_mode) or _is_reparse(configured_status):
+        raise ValueError(f"{label} must not traverse links")
     _require_plain_directory(path)
     current = path
     while current != current.parent:

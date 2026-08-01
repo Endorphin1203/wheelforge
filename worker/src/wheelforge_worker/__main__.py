@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import signal
 import threading
+import os
 from datetime import timedelta
 
 from sqlalchemy import create_engine
@@ -26,12 +27,15 @@ def create_consumer(settings: Settings, stop: threading.Event) -> JobConsumer:
     )
     storage = RootedLocalStorage(settings.data_root)
     workspaces = WorkspaceManager(settings.workspace_root)
-    MaintenanceService(
+    if os.path.samefile(storage.root, workspaces.root):
+        raise ValueError("WF_DATA_ROOT and WF_WORKSPACE_ROOT must be different")
+    maintenance = MaintenanceService(
         repository,
         storage,
         workspaces,
         minimum_age=timedelta(seconds=settings.maintenance_age_seconds),
-    ).run()
+    )
+    maintenance.run()
     pipeline = JobPipeline(
         repository,
         storage,
@@ -44,6 +48,7 @@ def create_consumer(settings: Settings, stop: threading.Event) -> JobConsumer:
         settings.worker_id,
         poll_seconds=settings.queue_poll_seconds,
         wait=stop.wait,
+        maintenance=maintenance.run_if_due,
     )
 
 

@@ -9,11 +9,15 @@ from uuid import UUID
 import pytest
 from packaging.tags import Tag
 from packaging.version import Version
-from sqlalchemy import create_engine, insert, select, update
+from sqlalchemy import create_engine, func, insert, select, update
 from sqlalchemy.dialects import mysql
 from sqlalchemy.pool import StaticPool
 
+import wheelforge_worker.jobs.repository as repository_module
 from wheelforge_worker.jobs.repository import (
+    MAX_BUILD_AUDIT_BYTES,
+    MAX_PACKAGE_AUDIT_BYTES,
+    MAX_RESOLVED_PACKAGES,
     JobRepository,
     LostLeaseError,
     artifacts,
@@ -28,6 +32,8 @@ from wheelforge_worker.jobs.repository import (
 from wheelforge_worker.jobs.storage import PublishedObject
 from wheelforge_worker.download import DownloadedWheel
 from wheelforge_worker.resolver import (
+    CandidateRejection,
+    CandidateRejectionCode,
     CandidateSelection,
     CompatibilityFailureCode,
     ResolutionAttempt,
@@ -489,9 +495,151 @@ def test_package_audit_persists_attempts_and_final_static_outcomes() -> None:
                 resolved_packages.c.attempts_json,
             ).order_by(resolved_packages.c.normalized_name)
         ).mappings().all()
+        audit_logs = connection.execute(
+            select(build_logs.c.stage, build_logs.c.context_json).where(
+                build_logs.c.stage == "RESOLUTION_AUDIT"
+            )
+        ).all()
     assert rows[0]["wheel_status"] == "STATIC_PASSED"
     assert rows[0]["sha256"] == "b" * 64
     assert rows[0]["wheel_tags"] == ["py3-none-any"]
     assert rows[0]["attempts_json"]
     assert rows[1]["wheel_status"] == "MISSING"
     assert rows[1]["error_message"] == "no target Wheel"
+    assert len(audit_logs) == 1
+    assert len(json.dumps(audit_logs[0].context_json).encode("utf-8")) <= 8000
+
+
+def test_package_audit_is_filtered_explainable_and_strictly_byte_bounded() -> None:
+    alpha = ResolvedPackage(
+        "alpha", Version("1.0"), True, "https://example/alpha", "alpha.whl", (), None, ()
+    )
+    attempts = tuple(
+        ResolutionAttempt(
+            (
+                CandidateSelection("alpha", Version(f"1.{index}")),
+                CandidateSelection("beta", Version(f"2.{index}")),
+            ),
+            PackageSource.PYPI,
+            CompatibilityFailureCode.STRICT_RESOLUTION,
+            "失败" * 1000,
+        )
+        for index in range(100)
+    )
+    rejections = tuple(
+        CandidateRejection(
+            "alpha" if index % 2 == 0 else "beta",
+            f"alpha-only-{index}" if index % 2 == 0 else f"beta-only-{index}",
+            PackageSource.ALIYUN,
+            CandidateRejectionCode.NO_TARGET_WHEEL,
+            "拒绝" * 1000,
+        )
+        for index in range(2000)
+    )
+    resolution = ResolutionResult("1", (alpha,), attempts, rejections)
+
+    audit = repository_module._package_resolution_audit(resolution, "alpha")
+    encoded = json.dumps(audit, ensure_ascii=True).encode("utf-8")
+
+    assert len(encoded) <= MAX_PACKAGE_AUDIT_BYTES
+    assert audit["package"] == "alpha"
+    assert audit["omitted"]["attempts"] > 0
+    assert audit["omitted"]["rejections"] > 0
+    assert "beta-only" not in encoded.decode("ascii")
+    assert any(item["selectedVersion"] == "1.0" for item in audit["attempts"])
+
+
+def test_worst_case_package_audit_total_growth_has_a_fixed_upper_bound() -> None:
+    packages = tuple(
+        ResolvedPackage(
+            f"package-{index}",
+            Version("1.0"),
+            True,
+            "https://example.invalid/wheel",
+            f"package-{index}-1.0-py3-none-any.whl",
+            (),
+            None,
+            (),
+        )
+        for index in range(MAX_RESOLVED_PACKAGES)
+    )
+    selections = tuple(
+        CandidateSelection(package.name, package.version) for package in packages
+    )
+    resolution = ResolutionResult(
+        "1",
+        packages,
+        attempts=(
+            ResolutionAttempt(
+                selections,
+                PackageSource.PYPI,
+                CompatibilityFailureCode.STRICT_RESOLUTION,
+                "x" * 10000,
+            ),
+        ),
+    )
+
+    total = sum(
+        len(
+            json.dumps(
+                repository_module._package_resolution_audit(resolution, package.name),
+                ensure_ascii=True,
+            ).encode("utf-8")
+        )
+        for package in packages
+    )
+
+    assert total <= MAX_RESOLVED_PACKAGES * MAX_PACKAGE_AUDIT_BYTES
+
+
+def test_full_resolution_audit_is_stored_once_under_a_strict_byte_limit() -> None:
+    package = ResolvedPackage(
+        "alpha", Version("1.0"), True, "https://example/alpha", "alpha.whl", (), None, ()
+    )
+    attempts = tuple(
+        ResolutionAttempt(
+            (CandidateSelection("alpha", Version(f"1.{index}")),),
+            PackageSource.PYPI,
+            CompatibilityFailureCode.STRICT_RESOLUTION,
+            "失败" * 1000,
+        )
+        for index in range(100)
+    )
+    rejections = tuple(
+        CandidateRejection(
+            "alpha",
+            f"{index}.0",
+            PackageSource.PYPI,
+            CandidateRejectionCode.NO_TARGET_WHEEL,
+            "拒绝" * 1000,
+        )
+        for index in range(2000)
+    )
+
+    audit = repository_module._resolution_summary_audit(
+        ResolutionResult("1", (package,), attempts, rejections)
+    )
+
+    assert len(json.dumps(audit, ensure_ascii=True).encode("utf-8")) <= MAX_BUILD_AUDIT_BYTES
+    assert audit["totals"] == {"attempts": 100, "rejections": 2000}
+    assert audit["omitted"]["attempts"] > 0
+    assert audit["omitted"]["rejections"] > 0
+
+
+def test_persist_resolution_rejects_package_count_before_database_writes() -> None:
+    repository = _repository()
+    lease = repository.claim_next("worker-a")
+    assert lease is not None
+    assert repository.claim_build_subject(lease) is not None
+    package = ResolvedPackage(
+        "alpha", Version("1.0"), True, "https://example/alpha", "alpha.whl", (), None, ()
+    )
+    resolution = ResolutionResult(
+        "1", tuple(package for _ in range(MAX_RESOLVED_PACKAGES + 1))
+    )
+
+    with pytest.raises(ValueError, match="package count"):
+        repository.persist_resolution(lease, resolution)
+
+    with repository.engine.connect() as connection:
+        assert connection.scalar(select(func.count()).select_from(resolved_packages)) == 0

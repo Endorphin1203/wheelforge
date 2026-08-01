@@ -14,7 +14,7 @@ from uuid import UUID
 import pytest
 from packaging.tags import Tag
 from packaging.version import Version
-from sqlalchemy import create_engine, insert, select, update
+from sqlalchemy import create_engine, func, insert, select, update
 from sqlalchemy.pool import StaticPool
 
 from wheelforge_worker.artifact import ArtifactBuildContext, BuiltArtifact, ValidatedWheel
@@ -33,6 +33,7 @@ from wheelforge_worker.jobs.pipeline import (
     PipelineResult,
 )
 from wheelforge_worker.jobs.repository import (
+    MAX_RESOLVED_PACKAGES,
     JobLease,
     JobRepository,
     artifacts,
@@ -484,10 +485,18 @@ def test_parse_rejects_payload_keys_that_disagree_with_subject(
 
     result = JobPipeline(repository, storage, workspaces, RecordingStages()).run(lease)
 
-    assert result.status is BuildStatus.QUEUED
+    assert result.status is BuildStatus.FAILED
     with repository.engine.connect() as connection:
-        assert connection.scalar(select(requirement_files.c.parse_status)) == "PENDING"
-        assert connection.scalar(select(build_jobs.c.status)) == "READY"
+        file_row = connection.execute(
+            select(requirement_files.c.parse_status, requirement_files.c.parse_error)
+        ).one()
+        job_row = connection.execute(
+            select(build_jobs.c.status, build_jobs.c.last_error)
+        ).one()
+    assert file_row.parse_status == "FAILED"
+    assert "PARSE_SUBJECT_INTEGRITY_FAILURE" in file_row.parse_error
+    assert job_row.status == "FAILED"
+    assert "PARSE_SUBJECT_INTEGRITY_FAILURE" in job_row.last_error
 
 
 def test_parse_rejects_tampered_original_file(tmp_path: Path) -> None:
@@ -536,8 +545,13 @@ def test_parse_rejects_tampered_original_file(tmp_path: Path) -> None:
 
     result = JobPipeline(repository, storage, workspaces, RecordingStages()).run(lease)
 
-    assert result.status is BuildStatus.QUEUED
+    assert result.status is BuildStatus.FAILED
     assert not (storage.root / "requirements/normalized/input.txt").exists()
+    with repository.engine.connect() as connection:
+        assert connection.scalar(select(requirement_files.c.parse_status)) == "FAILED"
+        assert "PARSE_SUBJECT_INTEGRITY_FAILURE" in connection.scalar(
+            select(build_jobs.c.last_error)
+        )
 
 
 def test_malformed_payload_terminally_fails_job_and_subject(tmp_path: Path) -> None:
@@ -649,6 +663,32 @@ def test_successful_build_publishes_artifact_and_terminal_states(
     assert storage.read_bytes(artifact.object_key) == b"verified zip bytes"
     assert artifact.sha256 == hashlib.sha256(b"verified zip bytes").hexdigest()
     assert list(workspaces.root.iterdir()) == []
+
+
+def test_build_rejects_oversized_resolution_before_package_audit(
+    tmp_path: Path,
+) -> None:
+    class OversizedResolutionStages(RecordingStages):
+        def resolve(
+            self, parsed: object, target: object, workspace: Path
+        ) -> ResolutionResult:
+            self.calls.append("resolve")
+            package = _resolved_package("alpha", "1.0")
+            return ResolutionResult(
+                "1", tuple(package for _ in range(MAX_RESOLVED_PACKAGES + 1))
+            )
+
+    repository, storage, workspaces = _environment(tmp_path)
+    _publish_build_inputs(storage)
+    lease = _seed_build(repository)
+    stages = OversizedResolutionStages()
+
+    result = JobPipeline(repository, storage, workspaces, stages).run(lease)
+
+    assert result.status is BuildStatus.FAILED
+    assert stages.calls == ["resolve"]
+    with repository.engine.connect() as connection:
+        assert connection.scalar(select(func.count()).select_from(resolved_packages)) == 0
 
 
 def test_partial_build_publishes_verified_successes_and_package_audit(

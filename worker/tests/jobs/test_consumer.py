@@ -139,3 +139,21 @@ def test_run_forever_waits_only_when_queue_is_empty() -> None:
     consumer.run_forever()
 
     assert waits == [3]
+
+
+def test_run_forever_runs_periodic_maintenance_while_processing_jobs() -> None:
+    repository = FakeRepository(LEASE, [])
+    maintenance_calls: list[None] = []
+
+    consumer = JobConsumer(
+        repository,
+        RecordingPipeline(),
+        "worker-a",
+        poll_seconds=3,
+        wait=lambda _seconds: True,
+        maintenance=lambda: maintenance_calls.append(None),
+    )
+
+    consumer.run_forever()
+
+    assert len(maintenance_calls) == 2

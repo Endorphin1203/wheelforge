@@ -68,7 +68,7 @@ class Settings:
         path = Path(cls._required_value(name))
         if not path.is_absolute():
             raise ValueError(f"{name} must be an absolute path")
-        return path.resolve(strict=False)
+        return Path(os.path.abspath(os.fspath(path)))
 
     @classmethod
     def _positive_integer(cls, name: str, default: str) -> int:
