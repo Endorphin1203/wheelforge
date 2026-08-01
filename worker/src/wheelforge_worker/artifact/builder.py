@@ -13,13 +13,19 @@ import stat
 import sys
 import tempfile
 from pathlib import Path, PurePosixPath
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Callable, Protocol, cast
 from uuid import UUID
 from zipfile import ZIP_DEFLATED, BadZipFile, ZipFile, ZipInfo
 
 from packaging.utils import InvalidWheelFilename, canonicalize_name, parse_wheel_filename
 
 from wheelforge_worker.resolver import VersionChange
+from wheelforge_worker.validation import (
+    ArchiveValidationReport,
+    StaticValidationReport,
+    ValidatedWheelSnapshot,
+    validate_closure,
+)
 
 from .models import ArtifactBuildContext, BuiltArtifact, ValidatedWheel
 from .templates import HTML_DOCUMENT, STATIC_VALIDATION_MESSAGE
@@ -37,15 +43,39 @@ class ArtifactBuildError(RuntimeError):
     pass
 
 
+_FileIdentity = tuple[int, int]
+
+
+class _WindowsApi(Protocol):
+    def open_directory(self, path: Path) -> int: ...
+
+    def close_handle(self, handle: int) -> None: ...
+
+    def descriptor_handle(self, descriptor: int) -> int: ...
+
+    def handle_identity(self, handle: int) -> _FileIdentity: ...
+
+    def handle_is_reparse(self, handle: int) -> bool: ...
+
+    def path_identity(
+        self, path: Path, *, directory: bool
+    ) -> _FileIdentity | None: ...
+
+    def rename_handle(
+        self, handle: int, directory_handle: int, final_name: str
+    ) -> None: ...
+
+    def delete_handle(self, handle: int) -> None: ...
+
+
 class ArtifactBuilder:
+    def __init__(self) -> None:
+        self._publication_backend = _select_publication_backend()
+
     def build(self, context: ArtifactBuildContext, output_dir: Path) -> BuiltArtifact:
-        snapshots = []
-        snapshot_ids: set[int] = set()
-        for item in context.wheels:
-            snapshot = item.report.snapshot
-            if snapshot is not None and id(snapshot) not in snapshot_ids:
-                snapshots.append(snapshot)
-                snapshot_ids.add(id(snapshot))
+        if not isinstance(context, ArtifactBuildContext):
+            raise ArtifactBuildError("artifact build context is required")
+        snapshots = _discover_snapshots(context.wheels)
         try:
             return self._build(context, Path(output_dir))
         finally:
@@ -61,14 +91,14 @@ class ArtifactBuilder:
 
     def _build(self, context: ArtifactBuildContext, output_dir: Path) -> BuiltArtifact:
         _validate_output_directory(output_dir)
-        _validate_context(context)
+        validation = _validate_context(context)
         final_path = output_dir / f"wheelforge-{context.build_id}.zip"
         if final_path.exists():
             raise FileExistsError(f"artifact already exists: {final_path.name}")
 
         packaged = _packaged_by_name(context)
         intended = _intended_packages(context, packaged)
-        complete = context.validation.complete and len(packaged) == len(intended)
+        complete = validation.complete and len(packaged) == len(intended)
         manifest = _manifest(context, intended, packaged, complete)
         entries = _text_entries(context, intended, manifest, complete)
         package_entries = {
@@ -85,49 +115,531 @@ class ArtifactBuilder:
         )
         expected_names = set(entries) | set(package_entries)
 
-        output_descriptor = _open_output_directory(output_dir)
+        publication = _open_publication_backend(self._publication_backend, output_dir)
         try:
             descriptor, staged_name = tempfile.mkstemp(
                 prefix=".wheelforge-artifact-", suffix=".tmp", dir=output_dir
             )
             staged_path = Path(staged_name)
-            staged_identity = _identity(os.fstat(descriptor))
             try:
-                with os.fdopen(descriptor, "w+b") as staged:
-                    _write_zip(staged, entries, package_entries)
-                    staged.flush()
-                    os.fsync(staged.fileno())
-                _require_owned_stage(
-                    output_descriptor, staged_path.name, staged_identity
-                )
-                _verify_zip(staged_path, expected_names, hashes)
-                _require_owned_stage(
-                    output_descriptor, staged_path.name, staged_identity
-                )
-                _require_output_directory(output_dir, output_descriptor)
-                digest = _hash_file(staged_path)
-                _require_owned_stage(
-                    output_descriptor, staged_path.name, staged_identity
-                )
-                _require_output_directory(output_dir, output_descriptor)
-                _publish_no_replace(
-                    staged_path,
-                    final_path,
-                    output_descriptor,
-                    staged_identity,
-                    output_dir,
-                )
-                return BuiltArtifact(final_path, digest, manifest)
-            except BaseException:
-                _unlink_if_owned(
-                    staged_path,
-                    staged_identity,
-                    output_descriptor,
-                    staged_path.name,
-                )
-                raise
+                try:
+                    staged_identity = publication.stage_identity(
+                        descriptor, staged_path
+                    )
+                except BaseException:
+                    publication.cleanup_unbound_stage(descriptor, staged_path)
+                    raise
+                try:
+                    with _duplicate_stream(descriptor, "w+b") as staged:
+                        _write_zip(staged, entries, package_entries)
+                        staged.flush()
+                        os.fsync(staged.fileno())
+                    publication.require_stage(
+                        descriptor, staged_path, staged_identity
+                    )
+                    with _duplicate_stream(descriptor, "rb") as staged:
+                        _verify_zip(staged, expected_names, hashes)
+                    publication.require_stage(
+                        descriptor, staged_path, staged_identity
+                    )
+                    publication.require_output()
+                    with _duplicate_stream(descriptor, "rb") as staged:
+                        digest = _hash_stream(staged)
+                    publication.require_stage(
+                        descriptor, staged_path, staged_identity
+                    )
+                    publication.require_output()
+                    publication.publish(
+                        descriptor, staged_path, final_path, staged_identity
+                    )
+                    return BuiltArtifact(final_path, digest, manifest)
+                except BaseException:
+                    publication.cleanup_stage(
+                        descriptor, staged_path, staged_identity
+                    )
+                    raise
+            finally:
+                _cleanup_preserving_primary(lambda: os.close(descriptor))
         finally:
-            os.close(output_descriptor)
+            _cleanup_preserving_primary(publication.close)
+
+
+def _discover_snapshots(wheels: object) -> tuple[ValidatedWheelSnapshot, ...]:
+    if not isinstance(wheels, tuple):
+        return ()
+    snapshots: list[ValidatedWheelSnapshot] = []
+    snapshot_ids: set[int] = set()
+    for item in wheels:
+        if not isinstance(item, ValidatedWheel) or not isinstance(
+            item.report, ArchiveValidationReport
+        ):
+            continue
+        snapshot = item.report.snapshot
+        if isinstance(snapshot, ValidatedWheelSnapshot) and id(snapshot) not in snapshot_ids:
+            snapshots.append(snapshot)
+            snapshot_ids.add(id(snapshot))
+    return tuple(snapshots)
+
+
+def _select_publication_backend() -> str:
+    if sys.platform == "darwin":
+        if _unix_publication_capabilities("renameatx_np"):
+            return "unix"
+    elif sys.platform.startswith("linux"):
+        if _unix_publication_capabilities("renameat2"):
+            return "unix"
+    elif os.name == "nt" and sys.platform == "win32":
+        if _windows_publication_capabilities():
+            return "windows"
+        raise ArtifactBuildError("safe Windows publication backend is unavailable")
+    raise ArtifactBuildError("safe host publication backend is unavailable")
+
+
+def _unix_publication_capabilities(rename_symbol: str) -> bool:
+    required_dir_fd = (os.stat, os.unlink)
+    if any(function not in os.supports_dir_fd for function in required_dir_fd):
+        return False
+    try:
+        return getattr(ctypes.CDLL(None), rename_symbol, None) is not None
+    except OSError:
+        return False
+
+
+def _windows_publication_capabilities() -> bool:
+    win_dll = getattr(ctypes, "WinDLL", None)
+    if win_dll is None:
+        return False
+    try:
+        kernel32 = win_dll("kernel32", use_last_error=True)
+    except OSError:
+        return False
+    return all(
+        getattr(kernel32, name, None) is not None
+        for name in (
+            "CreateFileW",
+            "CloseHandle",
+            "GetFileInformationByHandle",
+            "ReOpenFile",
+            "SetFileInformationByHandle",
+        )
+    )
+
+
+class _PublicationBackend(Protocol):
+    def stage_identity(self, descriptor: int, staged: Path) -> _FileIdentity: ...
+
+    def require_output(self) -> None: ...
+
+    def require_stage(
+        self, descriptor: int, staged: Path, expected: _FileIdentity
+    ) -> None: ...
+
+    def cleanup_stage(
+        self, descriptor: int, staged: Path, expected: _FileIdentity
+    ) -> None: ...
+
+    def cleanup_unbound_stage(self, descriptor: int, staged: Path) -> None: ...
+
+    def publish(
+        self,
+        descriptor: int,
+        staged: Path,
+        final: Path,
+        expected: _FileIdentity,
+    ) -> None: ...
+
+    def close(self) -> None: ...
+
+
+def _open_publication_backend(kind: str, output_dir: Path) -> _PublicationBackend:
+    if kind == "unix":
+        return _UnixPublicationBackend(output_dir)
+    if kind == "windows":
+        return _WindowsPublicationBackend(output_dir, _WindowsNativeApi())
+    raise ArtifactBuildError("safe host publication backend is unavailable")
+
+
+class _UnixPublicationBackend:
+    def __init__(self, output_dir: Path) -> None:
+        self._output_dir = output_dir
+        self._directory_descriptor = _open_output_directory(output_dir)
+
+    def stage_identity(self, descriptor: int, staged: Path) -> _FileIdentity:
+        expected = _identity(os.fstat(descriptor))
+        self.require_stage(descriptor, staged, expected)
+        return expected
+
+    def require_output(self) -> None:
+        _require_output_directory(self._output_dir, self._directory_descriptor)
+
+    def require_stage(
+        self, descriptor: int, staged: Path, expected: _FileIdentity
+    ) -> None:
+        if _identity(os.fstat(descriptor)) != expected:
+            raise ArtifactBuildError("staged ZIP descriptor identity changed")
+        _require_owned_stage(self._directory_descriptor, staged.name, expected)
+
+    def cleanup_stage(
+        self, descriptor: int, staged: Path, expected: _FileIdentity
+    ) -> None:
+        _unlink_if_owned(
+            staged, expected, self._directory_descriptor, staged.name
+        )
+
+    def cleanup_unbound_stage(self, descriptor: int, staged: Path) -> None:
+        try:
+            expected = _identity(os.fstat(descriptor))
+        except OSError:
+            return
+        _unlink_if_owned(
+            staged, expected, self._directory_descriptor, staged.name
+        )
+
+    def publish(
+        self,
+        descriptor: int,
+        staged: Path,
+        final: Path,
+        expected: _FileIdentity,
+    ) -> None:
+        self.require_stage(descriptor, staged, expected)
+        _publish_no_replace(
+            staged,
+            final,
+            self._directory_descriptor,
+            expected,
+            self._output_dir,
+        )
+
+    def close(self) -> None:
+        os.close(self._directory_descriptor)
+
+
+class _WindowsPublicationBackend:
+    def __init__(self, output_dir: Path, api: _WindowsApi) -> None:
+        self._output_dir = output_dir
+        self._api = api
+        self._directory_handle = api.open_directory(output_dir)
+        self._stage_handles: dict[int, int] = {}
+        try:
+            if api.handle_is_reparse(self._directory_handle):
+                raise ArtifactBuildError(
+                    "Windows reparse output directories are not allowed"
+                )
+            self._directory_identity = api.handle_identity(self._directory_handle)
+            self.require_output()
+        except BaseException:
+            _cleanup_preserving_primary(
+                lambda: api.close_handle(self._directory_handle)
+            )
+            raise
+
+    def _stage_handle(self, descriptor: int) -> int:
+        handle = self._stage_handles.get(descriptor)
+        if handle is None:
+            handle = self._api.descriptor_handle(descriptor)
+            self._stage_handles[descriptor] = handle
+        return handle
+
+    def stage_identity(self, descriptor: int, staged: Path) -> _FileIdentity:
+        handle = self._stage_handle(descriptor)
+        expected = self._api.handle_identity(handle)
+        self.require_stage(descriptor, staged, expected)
+        return expected
+
+    def require_output(self) -> None:
+        if (
+            self._api.handle_is_reparse(self._directory_handle)
+            or self._api.handle_identity(self._directory_handle)
+            != self._directory_identity
+            or self._api.path_identity(self._output_dir, directory=True)
+            != self._directory_identity
+        ):
+            raise ArtifactBuildError("output directory identity changed")
+
+    def require_stage(
+        self, descriptor: int, staged: Path, expected: _FileIdentity
+    ) -> None:
+        self.require_output()
+        handle = self._stage_handle(descriptor)
+        if (
+            self._api.handle_identity(handle) != expected
+            or self._api.path_identity(staged, directory=False) != expected
+        ):
+            raise ArtifactBuildError("staged ZIP identity changed")
+
+    def cleanup_stage(
+        self, descriptor: int, staged: Path, expected: _FileIdentity
+    ) -> None:
+        try:
+            handle = self._stage_handle(descriptor)
+            if self._api.handle_identity(handle) == expected:
+                self._api.delete_handle(handle)
+        except (OSError, ArtifactBuildError):
+            pass
+
+    def cleanup_unbound_stage(self, descriptor: int, staged: Path) -> None:
+        try:
+            self._api.delete_handle(self._stage_handle(descriptor))
+        except (OSError, ArtifactBuildError):
+            pass
+
+    def publish(
+        self,
+        descriptor: int,
+        staged: Path,
+        final: Path,
+        expected: _FileIdentity,
+    ) -> None:
+        self.require_stage(descriptor, staged, expected)
+        try:
+            final_identity = self._api.path_identity(final, directory=False)
+        except OSError as error:
+            raise ArtifactBuildError(
+                "artifact destination could not be inspected"
+            ) from error
+        if final_identity is not None:
+            raise FileExistsError(f"artifact already exists: {final.name}")
+        handle = self._stage_handle(descriptor)
+        try:
+            self._api.rename_handle(handle, self._directory_handle, final.name)
+        except OSError as error:
+            if error.errno in {errno.EEXIST, errno.ENOTEMPTY} or getattr(
+                error, "winerror", None
+            ) in {80, 183}:
+                raise FileExistsError(
+                    f"artifact already exists: {final.name}"
+                ) from error
+            raise ArtifactBuildError("artifact publication failed") from error
+        self.require_output()
+        if self._api.path_identity(final, directory=False) != expected:
+            raise ArtifactBuildError("published ZIP identity changed")
+
+    def close(self) -> None:
+        first_error: BaseException | None = None
+        handles = (*self._stage_handles.values(), self._directory_handle)
+        self._stage_handles.clear()
+        for handle in handles:
+            try:
+                self._api.close_handle(handle)
+            except BaseException as error:
+                first_error = first_error or error
+        if first_error is not None:
+            raise first_error
+
+
+class _WindowsFileInformation(ctypes.Structure):
+    _fields_ = [
+        ("file_attributes", ctypes.c_uint32),
+        ("creation_time_low", ctypes.c_uint32),
+        ("creation_time_high", ctypes.c_uint32),
+        ("access_time_low", ctypes.c_uint32),
+        ("access_time_high", ctypes.c_uint32),
+        ("write_time_low", ctypes.c_uint32),
+        ("write_time_high", ctypes.c_uint32),
+        ("volume_serial_number", ctypes.c_uint32),
+        ("file_size_high", ctypes.c_uint32),
+        ("file_size_low", ctypes.c_uint32),
+        ("number_of_links", ctypes.c_uint32),
+        ("file_index_high", ctypes.c_uint32),
+        ("file_index_low", ctypes.c_uint32),
+    ]
+
+
+class _WindowsRenameInformation(ctypes.Structure):
+    _fields_ = [
+        ("replace_if_exists", ctypes.c_ubyte),
+        ("root_directory", ctypes.c_void_p),
+        ("file_name_length", ctypes.c_uint32),
+        ("file_name", ctypes.c_wchar * 1),
+    ]
+
+
+class _WindowsDispositionInformation(ctypes.Structure):
+    _fields_ = [("delete_file", ctypes.c_ubyte)]
+
+
+class _WindowsNativeApi:
+    _GENERIC_READ = 0x80000000
+    _GENERIC_WRITE = 0x40000000
+    _DELETE = 0x00010000
+    _FILE_LIST_DIRECTORY = 0x0001
+    _FILE_READ_ATTRIBUTES = 0x0080
+    _FILE_SHARE_ALL = 0x00000007
+    _OPEN_EXISTING = 3
+    _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+    _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+    _FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+    _FILE_RENAME_INFORMATION = 3
+    _FILE_DISPOSITION_INFORMATION = 4
+    _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+    def __init__(self) -> None:
+        win_dll = getattr(ctypes, "WinDLL", None)
+        if win_dll is None:
+            raise ArtifactBuildError("safe Windows publication backend is unavailable")
+        self._kernel32 = win_dll("kernel32", use_last_error=True)
+        self._configure_functions()
+
+    def _configure_functions(self) -> None:
+        self._kernel32.CreateFileW.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        self._kernel32.CreateFileW.restype = ctypes.c_void_p
+        self._kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        self._kernel32.CloseHandle.restype = ctypes.c_int
+        self._kernel32.GetFileInformationByHandle.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(_WindowsFileInformation),
+        ]
+        self._kernel32.GetFileInformationByHandle.restype = ctypes.c_int
+        self._kernel32.ReOpenFile.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+        ]
+        self._kernel32.ReOpenFile.restype = ctypes.c_void_p
+        self._kernel32.SetFileInformationByHandle.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        ]
+        self._kernel32.SetFileInformationByHandle.restype = ctypes.c_int
+
+    def open_directory(self, path: Path) -> int:
+        return self._open_path(
+            path,
+            self._FILE_LIST_DIRECTORY | self._FILE_READ_ATTRIBUTES,
+            self._FILE_FLAG_BACKUP_SEMANTICS
+            | self._FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+
+    def _open_path(self, path: Path, access: int, flags: int) -> int:
+        handle = self._kernel32.CreateFileW(
+            str(path),
+            access,
+            self._FILE_SHARE_ALL,
+            None,
+            self._OPEN_EXISTING,
+            flags,
+            None,
+        )
+        if handle == self._INVALID_HANDLE_VALUE:
+            self._raise_last_error(f"could not open {path}")
+        return int(handle)
+
+    def close_handle(self, handle: int) -> None:
+        if not self._kernel32.CloseHandle(handle):
+            self._raise_last_error("could not close Windows file handle")
+
+    def descriptor_handle(self, descriptor: int) -> int:
+        try:
+            import msvcrt
+        except ImportError as error:
+            raise ArtifactBuildError(
+                "safe Windows publication backend is unavailable"
+            ) from error
+        source = msvcrt.get_osfhandle(descriptor)  # type: ignore[attr-defined]
+        handle = self._kernel32.ReOpenFile(
+            source,
+            self._GENERIC_READ
+            | self._GENERIC_WRITE
+            | self._DELETE
+            | self._FILE_READ_ATTRIBUTES,
+            self._FILE_SHARE_ALL,
+            0,
+        )
+        if handle == self._INVALID_HANDLE_VALUE:
+            self._raise_last_error("could not bind staged ZIP handle")
+        return int(handle)
+
+    def handle_identity(self, handle: int) -> _FileIdentity:
+        information = self._handle_information(handle)
+        file_index = (information.file_index_high << 32) | information.file_index_low
+        return information.volume_serial_number, file_index
+
+    def handle_is_reparse(self, handle: int) -> bool:
+        information = self._handle_information(handle)
+        return bool(
+            information.file_attributes & self._FILE_ATTRIBUTE_REPARSE_POINT
+        )
+
+    def _handle_information(self, handle: int) -> _WindowsFileInformation:
+        information = _WindowsFileInformation()
+        if not self._kernel32.GetFileInformationByHandle(
+            handle, ctypes.byref(information)
+        ):
+            self._raise_last_error("could not inspect Windows file handle")
+        return information
+
+    def path_identity(
+        self, path: Path, *, directory: bool
+    ) -> _FileIdentity | None:
+        try:
+            handle = self._open_path(
+                path,
+                self._FILE_READ_ATTRIBUTES,
+                self._FILE_FLAG_OPEN_REPARSE_POINT
+                | (self._FILE_FLAG_BACKUP_SEMANTICS if directory else 0),
+            )
+        except OSError as error:
+            if getattr(error, "winerror", None) in {2, 3}:
+                return None
+            raise
+        try:
+            if self.handle_is_reparse(handle):
+                raise ArtifactBuildError(
+                    "Windows reparse path substitutions are not allowed"
+                )
+            return self.handle_identity(handle)
+        finally:
+            self.close_handle(handle)
+
+    def rename_handle(
+        self, handle: int, directory_handle: int, final_name: str
+    ) -> None:
+        encoded_name = final_name.encode("utf-16-le")
+        name_offset = _WindowsRenameInformation.file_name.offset
+        size = name_offset + len(encoded_name)
+        buffer = ctypes.create_string_buffer(size)
+        ctypes.c_ubyte.from_buffer(
+            buffer, _WindowsRenameInformation.replace_if_exists.offset
+        ).value = 0
+        ctypes.c_void_p.from_buffer(
+            buffer, _WindowsRenameInformation.root_directory.offset
+        ).value = directory_handle
+        ctypes.c_uint32.from_buffer(
+            buffer, _WindowsRenameInformation.file_name_length.offset
+        ).value = len(encoded_name)
+        ctypes.memmove(ctypes.addressof(buffer) + name_offset, encoded_name, len(encoded_name))
+        if not self._kernel32.SetFileInformationByHandle(
+            handle, self._FILE_RENAME_INFORMATION, buffer, size
+        ):
+            self._raise_last_error("could not publish staged ZIP")
+
+    def delete_handle(self, handle: int) -> None:
+        information = _WindowsDispositionInformation(1)
+        if not self._kernel32.SetFileInformationByHandle(
+            handle,
+            self._FILE_DISPOSITION_INFORMATION,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+        ):
+            self._raise_last_error("could not remove staged ZIP")
+
+    @staticmethod
+    def _raise_last_error(message: str) -> None:
+        get_last_error = getattr(ctypes, "get_last_error", None)
+        number = 1 if get_last_error is None else get_last_error()
+        raise OSError(number, message, None, number)
 
 
 def _validate_output_directory(output_dir: Path) -> None:
@@ -139,7 +651,7 @@ def _validate_output_directory(output_dir: Path) -> None:
         raise ArtifactBuildError("output directory must be a real directory")
 
 
-def _validate_context(context: ArtifactBuildContext) -> None:
+def _validate_context(context: ArtifactBuildContext) -> StaticValidationReport:
     if not isinstance(context, ArtifactBuildContext):
         raise ArtifactBuildError("artifact build context is required")
     try:
@@ -150,29 +662,49 @@ def _validate_context(context: ArtifactBuildContext) -> None:
         raise ArtifactBuildError("build identifier must be a canonical UUID")
     if context.target.os not in {"LINUX", "WINDOWS"}:
         raise ArtifactBuildError("artifact target OS is unsupported")
+    if context.version_changes != context.resolution.changes:
+        raise ArtifactBuildError(
+            "version comparison does not match resolution changes"
+        )
 
-    resolved_names: set[str] = set()
+    resolved: dict[str, Any] = {}
     for package in context.resolution.packages:
         name = canonicalize_name(package.name)
-        if name in resolved_names:
+        if name in resolved:
             raise ArtifactBuildError("resolved package identities must be unique")
-        resolved_names.add(name)
+        resolved[name] = package
 
     packaged_names: set[str] = set()
     portable_paths: set[str] = set()
     for item in context.wheels:
         _validate_pair(item)
         name = canonicalize_name(item.download.package)
-        if name in packaged_names or name not in resolved_names:
+        if name in packaged_names or name not in resolved:
             raise ArtifactBuildError("validated package identities are inconsistent")
+        package = resolved[name]
+        if item.download.version != package.version:
+            raise ArtifactBuildError("closure validation package version mismatch")
+        if item.download.filename != package.wheel_filename:
+            raise ArtifactBuildError("resolved Wheel filename does not match validation")
         packaged_names.add(name)
         package_path = f"packages/{item.download.filename}"
         key = package_path.casefold()
         if key in portable_paths or not _safe_zip_path(package_path):
             raise ArtifactBuildError("validated Wheel path is unsafe or duplicate")
         portable_paths.add(key)
-    if context.validation.complete and packaged_names != resolved_names:
+    if context.validation.complete and packaged_names != set(resolved):
         raise ArtifactBuildError("complete validation requires every resolved Wheel")
+    try:
+        recomputed = validate_closure(
+            context.resolution,
+            (item.download for item in context.wheels),
+            context.target,
+        )
+    except ValueError as error:
+        raise ArtifactBuildError("closure validation inputs are invalid") from error
+    if recomputed != context.validation:
+        raise ArtifactBuildError("closure validation report does not match recomputed result")
+    return recomputed
 
 
 def _validate_pair(item: ValidatedWheel) -> None:
@@ -270,10 +802,10 @@ def _manifest(
         for issue in sorted(
             context.validation.issues,
             key=lambda item: (
-                canonicalize_name(item.package),
                 item.code.value,
-                item.filename or "",
+                item.package,
                 item.detail,
+                (0, "") if item.filename is None else (1, item.filename),
             ),
         )
     ]
@@ -408,12 +940,22 @@ def _version_change_key(change: VersionChange) -> tuple[str, ...]:
 
 
 def _linux_scripts(context: ArtifactBuildContext, complete: bool) -> tuple[str, str]:
+    location = (
+        "#!/bin/sh\nset -eu\n"
+        'SCRIPT_DIR=$(CDPATH= cd -P -- "$(dirname -- "$0")" && pwd) || '
+        "{ echo 'Artifact directory is unavailable' >&2; exit 1; }\n"
+        'cd -- "$SCRIPT_DIR" || { echo \'Artifact directory is unavailable\' >&2; exit 1; }\n'
+    )
     if not complete:
-        failure = "#!/bin/sh\necho 'Incomplete artifact: installation is unavailable.' >&2\nexit 1\n"
+        failure = (
+            location
+            + "echo 'Incomplete artifact: installation is unavailable.' >&2\nexit 1\n"
+        )
         return failure, failure
     machine = {"X86_64": "x86_64", "AARCH64": "aarch64"}[context.target.architecture]
     checks = (
-        "#!/bin/sh\nset -eu\n"
+        location
+        +
         f"[ \"$(uname -s)\" = \"Linux\" ] || {{ echo 'Target OS mismatch' >&2; exit 1; }}\n"
         f"[ \"$(uname -m)\" = \"{machine}\" ] || {{ echo 'Target architecture mismatch' >&2; exit 1; }}\n"
         f"python -c \"import sys; raise SystemExit(sys.version_info[:2] != ({context.target.python_version.replace('.', ', ')}))\" || {{ echo 'Target Python mismatch' >&2; exit 1; }}\n"
@@ -424,13 +966,21 @@ def _linux_scripts(context: ArtifactBuildContext, complete: bool) -> tuple[str, 
 
 
 def _windows_scripts(context: ArtifactBuildContext, complete: bool) -> tuple[str, str]:
+    location = (
+        "@echo off\r\nsetlocal\r\n"
+        'cd /d "%~dp0" || (echo Artifact directory is unavailable 1>&2 & exit /b 1)\r\n'
+    )
     if not complete:
-        failure = "@echo off\r\necho Incomplete artifact: installation is unavailable. 1>&2\r\nexit /b 1\r\n"
+        failure = (
+            location
+            + "echo Incomplete artifact: installation is unavailable. 1>&2\r\nexit /b 1\r\n"
+        )
         return failure, failure
     machine = {"AMD64": "AMD64", "ARM64": "ARM64"}[context.target.architecture]
     major, minor = context.target.python_version.split(".")
     checks = (
-        "@echo off\r\nsetlocal\r\n"
+        location
+        +
         "if /I not \"%OS%\"==\"Windows_NT\" (echo Target OS mismatch 1>&2 & exit /b 1)\r\n"
         f"python -c \"import platform,sys; raise SystemExit(platform.machine().upper() != '{machine}' or sys.version_info[:2] != ({major}, {minor}))\"\r\n"
         "if errorlevel 1 (echo Target architecture or Python mismatch 1>&2 & exit /b 1)\r\n"
@@ -473,10 +1023,11 @@ def _write_zip(
 
 
 def _verify_zip(
-    path: Path, expected_names: set[str], expected_hashes: dict[str, str]
+    staged: BinaryIO, expected_names: set[str], expected_hashes: dict[str, str]
 ) -> None:
     try:
-        with ZipFile(path) as archive:
+        staged.seek(0)
+        with ZipFile(staged) as archive:
             names = archive.namelist()
             if len(names) != len(set(names)) or set(names) != expected_names:
                 raise ArtifactBuildError("staged ZIP member contract is invalid")
@@ -532,9 +1083,34 @@ def _safe_zip_path(path: str) -> bool:
     )
 
 
-def _hash_file(path: Path) -> str:
-    with path.open("rb") as handle:
-        return hashlib.file_digest(handle, "sha256").hexdigest()
+def _hash_stream(staged: BinaryIO) -> str:
+    staged.seek(0)
+    digest = hashlib.sha256()
+    while block := staged.read(_COPY_CHUNK_BYTES):
+        digest.update(block)
+    return digest.hexdigest()
+
+
+def _duplicate_stream(descriptor: int, mode: str) -> BinaryIO:
+    duplicate = -1
+    try:
+        duplicate = os.dup(descriptor)
+        stream = os.fdopen(duplicate, mode)
+        duplicate = -1
+        return cast(BinaryIO, stream)
+    except BaseException:
+        if duplicate != -1:
+            os.close(duplicate)
+        raise
+
+
+def _cleanup_preserving_primary(operation: Callable[[], None]) -> None:
+    active_error = sys.exception()
+    try:
+        operation()
+    except BaseException:
+        if active_error is None:
+            raise
 
 
 def _hash_zip_member(archive: ZipFile, name: str) -> str:
@@ -655,6 +1231,14 @@ def _publish_no_replace(
             directory_descriptor, final.name, staged_identity
         )
         raise
+    try:
+        published = os.stat(
+            final.name, dir_fd=directory_descriptor, follow_symlinks=False
+        )
+    except OSError as error:
+        raise ArtifactBuildError("published ZIP identity changed") from error
+    if not stat.S_ISREG(published.st_mode) or _identity(published) != staged_identity:
+        raise ArtifactBuildError("published ZIP identity changed")
 
 
 def _rename_no_replace(

@@ -10,6 +10,7 @@ import socket
 import subprocess
 from dataclasses import replace
 from pathlib import Path
+from typing import BinaryIO
 from zipfile import ZipFile
 
 import pytest
@@ -39,6 +40,7 @@ from wheelforge_worker.validation import (
     ValidationIssue,
     ValidationIssueCode,
     ValidatedWheelSnapshot,
+    validate_closure,
 )
 
 
@@ -46,6 +48,113 @@ BUILD_ID = "123e4567-e89b-12d3-a456-426614174000"
 STATIC_MESSAGE = (
     "Static compatibility checks passed; target installation was not verified."
 )
+
+
+class FaultingBinaryFile:
+    def __init__(self, wrapped: BinaryIO, failing_method: str) -> None:
+        self.wrapped = wrapped
+        self.failing_method = failing_method
+
+    def __enter__(self) -> FaultingBinaryFile:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.wrapped, name)
+
+    def read(self, size: int = -1) -> bytes:
+        self._fail("read")
+        return self.wrapped.read(size)
+
+    def readinto(self, buffer: object) -> int | None:
+        self._fail("read")
+        return self.wrapped.readinto(buffer)  # type: ignore[arg-type]
+
+    def write(self, value: bytes) -> int:
+        self._fail("write")
+        return self.wrapped.write(value)
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        self._fail("seek")
+        return self.wrapped.seek(offset, whence)
+
+    def flush(self) -> None:
+        self._fail("flush")
+        self.wrapped.flush()
+
+    def fileno(self) -> int:
+        return self.wrapped.fileno()
+
+    def close(self) -> None:
+        self.wrapped.close()
+
+    def _fail(self, method: str) -> None:
+        if self.failing_method == method:
+            raise OSError(f"injected staged {method} failure")
+
+
+class FakeWindowsNativeApi:
+    def __init__(self, output: Path, staged: Path, final: Path) -> None:
+        self.output = output
+        self.staged = staged
+        self.final = final
+        self.directory_handle = 101
+        self.stage_handle = 202
+        self.directory_identity = (11, 12)
+        self.stage_identity = (21, 22)
+        self.paths: dict[Path, tuple[int, int] | None] = {
+            output: self.directory_identity,
+            staged: self.stage_identity,
+            final: None,
+        }
+        self.renamed: list[tuple[int, int, str]] = []
+        self.deleted: list[int] = []
+        self.closed: list[int] = []
+        self.close_failures: set[int] = set()
+        self.reparse_handles: set[int] = set()
+        self.reparse_paths: set[Path] = set()
+
+    def open_directory(self, path: Path) -> int:
+        assert path == self.output
+        return self.directory_handle
+
+    def close_handle(self, handle: int) -> None:
+        self.closed.append(handle)
+        if handle in self.close_failures:
+            raise OSError(f"injected close failure {handle}")
+
+    def descriptor_handle(self, descriptor: int) -> int:
+        assert descriptor == 7
+        return self.stage_handle
+
+    def handle_identity(self, handle: int) -> tuple[int, int]:
+        if handle == self.directory_handle:
+            return self.directory_identity
+        assert handle == self.stage_handle
+        return self.stage_identity
+
+    def handle_is_reparse(self, handle: int) -> bool:
+        return handle in self.reparse_handles
+
+    def path_identity(self, path: Path, *, directory: bool) -> tuple[int, int] | None:
+        assert directory == (path == self.output)
+        if path in self.reparse_paths:
+            raise ArtifactBuildError("Windows reparse points are not allowed")
+        return self.paths.get(path)
+
+    def rename_handle(self, handle: int, directory_handle: int, final_name: str) -> None:
+        self.renamed.append((handle, directory_handle, final_name))
+        assert self.paths[self.final] is None
+        self.paths[self.staged] = None
+        self.paths[self.final] = self.stage_identity
+
+    def delete_handle(self, handle: int) -> None:
+        self.deleted.append(handle)
+        for path, identity in tuple(self.paths.items()):
+            if identity == self.stage_identity:
+                self.paths[path] = None
 
 
 def target_profile(os_name: str = "LINUX") -> TargetProfile:
@@ -154,11 +263,6 @@ def partial_context(root: Path, *, malicious: bool = False) -> ArtifactBuildCont
     validated = validated_wheel(root)
     missing_hash = "b" * 64
     issue_detail = '<missing & unsafe "detail">\nnext' if malicious else "missing Wheel"
-    issue = ValidationIssue(
-        ValidationIssueCode.WHEEL_MISSING,
-        "missing<script>" if malicious else "missing",
-        issue_detail,
-    )
     change = VersionChange(
         package="missing<script>" if malicious else "missing",
         kind=VersionChangeKind.UPGRADE,
@@ -168,19 +272,27 @@ def partial_context(root: Path, *, malicious: bool = False) -> ArtifactBuildCont
         reason='<reason & "quoted">\nnext' if malicious else "compatibility",
         source=PackageSource.PYPI,
     )
+    target = target_profile()
+    demo = resolved_package(
+        "demo", "1.2.3", digest=validated.download.sha256
+    )
+    if malicious:
+        demo = replace(demo, requires_python=issue_detail)
+    resolution = ResolutionResult(
+        report_version="1",
+        packages=(
+            resolved_package("missing", "2", digest=missing_hash),
+            demo,
+        ),
+        changes=(change,),
+    )
     return ArtifactBuildContext(
         build_id=BUILD_ID,
         original_requirements='demo>=1\r\nmissing>=1 # "quoted"\r\n',
-        resolution=ResolutionResult(
-            report_version="1",
-            packages=(
-                resolved_package("missing", "2", digest=missing_hash),
-                resolved_package("demo", "1.2.3", digest=validated.download.sha256),
-            ),
-        ),
+        resolution=resolution,
         version_changes=(change,),
-        target=target_profile(),
-        validation=StaticValidationReport((issue,), False),
+        target=target,
+        validation=validate_closure(resolution, (validated.download,), target),
         wheels=(validated,),
     )
 
@@ -453,9 +565,9 @@ def test_staged_verification_failure_removes_stage_and_cleans_snapshot(
     output.mkdir()
 
     def fail_verification(
-        path: Path, expected_names: set[str], expected_hashes: dict[str, str]
+        staged: BinaryIO, expected_names: set[str], expected_hashes: dict[str, str]
     ) -> None:
-        assert path.parent == output
+        assert staged.seekable()
         assert expected_names
         assert expected_hashes
         raise ArtifactBuildError("injected verification failure")
@@ -466,6 +578,350 @@ def test_staged_verification_failure_removes_stage_and_cleans_snapshot(
 
     assert list(output.iterdir()) == []
     assert not snapshot.path.exists()
+
+
+def test_staged_fdopen_failure_closes_all_descriptors_and_preserves_primary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context = build_context(tmp_path)
+    snapshot = context.wheels[0].report.snapshot
+    assert snapshot is not None
+    output = tmp_path / "output"
+    output.mkdir()
+    mkstemp = builder_module.tempfile.mkstemp
+    fdopen = builder_module.os.fdopen
+    original_descriptor = -1
+    transferred_descriptor = -1
+    stage_created = False
+
+    def capture_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+        nonlocal original_descriptor, stage_created
+        descriptor, name = mkstemp(*args, **kwargs)
+        original_descriptor = descriptor
+        stage_created = True
+        return descriptor, name
+
+    def fail_first_stage_fdopen(
+        descriptor: int, *args: object, **kwargs: object
+    ) -> object:
+        nonlocal transferred_descriptor
+        if stage_created and transferred_descriptor == -1:
+            transferred_descriptor = descriptor
+            raise OSError("injected staged fdopen failure")
+        return fdopen(descriptor, *args, **kwargs)
+
+    monkeypatch.setattr(builder_module.tempfile, "mkstemp", capture_mkstemp)
+    monkeypatch.setattr(builder_module.os, "fdopen", fail_first_stage_fdopen)
+
+    with pytest.raises(OSError, match="injected staged fdopen failure"):
+        ArtifactBuilder().build(context, output)
+
+    assert original_descriptor != -1
+    assert transferred_descriptor != -1
+    for descriptor in {original_descriptor, transferred_descriptor}:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+    assert list(output.iterdir()) == []
+    assert not snapshot.path.exists()
+
+
+def test_staged_zip_is_never_reopened_by_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context = build_context(tmp_path)
+    output = tmp_path / "output"
+    output.mkdir()
+    zip_file = builder_module.ZipFile
+    path_open = Path.open
+
+    def descriptor_zip_file(file: object, *args: object, **kwargs: object) -> object:
+        if isinstance(file, (str, Path)) and ".wheelforge-artifact-" in str(file):
+            raise AssertionError("staged ZIP was reopened by path")
+        return zip_file(file, *args, **kwargs)
+
+    def descriptor_path_open(
+        path: Path, *args: object, **kwargs: object
+    ) -> object:
+        if ".wheelforge-artifact-" in path.name:
+            raise AssertionError("staged ZIP hash reopened by path")
+        return path_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builder_module, "ZipFile", descriptor_zip_file)
+    monkeypatch.setattr(Path, "open", descriptor_path_open)
+
+    artifact = ArtifactBuilder().build(context, output)
+
+    assert artifact.sha256 == hashlib.sha256(artifact.path.read_bytes()).hexdigest()
+
+
+def test_staged_dup_failure_closes_original_fd_and_cleans_owned_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context = build_context(tmp_path)
+    snapshot = context.wheels[0].report.snapshot
+    assert snapshot is not None
+    output = tmp_path / "output"
+    output.mkdir()
+    mkstemp = builder_module.tempfile.mkstemp
+    duplicate = builder_module.os.dup
+    original_descriptor = -1
+    stage_created = False
+
+    def capture_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+        nonlocal original_descriptor, stage_created
+        original_descriptor, name = mkstemp(*args, **kwargs)
+        stage_created = True
+        return original_descriptor, name
+
+    def fail_first_stage_dup(descriptor: int) -> int:
+        if stage_created:
+            raise OSError("injected staged dup failure")
+        return duplicate(descriptor)
+
+    monkeypatch.setattr(builder_module.tempfile, "mkstemp", capture_mkstemp)
+    monkeypatch.setattr(builder_module.os, "dup", fail_first_stage_dup)
+
+    with pytest.raises(OSError, match="injected staged dup failure"):
+        ArtifactBuilder().build(context, output)
+
+    with pytest.raises(OSError):
+        os.fstat(original_descriptor)
+    assert list(output.iterdir()) == []
+    assert not snapshot.path.exists()
+
+
+def test_stage_identity_failure_still_closes_original_fd_and_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context = build_context(tmp_path)
+    snapshot = context.wheels[0].report.snapshot
+    assert snapshot is not None
+    output = tmp_path / "output"
+    output.mkdir()
+    original_descriptor = -1
+
+    def fail_identity(
+        backend: object, descriptor: int, staged: Path
+    ) -> tuple[int, int]:
+        nonlocal original_descriptor
+        original_descriptor = descriptor
+        raise OSError("injected stage identity failure")
+
+    monkeypatch.setattr(
+        builder_module._UnixPublicationBackend, "stage_identity", fail_identity
+    )
+
+    with pytest.raises(OSError, match="injected stage identity failure"):
+        ArtifactBuilder().build(context, output)
+
+    with pytest.raises(OSError):
+        os.fstat(original_descriptor)
+    assert list(output.iterdir()) == []
+    assert not snapshot.path.exists()
+
+
+def test_unbound_stage_cleanup_preserves_same_name_external_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context = build_context(tmp_path)
+    output = tmp_path / "output"
+    output.mkdir()
+    external = b"external replacement before identity binding"
+
+    def replace_then_fail(
+        backend: object, descriptor: int, staged: Path
+    ) -> tuple[int, int]:
+        staged.unlink()
+        staged.write_bytes(external)
+        raise OSError("injected identity failure after replacement")
+
+    monkeypatch.setattr(
+        builder_module._UnixPublicationBackend, "stage_identity", replace_then_fail
+    )
+
+    with pytest.raises(OSError, match="identity failure after replacement"):
+        ArtifactBuilder().build(context, output)
+
+    remaining = list(output.iterdir())
+    assert len(remaining) == 1
+    assert remaining[0].read_bytes() == external
+
+
+@pytest.mark.parametrize(
+    ("stream_number", "method"),
+    [
+        (1, "write"),
+        (1, "flush"),
+        (2, "seek"),
+        (2, "read"),
+        (3, "seek"),
+        (3, "read"),
+    ],
+)
+def test_staged_stream_failure_closes_original_fd_and_cleans_owned_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stream_number: int,
+    method: str,
+) -> None:
+    context = build_context(tmp_path)
+    snapshot = context.wheels[0].report.snapshot
+    assert snapshot is not None
+    output = tmp_path / "output"
+    output.mkdir()
+    mkstemp = builder_module.tempfile.mkstemp
+    open_stream = builder_module._duplicate_stream
+    original_descriptor = -1
+    opened = 0
+
+    def capture_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+        nonlocal original_descriptor
+        original_descriptor, name = mkstemp(*args, **kwargs)
+        return original_descriptor, name
+
+    def faulting_stream(descriptor: int, mode: str) -> BinaryIO:
+        nonlocal opened
+        opened += 1
+        stream = open_stream(descriptor, mode)
+        if opened == stream_number:
+            return FaultingBinaryFile(stream, method)  # type: ignore[return-value]
+        return stream
+
+    monkeypatch.setattr(builder_module.tempfile, "mkstemp", capture_mkstemp)
+    monkeypatch.setattr(builder_module, "_duplicate_stream", faulting_stream)
+
+    with pytest.raises((OSError, ArtifactBuildError), match="staged|verification"):
+        ArtifactBuilder().build(context, output)
+
+    with pytest.raises(OSError):
+        os.fstat(original_descriptor)
+    assert list(output.iterdir()) == []
+    assert not snapshot.path.exists()
+
+
+def test_staged_fsync_failure_closes_original_fd_and_cleans_owned_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context = build_context(tmp_path)
+    snapshot = context.wheels[0].report.snapshot
+    assert snapshot is not None
+    output = tmp_path / "output"
+    output.mkdir()
+    fsync = builder_module.os.fsync
+    failed = False
+
+    def fail_first_fsync(descriptor: int) -> None:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OSError("injected staged fsync failure")
+        fsync(descriptor)
+
+    monkeypatch.setattr(builder_module.os, "fsync", fail_first_fsync)
+
+    with pytest.raises(OSError, match="injected staged fsync failure"):
+        ArtifactBuilder().build(context, output)
+
+    assert list(output.iterdir()) == []
+    assert not snapshot.path.exists()
+
+
+def test_descriptor_and_publication_close_errors_do_not_replace_primary_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context = build_context(tmp_path)
+    output = tmp_path / "output"
+    output.mkdir()
+    open_backend = builder_module._open_publication_backend
+    mkstemp = builder_module.tempfile.mkstemp
+    close = builder_module.os.close
+    original_descriptor = -1
+
+    class CloseFailingBackend:
+        def __init__(self, wrapped: object) -> None:
+            self.wrapped = wrapped
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self.wrapped, name)
+
+        def close(self) -> None:
+            self.wrapped.close()  # type: ignore[attr-defined]
+            raise OSError("injected publication close failure")
+
+    def faulting_backend(kind: str, path: Path) -> object:
+        return CloseFailingBackend(open_backend(kind, path))
+
+    def capture_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+        nonlocal original_descriptor
+        original_descriptor, name = mkstemp(*args, **kwargs)
+        return original_descriptor, name
+
+    def close_then_fail(descriptor: int) -> None:
+        close(descriptor)
+        if descriptor == original_descriptor:
+            raise OSError("injected descriptor close failure")
+
+    def fail_verification(
+        staged: BinaryIO, expected_names: set[str], expected_hashes: dict[str, str]
+    ) -> None:
+        raise ArtifactBuildError("primary verification failure")
+
+    monkeypatch.setattr(builder_module, "_open_publication_backend", faulting_backend)
+    monkeypatch.setattr(builder_module.tempfile, "mkstemp", capture_mkstemp)
+    monkeypatch.setattr(builder_module.os, "close", close_then_fail)
+    monkeypatch.setattr(builder_module, "_verify_zip", fail_verification)
+
+    with pytest.raises(ArtifactBuildError, match="primary verification failure"):
+        ArtifactBuilder().build(context, output)
+
+    assert list(output.iterdir()) == []
+
+
+def test_successful_publication_surfaces_first_descriptor_close_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context = build_context(tmp_path)
+    output = tmp_path / "output"
+    output.mkdir()
+    open_backend = builder_module._open_publication_backend
+    mkstemp = builder_module.tempfile.mkstemp
+    close = builder_module.os.close
+    original_descriptor = -1
+
+    class CloseFailingBackend:
+        def __init__(self, wrapped: object) -> None:
+            self.wrapped = wrapped
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self.wrapped, name)
+
+        def close(self) -> None:
+            self.wrapped.close()  # type: ignore[attr-defined]
+            raise OSError("injected publication close failure")
+
+    def faulting_backend(kind: str, path: Path) -> object:
+        return CloseFailingBackend(open_backend(kind, path))
+
+    def capture_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+        nonlocal original_descriptor
+        original_descriptor, name = mkstemp(*args, **kwargs)
+        return original_descriptor, name
+
+    def close_then_fail(descriptor: int) -> None:
+        close(descriptor)
+        if descriptor == original_descriptor:
+            raise OSError("first descriptor close failure")
+
+    monkeypatch.setattr(builder_module, "_open_publication_backend", faulting_backend)
+    monkeypatch.setattr(builder_module.tempfile, "mkstemp", capture_mkstemp)
+    monkeypatch.setattr(builder_module.os, "close", close_then_fail)
+
+    with pytest.raises(OSError, match="first descriptor close failure"):
+        ArtifactBuilder().build(context, output)
+
+    assert [path.name for path in output.iterdir()] == [
+        f"wheelforge-{BUILD_ID}.zip"
+    ]
 
 
 def test_output_must_be_existing_real_directory_and_snapshot_is_cleaned(
@@ -526,10 +982,11 @@ def test_failure_cleanup_preserves_replacement_of_owned_stage(
     replacement = b"external replacement"
 
     def replace_then_fail(
-        path: Path, expected_names: set[str], expected_hashes: dict[str, str]
+        staged: BinaryIO, expected_names: set[str], expected_hashes: dict[str, str]
     ) -> None:
         assert expected_names
         assert expected_hashes
+        path = next(output.iterdir())
         path.unlink()
         path.write_bytes(replacement)
         raise ArtifactBuildError("injected replacement race")
@@ -568,6 +1025,99 @@ def test_wheel_filename_identity_must_match_report_identity(tmp_path: Path) -> N
         ArtifactBuilder().build(broken, output)
 
     assert not renamed_path.exists()
+
+
+def test_resolved_version_must_match_validated_wheel(tmp_path: Path) -> None:
+    context = build_context(tmp_path)
+    wrong = resolved_package("demo", "9", digest=context.wheels[0].download.sha256)
+    broken = replace(
+        context,
+        resolution=replace(context.resolution, packages=(wrong,)),
+    )
+    snapshot = context.wheels[0].report.snapshot
+    assert snapshot is not None
+    output = tmp_path / "output"
+    output.mkdir()
+
+    with pytest.raises(ArtifactBuildError, match="closure validation"):
+        ArtifactBuilder().build(broken, output)
+
+    assert not snapshot.path.exists()
+
+
+def test_resolved_wheel_filename_must_match_validated_wheel(tmp_path: Path) -> None:
+    context = build_context(tmp_path)
+    package = context.resolution.packages[0]
+    broken = replace(
+        context,
+        resolution=replace(
+            context.resolution,
+            packages=(replace(package, wheel_filename="other-1.2.3-py3-none-any.whl"),),
+        ),
+    )
+    output = tmp_path / "output"
+    output.mkdir()
+
+    with pytest.raises(ArtifactBuildError, match="resolved Wheel filename"):
+        ArtifactBuilder().build(broken, output)
+
+
+def test_target_incompatible_wheel_cannot_use_stale_complete_report(tmp_path: Path) -> None:
+    pair = validated_wheel(tmp_path)
+    old_snapshot = pair.report.snapshot
+    assert old_snapshot is not None
+    incompatible_name = "demo-1.2.3-cp311-cp311-manylinux2014_x86_64.whl"
+    incompatible_path = old_snapshot.path.with_name(incompatible_name)
+    old_snapshot.path.rename(incompatible_path)
+    incompatible_snapshot = replace(old_snapshot, path=incompatible_path)
+    incompatible_tags = frozenset(
+        {Tag("cp311", "cp311", "manylinux2014_x86_64")}
+    )
+    pair = ValidatedWheel(
+        replace(pair.download, filename=incompatible_name, tags=incompatible_tags),
+        replace(
+            pair.report,
+            tags=incompatible_tags,
+            snapshot=incompatible_snapshot,
+        ),
+    )
+    package = replace(
+        resolved_package(digest=pair.download.sha256), wheel_filename=incompatible_name
+    )
+    context = ArtifactBuildContext(
+        BUILD_ID,
+        "demo\n",
+        ResolutionResult("1", (package,)),
+        (),
+        target_profile("WINDOWS"),
+        StaticValidationReport((), True),
+        (pair,),
+    )
+    output = tmp_path / "output"
+    output.mkdir()
+
+    with pytest.raises(ArtifactBuildError, match="closure validation"):
+        ArtifactBuilder().build(context, output)
+
+    assert not incompatible_path.exists()
+
+
+def test_supplied_validation_report_must_equal_recomputed_report(tmp_path: Path) -> None:
+    context = build_context(tmp_path)
+    stale_issue = ValidationIssue(
+        ValidationIssueCode.WHEEL_MISSING,
+        "demo",
+        "stale issue",
+    )
+    broken = replace(
+        context,
+        validation=StaticValidationReport((stale_issue,), False),
+    )
+    output = tmp_path / "output"
+    output.mkdir()
+
+    with pytest.raises(ArtifactBuildError, match="closure validation report"):
+        ArtifactBuilder().build(broken, output)
 
 
 def test_partial_missing_package_without_one_sha256_is_rejected(tmp_path: Path) -> None:
@@ -671,23 +1221,20 @@ def unordered_context(root: Path, *, reverse: bool) -> ArtifactBuildContext:
             PackageSource.ALIYUN,
         ),
     )
-    issues = (
-        ValidationIssue(ValidationIssueCode.WHEEL_MISSING, "zeta", "z issue"),
-        ValidationIssue(ValidationIssueCode.REQUIRES_DIST_INVALID, "alpha", "a issue"),
-    )
     wheels = (alpha, beta)
     if reverse:
         packages = tuple(reversed(packages))
         changes = tuple(reversed(changes))
-        issues = tuple(reversed(issues))
         wheels = tuple(reversed(wheels))
+    resolution = ResolutionResult("1", packages, changes=changes)
+    target = target_profile()
     return ArtifactBuildContext(
         BUILD_ID,
         "alpha\nbeta\n",
-        ResolutionResult("1", packages),
+        resolution,
         changes,
-        target_profile(),
-        StaticValidationReport(issues, False),
+        target,
+        validate_closure(resolution, (item.download for item in wheels), target),
         wheels,
     )
 
@@ -704,6 +1251,78 @@ def test_all_manifest_lists_and_zip_bytes_have_stable_ordering(tmp_path: Path) -
 
     first = ArtifactBuilder().build(unordered_context(first_root, reverse=False), first_output)
     second = ArtifactBuilder().build(unordered_context(second_root, reverse=True), second_output)
+
+    assert first.manifest == second.manifest
+    assert first.path.read_bytes() == second.path.read_bytes()
+
+
+@pytest.mark.parametrize("tampered", [False, True])
+def test_version_comparison_must_exactly_match_resolution_changes(
+    tmp_path: Path, tampered: bool
+) -> None:
+    context = partial_context(tmp_path)
+    supplied = ()
+    if tampered:
+        supplied = (replace(context.resolution.changes[0], reason="tampered"),)
+    broken = replace(context, version_changes=supplied)
+    snapshot = context.wheels[0].report.snapshot
+    assert snapshot is not None
+    output = tmp_path / "output"
+    output.mkdir()
+
+    with pytest.raises(ArtifactBuildError, match="version comparison"):
+        ArtifactBuilder().build(broken, output)
+
+    assert list(output.iterdir()) == []
+    assert not snapshot.path.exists()
+
+
+def test_validation_issue_sort_uses_every_exact_emitted_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    issues = (
+        ValidationIssue(
+            ValidationIssueCode.WHEEL_MISSING,
+            "Demo",
+            "same detail",
+            None,
+        ),
+        ValidationIssue(
+            ValidationIssueCode.WHEEL_MISSING,
+            "demo",
+            "same detail",
+            "",
+        ),
+    )
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    first_context = replace(
+        build_context(first_root),
+        validation=StaticValidationReport(issues, False),
+    )
+    second_context = replace(
+        build_context(second_root),
+        validation=StaticValidationReport(tuple(reversed(issues)), False),
+    )
+    monkeypatch.setattr(
+        builder_module,
+        "validate_closure",
+        lambda resolution, wheels, target: first_context.validation,
+    )
+    first_output = first_root / "output"
+    second_output = second_root / "output"
+    first_output.mkdir()
+    second_output.mkdir()
+
+    first = ArtifactBuilder().build(first_context, first_output)
+    monkeypatch.setattr(
+        builder_module,
+        "validate_closure",
+        lambda resolution, wheels, target: second_context.validation,
+    )
+    second = ArtifactBuilder().build(second_context, second_output)
 
     assert first.manifest == second.manifest
     assert first.path.read_bytes() == second.path.read_bytes()
@@ -740,6 +1359,77 @@ def test_windows_partial_scripts_fail_without_invoking_pip(tmp_path: Path) -> No
             assert "pip" not in script
 
 
+@pytest.mark.parametrize("script_name", ["install.sh", "verify.sh"])
+def test_linux_scripts_run_from_any_cwd_with_metacharacters_in_artifact_path(
+    tmp_path: Path, script_name: str
+) -> None:
+    context = build_context(tmp_path)
+    output = tmp_path / "output"
+    output.mkdir()
+    artifact = ArtifactBuilder().build(context, output)
+    extracted = tmp_path / "artifact $value; semi [space]"
+    with ZipFile(artifact.path) as archive:
+        archive.extractall(extracted)
+    script = extracted / script_name
+    script.chmod(0o700)
+    unrelated = tmp_path / "unrelated cwd"
+    unrelated.mkdir()
+    commands = tmp_path / "stub commands"
+    commands.mkdir()
+    cwd_log = tmp_path / f"{script_name}.cwd"
+    uname = commands / "uname"
+    uname.write_text(
+        "#!/bin/sh\n[ \"$1\" = \"-s\" ] && echo Linux || echo x86_64\n"
+    )
+    uname.chmod(0o700)
+    python = commands / "python"
+    python.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"-c\" ]; then exit 0; fi\n"
+        "[ -d packages ] && [ -f requirements-resolved.txt ] || exit 21\n"
+        "pwd > \"$WF_SCRIPT_CWD_LOG\"\n"
+    )
+    python.chmod(0o700)
+    sha256sum = commands / "sha256sum"
+    sha256sum.write_text(
+        "#!/bin/sh\n"
+        "[ \"$1\" = \"-c\" ] && [ -f \"$2\" ] || exit 22\n"
+        "pwd > \"$WF_SCRIPT_CWD_LOG\"\n"
+    )
+    sha256sum.chmod(0o700)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{commands}:{environment['PATH']}"
+    environment["WF_SCRIPT_CWD_LOG"] = str(cwd_log)
+
+    result = subprocess.run(
+        ["/bin/sh", str(script)],
+        cwd=unrelated,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert cwd_log.read_text().strip() == str(extracted)
+
+
+def test_windows_scripts_change_safely_to_their_own_directory_before_checks(
+    tmp_path: Path,
+) -> None:
+    context = build_context(tmp_path, os_name="WINDOWS")
+    output = tmp_path / "output"
+    output.mkdir()
+    artifact = ArtifactBuilder().build(context, output)
+
+    with ZipFile(artifact.path) as archive:
+        for name in ("install.bat", "verify.bat"):
+            script = archive.read(name).decode()
+            cd_command = 'cd /d "%~dp0"'
+            assert cd_command in script
+            assert script.index(cd_command) < script.index("%OS%")
+
+
 def test_builder_never_starts_processes_or_network_connections(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -757,6 +1447,194 @@ def test_builder_never_starts_processes_or_network_connections(
     artifact = ArtifactBuilder().build(context, output)
 
     assert artifact.path.exists()
+
+
+def test_unknown_host_publication_backend_fails_closed_at_initialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(builder_module.sys, "platform", "unsupported-host")
+    monkeypatch.setattr(builder_module.os, "name", "posix")
+
+    with pytest.raises(ArtifactBuildError, match="publication backend is unavailable"):
+        ArtifactBuilder()
+
+
+def test_windows_host_without_safe_native_capabilities_fails_closed_at_initialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(builder_module.sys, "platform", "win32")
+    monkeypatch.setattr(builder_module.os, "name", "nt")
+
+    with pytest.raises(ArtifactBuildError, match="Windows publication backend"):
+        ArtifactBuilder()
+
+
+def test_windows_backend_uses_stable_handles_without_dir_fd(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "output"
+    staged = output / ".stage.tmp"
+    final = output / "artifact.zip"
+    api = FakeWindowsNativeApi(output, staged, final)
+
+    backend = builder_module._WindowsPublicationBackend(output, api)
+
+    identity = backend.stage_identity(7, staged)
+    backend.require_stage(7, staged, identity)
+    backend.publish(7, staged, final, identity)
+    backend.cleanup_stage(7, staged, identity)
+    backend.close()
+
+    assert api.renamed == [(api.stage_handle, api.directory_handle, final.name)]
+    assert api.deleted == [api.stage_handle]
+    assert api.closed == [api.stage_handle, api.directory_handle]
+
+
+def test_windows_backend_rejects_reparse_output_handle_at_initialization(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "output"
+    staged = output / ".stage.tmp"
+    final = output / "artifact.zip"
+    api = FakeWindowsNativeApi(output, staged, final)
+    api.reparse_handles.add(api.directory_handle)
+
+    with pytest.raises(ArtifactBuildError, match="reparse"):
+        builder_module._WindowsPublicationBackend(output, api)
+
+    assert api.closed == [api.directory_handle]
+
+
+def test_windows_native_api_opens_paths_without_following_reparse_points(
+    tmp_path: Path,
+) -> None:
+    class RecordingWindowsNativeApi(builder_module._WindowsNativeApi):
+        def __init__(self) -> None:
+            self.opened: list[tuple[Path, int]] = []
+
+        def _open_path(self, path: Path, access: int, flags: int) -> int:
+            self.opened.append((path, flags))
+            return 404
+
+        def handle_identity(self, handle: int) -> tuple[int, int]:
+            return (51, 52)
+
+        def handle_is_reparse(self, handle: int) -> bool:
+            return False
+
+        def close_handle(self, handle: int) -> None:
+            pass
+
+    output = tmp_path / "output"
+    staged = output / ".stage.tmp"
+    api = RecordingWindowsNativeApi()
+
+    api.open_directory(output)
+    assert api.path_identity(staged, directory=False) == (51, 52)
+
+    open_reparse_point = 0x00200000
+    assert [path for path, _flags in api.opened] == [output, staged]
+    assert all(flags & open_reparse_point for _path, flags in api.opened)
+
+
+def test_windows_backend_no_replace_rejects_existing_final_without_rename(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "output"
+    staged = output / ".stage.tmp"
+    final = output / "artifact.zip"
+    api = FakeWindowsNativeApi(output, staged, final)
+    api.paths[final] = (99, 100)
+    backend = builder_module._WindowsPublicationBackend(output, api)
+    identity = backend.stage_identity(7, staged)
+
+    with pytest.raises(FileExistsError):
+        backend.publish(7, staged, final, identity)
+
+    assert api.renamed == []
+    backend.close()
+
+
+def test_windows_backend_cleanup_preserves_external_stage_name_replacement(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "output"
+    staged = output / ".stage.tmp"
+    final = output / "artifact.zip"
+    api = FakeWindowsNativeApi(output, staged, final)
+    backend = builder_module._WindowsPublicationBackend(output, api)
+    identity = backend.stage_identity(7, staged)
+    external_identity = (31, 32)
+    api.paths[staged] = external_identity
+
+    backend.cleanup_stage(7, staged, identity)
+    backend.close()
+
+    assert api.deleted == [api.stage_handle]
+    assert api.paths[staged] == external_identity
+
+
+def test_windows_backend_output_identity_change_prevents_rename(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "output"
+    staged = output / ".stage.tmp"
+    final = output / "artifact.zip"
+    api = FakeWindowsNativeApi(output, staged, final)
+    backend = builder_module._WindowsPublicationBackend(output, api)
+    identity = backend.stage_identity(7, staged)
+    api.paths[output] = (41, 42)
+
+    with pytest.raises(ArtifactBuildError, match="output directory identity changed"):
+        backend.publish(7, staged, final, identity)
+
+    assert api.renamed == []
+    backend.close()
+
+
+def test_windows_backend_rejects_reparse_output_path_substitution(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "output"
+    staged = output / ".stage.tmp"
+    final = output / "artifact.zip"
+    api = FakeWindowsNativeApi(output, staged, final)
+    backend = builder_module._WindowsPublicationBackend(output, api)
+    identity = backend.stage_identity(7, staged)
+    api.reparse_paths.add(output)
+
+    with pytest.raises(ArtifactBuildError, match="reparse"):
+        backend.publish(7, staged, final, identity)
+
+    assert api.renamed == []
+    backend.close()
+
+
+def test_windows_backend_close_attempts_every_handle_and_raises_first_error(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "output"
+    staged = output / ".stage.tmp"
+    final = output / "artifact.zip"
+    api = FakeWindowsNativeApi(output, staged, final)
+    backend = builder_module._WindowsPublicationBackend(output, api)
+    backend.stage_identity(7, staged)
+    second_stage_handle = 303
+    backend._stage_handles[8] = second_stage_handle
+    api.close_failures = {
+        api.stage_handle,
+        second_stage_handle,
+        api.directory_handle,
+    }
+
+    with pytest.raises(OSError, match=f"close failure {api.stage_handle}"):
+        backend.close()
+
+    assert api.closed == [
+        api.stage_handle,
+        second_stage_handle,
+        api.directory_handle,
+    ]
 
 
 def test_publication_race_preserves_external_final_file(
@@ -790,6 +1668,38 @@ def test_publication_race_preserves_external_final_file(
     assert [path.name for path in output.iterdir()] == [final.name]
 
 
+def test_staged_source_name_replacement_at_rename_boundary_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context = build_context(tmp_path)
+    output = tmp_path / "output"
+    output.mkdir()
+    final = output / f"wheelforge-{BUILD_ID}.zip"
+    external = b"external staged-name replacement"
+    rename = builder_module._rename_no_replace
+
+    def replace_source_then_rename(
+        staged: Path,
+        destination: Path,
+        symbol: str,
+        flag: int,
+        *extra: object,
+    ) -> None:
+        staged.unlink()
+        staged.write_bytes(external)
+        rename(staged, destination, symbol, flag, *extra)
+
+    monkeypatch.setattr(
+        builder_module, "_rename_no_replace", replace_source_then_rename
+    )
+
+    with pytest.raises(ArtifactBuildError, match="published ZIP identity changed"):
+        ArtifactBuilder().build(context, output)
+
+    assert final.read_bytes() == external
+    assert list(output.iterdir()) == [final]
+
+
 @pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlinks unavailable")
 def test_directory_swap_failure_removes_only_owned_stage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -803,10 +1713,11 @@ def test_directory_swap_failure_removes_only_owned_stage(
     replacement = b"attacker-owned replacement"
 
     def swap_directory_then_fail(
-        path: Path, expected_names: set[str], expected_hashes: dict[str, str]
+        staged: BinaryIO, expected_names: set[str], expected_hashes: dict[str, str]
     ) -> None:
         assert expected_names
         assert expected_hashes
+        path = next(output.iterdir())
         output.rename(moved_output)
         output.symlink_to(attacker, target_is_directory=True)
         (attacker / path.name).write_bytes(replacement)
@@ -856,6 +1767,76 @@ def test_duplicate_snapshot_reference_is_cleaned_exactly_once(
     assert calls == 1
 
 
+@pytest.mark.parametrize("malformed_index", [0, 1, 2])
+def test_malformed_wheel_member_cleans_every_discoverable_snapshot_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    malformed_index: int,
+) -> None:
+    alpha = validated_wheel(tmp_path, name="alpha", version="1")
+    beta = validated_wheel(tmp_path, name="beta", version="2")
+    context = ArtifactBuildContext(
+        BUILD_ID,
+        "alpha\nbeta\n",
+        ResolutionResult(
+            "1",
+            (
+                resolved_package("alpha", "1", digest=alpha.download.sha256),
+                resolved_package("beta", "2", digest=beta.download.sha256),
+            ),
+        ),
+        (),
+        target_profile(),
+        StaticValidationReport((), True),
+        (alpha, beta),
+    )
+    malformed = object()
+    members: list[object] = [alpha, beta]
+    members.insert(malformed_index, malformed)
+    broken = replace(context, wheels=tuple(members))  # type: ignore[arg-type]
+    snapshots = (alpha.report.snapshot, beta.report.snapshot)
+    assert all(snapshot is not None for snapshot in snapshots)
+    cleanup_calls: list[ValidatedWheelSnapshot] = []
+    cleanup = ValidatedWheelSnapshot.cleanup
+
+    def counted_cleanup(snapshot: ValidatedWheelSnapshot) -> None:
+        cleanup_calls.append(snapshot)
+        cleanup(snapshot)
+
+    monkeypatch.setattr(ValidatedWheelSnapshot, "cleanup", counted_cleanup)
+    output = tmp_path / "output"
+    output.mkdir()
+
+    with pytest.raises(ArtifactBuildError, match="ValidatedWheel"):
+        ArtifactBuilder().build(broken, output)
+
+    assert len(cleanup_calls) == 2
+    assert {id(snapshot) for snapshot in cleanup_calls} == {
+        id(snapshot) for snapshot in snapshots
+    }
+    assert all(not snapshot.path.exists() for snapshot in snapshots if snapshot)
+
+
+def test_malformed_wheel_error_remains_primary_when_snapshot_cleanup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context = build_context(tmp_path)
+    pair = context.wheels[0]
+    broken = replace(context, wheels=(pair, object()))  # type: ignore[arg-type]
+    cleanup = ValidatedWheelSnapshot.cleanup
+
+    def cleanup_then_fail(snapshot: ValidatedWheelSnapshot) -> None:
+        cleanup(snapshot)
+        raise OSError("injected cleanup failure")
+
+    monkeypatch.setattr(ValidatedWheelSnapshot, "cleanup", cleanup_then_fail)
+    output = tmp_path / "output"
+    output.mkdir()
+
+    with pytest.raises(ArtifactBuildError, match="ValidatedWheel"):
+        ArtifactBuilder().build(broken, output)
+
+
 def test_valid_replacement_of_staged_path_is_not_published(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -865,12 +1846,13 @@ def test_valid_replacement_of_staged_path_is_not_published(
     verify = builder_module._verify_zip
 
     def replace_with_valid_copy(
-        path: Path, expected_names: set[str], expected_hashes: dict[str, str]
+        staged: BinaryIO, expected_names: set[str], expected_hashes: dict[str, str]
     ) -> None:
+        path = next(output.iterdir())
         content = path.read_bytes()
         path.unlink()
         path.write_bytes(content)
-        verify(path, expected_names, expected_hashes)
+        verify(staged, expected_names, expected_hashes)
 
     monkeypatch.setattr(builder_module, "_verify_zip", replace_with_valid_copy)
 
@@ -889,8 +1871,9 @@ def test_staged_zip_metadata_tampering_is_rejected(
     verify = builder_module._verify_zip
 
     def tamper_metadata(
-        path: Path, expected_names: set[str], expected_hashes: dict[str, str]
+        staged: BinaryIO, expected_names: set[str], expected_hashes: dict[str, str]
     ) -> None:
+        path = next(output.iterdir())
         with ZipFile(path) as source:
             entries = {name: source.read(name) for name in source.namelist()}
         with ZipFile(path, "w") as replacement:
@@ -902,7 +1885,7 @@ def test_staged_zip_metadata_tampering_is_rejected(
                     info.date_time = (2025, 1, 2, 3, 4, 6)
                     info.external_attr = 0o100600 << 16
                 replacement.writestr(info, entries[name])
-        verify(path, expected_names, expected_hashes)
+        verify(staged, expected_names, expected_hashes)
 
     monkeypatch.setattr(builder_module, "_verify_zip", tamper_metadata)
 
@@ -923,9 +1906,10 @@ def test_output_directory_swap_before_publication_is_rejected(
     verify = builder_module._verify_zip
 
     def verify_then_swap(
-        path: Path, expected_names: set[str], expected_hashes: dict[str, str]
+        staged: BinaryIO, expected_names: set[str], expected_hashes: dict[str, str]
     ) -> None:
-        verify(path, expected_names, expected_hashes)
+        path = next(output.iterdir())
+        verify(staged, expected_names, expected_hashes)
         content = path.read_bytes()
         output.rename(moved_output)
         output.symlink_to(attacker, target_is_directory=True)
@@ -989,8 +1973,9 @@ def test_self_consistent_staged_content_tampering_is_rejected(
     verify = builder_module._verify_zip
 
     def tamper_with_valid_checksums(
-        path: Path, expected_names: set[str], expected_hashes: dict[str, str]
+        staged: BinaryIO, expected_names: set[str], expected_hashes: dict[str, str]
     ) -> None:
+        path = next(output.iterdir())
         with ZipFile(path) as source:
             entries = {name: source.read(name) for name in source.namelist()}
         entries["README.md"] = b"tampered but self-consistent\n"
@@ -1010,7 +1995,7 @@ def test_self_consistent_staged_content_tampering_is_rejected(
                     ),
                     entries[name],
                 )
-        verify(path, expected_names, expected_hashes)
+        verify(staged, expected_names, expected_hashes)
 
     monkeypatch.setattr(builder_module, "_verify_zip", tamper_with_valid_checksums)
 
