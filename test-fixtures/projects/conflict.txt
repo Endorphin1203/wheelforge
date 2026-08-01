@@ -1,0 +1,2 @@
+conflict-a==1.0.0
+conflict-b==1.0.0

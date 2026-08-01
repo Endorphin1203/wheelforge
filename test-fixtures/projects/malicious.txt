@@ -1,0 +1,5 @@
+git+https://example.invalid/repository.git
+-e .
+demo @ https://example.invalid/demo.whl
+-r other.txt
+../local-package

@@ -1,0 +1,4 @@
+unchanged-demo==1.2.3
+upgrade-demo==1.2.3
+downgrade-demo==1.2.3
+missing-demo==1.2.3
