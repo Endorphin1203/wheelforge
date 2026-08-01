@@ -1,0 +1,402 @@
+from __future__ import annotations
+
+import hashlib
+import os
+import re
+import shutil
+import stat
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import BinaryIO
+from uuid import UUID, uuid4
+
+
+_DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
+_CHUNK_SIZE = 64 * 1024
+
+
+class InvalidObjectKey(ValueError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class PublishedObject:
+    object_key: str
+    size_bytes: int
+    sha256: str
+
+
+@dataclass(slots=True)
+class _ParentBinding:
+    path: Path
+    descriptor: int | None
+
+    def close(self) -> None:
+        if self.descriptor is not None:
+            os.close(self.descriptor)
+            self.descriptor = None
+
+
+class RootedLocalStorage:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        uuid_factory: Callable[[], UUID] = uuid4,
+    ) -> None:
+        self.root = _require_stable_root(Path(root), "data root")
+        self._root_identity = _identity(self.root.lstat())
+        self._uuid_factory = uuid_factory
+
+    def read_bytes(self, object_key: str) -> bytes:
+        parts = _object_key_parts(object_key)
+        parent = self._open_parent(parts[:-1], create=False)
+        try:
+            descriptor = _open_regular(parent, parts[-1], os.O_RDONLY)
+            try:
+                before = os.fstat(descriptor)
+                with os.fdopen(os.dup(descriptor), "rb") as handle:
+                    content = handle.read()
+                after = os.fstat(descriptor)
+                _require_same_regular(before, after)
+                _require_named_identity(parent, parts[-1], _identity(after))
+                return content
+            finally:
+                os.close(descriptor)
+        finally:
+            parent.close()
+
+    def publish_bytes(self, object_key: str, content: bytes) -> PublishedObject:
+        if not isinstance(content, bytes):
+            raise TypeError("content must be bytes")
+        return self._publish(object_key, lambda handle: _write_bytes(handle, content))
+
+    def publish_file(self, object_key: str, source: Path) -> PublishedObject:
+        source = Path(source)
+
+        def copy(handle: BinaryIO) -> tuple[int, str]:
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            source_descriptor = os.open(source, flags)
+            try:
+                before = os.fstat(source_descriptor)
+                if not stat.S_ISREG(before.st_mode):
+                    raise OSError("artifact source must be a regular file")
+                digest = hashlib.sha256()
+                size = 0
+                with os.fdopen(os.dup(source_descriptor), "rb") as input_handle:
+                    while chunk := input_handle.read(_CHUNK_SIZE):
+                        handle.write(chunk)
+                        digest.update(chunk)
+                        size += len(chunk)
+                after = os.fstat(source_descriptor)
+                _require_same_regular(before, after)
+                return size, digest.hexdigest()
+            finally:
+                os.close(source_descriptor)
+
+        return self._publish(object_key, copy)
+
+    def delete_if_owned(self, object_key: str, expected_sha256: str) -> bool:
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+            return False
+        parts = _object_key_parts(object_key)
+        try:
+            parent = self._open_parent(parts[:-1], create=False)
+        except FileNotFoundError:
+            return False
+        try:
+            try:
+                descriptor = _open_regular(parent, parts[-1], os.O_RDONLY)
+            except FileNotFoundError:
+                return False
+            try:
+                before = os.fstat(descriptor)
+                digest = _hash_descriptor(descriptor)
+                after = os.fstat(descriptor)
+                _require_same_regular(before, after)
+                identity = _identity(after)
+                _require_named_identity(parent, parts[-1], identity)
+                if digest != expected_sha256:
+                    return False
+                _unlink_named(parent, parts[-1])
+                return True
+            finally:
+                os.close(descriptor)
+        finally:
+            parent.close()
+
+    def _publish(
+        self,
+        object_key: str,
+        writer: Callable[[BinaryIO], tuple[int, str]],
+    ) -> PublishedObject:
+        parts = _object_key_parts(object_key)
+        parent = self._open_parent(parts[:-1], create=True)
+        stage_name = f".wf-stage-{self._uuid_factory()}"
+        descriptor: int | None = None
+        staged = False
+        try:
+            descriptor = _create_exclusive(parent, stage_name)
+            staged = True
+            with os.fdopen(os.dup(descriptor), "wb") as handle:
+                size, digest = writer(handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            status = os.fstat(descriptor)
+            if not stat.S_ISREG(status.st_mode) or status.st_size != size:
+                raise OSError("published object changed while it was copied")
+            _require_named_identity(parent, stage_name, _identity(status))
+            _link_no_replace(parent, stage_name, parts[-1])
+            _unlink_named(parent, stage_name)
+            staged = False
+            return PublishedObject(object_key, size, digest)
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            if staged:
+                try:
+                    _unlink_named(parent, stage_name)
+                except FileNotFoundError:
+                    pass
+            parent.close()
+
+    def _open_parent(self, parts: tuple[str, ...], *, create: bool) -> _ParentBinding:
+        self._require_root()
+        supports_dir_fd = os.open in os.supports_dir_fd
+        if supports_dir_fd:
+            descriptor = os.open(
+                self.root,
+                os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+            )
+            current = self.root
+            try:
+                for part in parts:
+                    if create:
+                        try:
+                            os.mkdir(part, 0o700, dir_fd=descriptor)
+                        except FileExistsError:
+                            pass
+                    next_descriptor = os.open(
+                        part,
+                        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=descriptor,
+                    )
+                    os.close(descriptor)
+                    descriptor = next_descriptor
+                    current /= part
+                return _ParentBinding(current, descriptor)
+            except BaseException:
+                os.close(descriptor)
+                raise
+
+        current = self.root
+        for part in parts:
+            current /= part
+            if create:
+                current.mkdir(mode=0o700, exist_ok=True)
+            _require_plain_directory(current)
+        return _ParentBinding(current, None)
+
+    def _require_root(self) -> None:
+        status = self.root.lstat()
+        if (
+            not stat.S_ISDIR(status.st_mode)
+            or stat.S_ISLNK(status.st_mode)
+            or _is_reparse(status)
+            or _identity(status) != self._root_identity
+        ):
+            raise OSError("data root identity changed")
+
+
+@dataclass(slots=True)
+class OwnedWorkspace:
+    path: Path
+    _root: Path
+    _root_identity: tuple[int, int]
+    _identity: tuple[int, int]
+    _cleaned: bool = False
+
+    def cleanup(self) -> None:
+        if self._cleaned:
+            return
+        root_status = self._root.lstat()
+        if _identity(root_status) != self._root_identity:
+            raise RuntimeError("workspace root identity changed")
+        child_status = self.path.lstat()
+        if (
+            not stat.S_ISDIR(child_status.st_mode)
+            or stat.S_ISLNK(child_status.st_mode)
+            or _is_reparse(child_status)
+            or _identity(child_status) != self._identity
+        ):
+            raise RuntimeError("workspace identity changed")
+        if os.open in os.supports_dir_fd and shutil.rmtree.avoids_symlink_attacks:
+            root_descriptor = os.open(
+                self._root,
+                os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+            )
+            try:
+                current = os.stat(
+                    self.path.name, dir_fd=root_descriptor, follow_symlinks=False
+                )
+                if _identity(current) != self._identity:
+                    raise RuntimeError("workspace identity changed")
+                shutil.rmtree(self.path.name, dir_fd=root_descriptor)
+            finally:
+                os.close(root_descriptor)
+        else:
+            shutil.rmtree(self.path)
+        self._cleaned = True
+
+
+class WorkspaceManager:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        uuid_factory: Callable[[], UUID] = uuid4,
+    ) -> None:
+        self.root = _require_stable_root(Path(root), "workspace root")
+        self._root_identity = _identity(self.root.lstat())
+        self._uuid_factory = uuid_factory
+
+    def allocate(self) -> OwnedWorkspace:
+        root_status = self.root.lstat()
+        if _identity(root_status) != self._root_identity:
+            raise RuntimeError("workspace root identity changed")
+        for _attempt in range(128):
+            name = f"wf-execution-{self._uuid_factory()}"
+            path = self.root / name
+            try:
+                path.mkdir(mode=0o700)
+            except FileExistsError:
+                continue
+            status = path.lstat()
+            if not stat.S_ISDIR(status.st_mode) or _is_reparse(status):
+                raise RuntimeError("allocated workspace is not a plain directory")
+            return OwnedWorkspace(
+                path,
+                self.root,
+                self._root_identity,
+                _identity(status),
+            )
+        raise RuntimeError("could not allocate a unique workspace")
+
+
+def _object_key_parts(object_key: str) -> tuple[str, ...]:
+    if not isinstance(object_key, str) or not object_key or "\x00" in object_key:
+        raise InvalidObjectKey("object key must be a non-empty relative POSIX path")
+    if "\\" in object_key:
+        raise InvalidObjectKey("object key must use relative POSIX components")
+    parts = tuple(object_key.split("/"))
+    if any(part in ("", ".", "..") or _DRIVE_PREFIX.match(part) for part in parts):
+        raise InvalidObjectKey("object key must use safe relative components")
+    return parts
+
+
+def _require_stable_root(path: Path, label: str) -> Path:
+    if not path.is_absolute():
+        raise ValueError(f"{label} must be absolute")
+    _require_plain_directory(path)
+    current = path
+    while current != current.parent:
+        status = current.lstat()
+        if stat.S_ISLNK(status.st_mode) or _is_reparse(status):
+            raise ValueError(f"{label} must not traverse links")
+        current = current.parent
+    return path.absolute()
+
+
+def _require_plain_directory(path: Path) -> None:
+    status = path.lstat()
+    if (
+        not stat.S_ISDIR(status.st_mode)
+        or stat.S_ISLNK(status.st_mode)
+        or _is_reparse(status)
+    ):
+        raise ValueError("path must be a plain directory")
+
+
+def _is_reparse(status: os.stat_result) -> bool:
+    attributes = getattr(status, "st_file_attributes", 0)
+    return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+
+
+def _identity(status: os.stat_result) -> tuple[int, int]:
+    return status.st_dev, status.st_ino
+
+
+def _open_regular(parent: _ParentBinding, name: str, flags: int) -> int:
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    if parent.descriptor is not None:
+        descriptor = os.open(name, flags, dir_fd=parent.descriptor)
+    else:
+        descriptor = os.open(parent.path / name, flags)
+    status = os.fstat(descriptor)
+    if not stat.S_ISREG(status.st_mode):
+        os.close(descriptor)
+        raise OSError("object must be a regular file")
+    return descriptor
+
+
+def _create_exclusive(parent: _ParentBinding, name: str) -> int:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    if parent.descriptor is not None:
+        return os.open(name, flags, 0o600, dir_fd=parent.descriptor)
+    return os.open(parent.path / name, flags, 0o600)
+
+
+def _require_named_identity(
+    parent: _ParentBinding, name: str, expected: tuple[int, int]
+) -> None:
+    if parent.descriptor is not None:
+        status = os.stat(name, dir_fd=parent.descriptor, follow_symlinks=False)
+    else:
+        status = (parent.path / name).lstat()
+    if not stat.S_ISREG(status.st_mode) or _identity(status) != expected:
+        raise OSError("object identity changed")
+
+
+def _link_no_replace(parent: _ParentBinding, source: str, target: str) -> None:
+    if parent.descriptor is not None and os.link in os.supports_dir_fd:
+        os.link(
+            source,
+            target,
+            src_dir_fd=parent.descriptor,
+            dst_dir_fd=parent.descriptor,
+            follow_symlinks=False,
+        )
+    else:
+        os.link(parent.path / source, parent.path / target, follow_symlinks=False)
+
+
+def _unlink_named(parent: _ParentBinding, name: str) -> None:
+    if parent.descriptor is not None and os.unlink in os.supports_dir_fd:
+        os.unlink(name, dir_fd=parent.descriptor)
+    else:
+        os.unlink(parent.path / name)
+
+
+def _write_bytes(handle: BinaryIO, content: bytes) -> tuple[int, str]:
+    handle.write(content)
+    return len(content), hashlib.sha256(content).hexdigest()
+
+
+def _hash_descriptor(descriptor: int) -> str:
+    digest = hashlib.sha256()
+    with os.fdopen(os.dup(descriptor), "rb") as handle:
+        while chunk := handle.read(_CHUNK_SIZE):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _require_same_regular(before: os.stat_result, after: os.stat_result) -> None:
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or not stat.S_ISREG(after.st_mode)
+        or _identity(before) != _identity(after)
+        or before.st_size != after.st_size
+        or before.st_mtime_ns != after.st_mtime_ns
+    ):
+        raise OSError("regular file changed while it was open")
