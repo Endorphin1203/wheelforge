@@ -9,6 +9,7 @@ import io
 import json
 import os
 import re
+import secrets
 import stat
 import sys
 import tempfile
@@ -47,6 +48,8 @@ _FileIdentity = tuple[int, int]
 
 
 class _WindowsApi(Protocol):
+    def create_stage(self, path: Path) -> int: ...
+
     def open_directory(self, path: Path) -> int: ...
 
     def close_handle(self, handle: int) -> None: ...
@@ -117,10 +120,7 @@ class ArtifactBuilder:
 
         publication = _open_publication_backend(self._publication_backend, output_dir)
         try:
-            descriptor, staged_name = tempfile.mkstemp(
-                prefix=".wheelforge-artifact-", suffix=".tmp", dir=output_dir
-            )
-            staged_path = Path(staged_name)
+            descriptor, staged_path = publication.create_stage()
             try:
                 try:
                     staged_identity = publication.stage_identity(
@@ -226,6 +226,8 @@ def _windows_publication_capabilities() -> bool:
 
 
 class _PublicationBackend(Protocol):
+    def create_stage(self) -> tuple[int, Path]: ...
+
     def stage_identity(self, descriptor: int, staged: Path) -> _FileIdentity: ...
 
     def require_output(self) -> None: ...
@@ -263,6 +265,14 @@ class _UnixPublicationBackend:
     def __init__(self, output_dir: Path) -> None:
         self._output_dir = output_dir
         self._directory_descriptor = _open_output_directory(output_dir)
+
+    def create_stage(self) -> tuple[int, Path]:
+        descriptor, name = tempfile.mkstemp(
+            prefix=".wheelforge-artifact-",
+            suffix=".tmp",
+            dir=self._output_dir,
+        )
+        return descriptor, Path(name)
 
     def stage_identity(self, descriptor: int, staged: Path) -> _FileIdentity:
         expected = _identity(os.fstat(descriptor))
@@ -333,6 +343,21 @@ class _WindowsPublicationBackend:
                 lambda: api.close_handle(self._directory_handle)
             )
             raise
+
+    def create_stage(self) -> tuple[int, Path]:
+        for _attempt in range(128):
+            staged = self._output_dir / (
+                f".wheelforge-artifact-{secrets.token_hex(16)}.tmp"
+            )
+            try:
+                return self._api.create_stage(staged), staged
+            except OSError as error:
+                if error.errno == errno.EEXIST or getattr(
+                    error, "winerror", None
+                ) in {80, 183}:
+                    continue
+                raise
+        raise ArtifactBuildError("could not allocate a private staged ZIP")
 
     def _stage_handle(self, descriptor: int) -> int:
         handle = self._stage_handles.get(descriptor)
@@ -466,10 +491,12 @@ class _WindowsNativeApi:
     _FILE_LIST_DIRECTORY = 0x0001
     _FILE_READ_ATTRIBUTES = 0x0080
     _FILE_SHARE_ALL = 0x00000007
+    _CREATE_NEW = 1
     _OPEN_EXISTING = 3
     _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
     _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
     _FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+    _FILE_ATTRIBUTE_TEMPORARY = 0x00000100
     _FILE_RENAME_INFORMATION = 3
     _FILE_DISPOSITION_INFORMATION = 4
     _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
@@ -522,13 +549,44 @@ class _WindowsNativeApi:
             | self._FILE_FLAG_OPEN_REPARSE_POINT,
         )
 
-    def _open_path(self, path: Path, access: int, flags: int) -> int:
+    def create_stage(self, path: Path) -> int:
+        handle = self._open_path(
+            path,
+            self._GENERIC_READ | self._GENERIC_WRITE | self._DELETE,
+            self._FILE_FLAG_OPEN_REPARSE_POINT | self._FILE_ATTRIBUTE_TEMPORARY,
+            creation=self._CREATE_NEW,
+            share=self._FILE_SHARE_ALL,
+        )
+        try:
+            try:
+                import msvcrt
+            except ImportError as error:
+                raise ArtifactBuildError(
+                    "safe Windows publication backend is unavailable"
+                ) from error
+            return msvcrt.open_osfhandle(  # type: ignore[attr-defined]
+                handle, os.O_RDWR | getattr(os, "O_BINARY", 0)
+            )
+        except BaseException:
+            _cleanup_preserving_primary(lambda: self.delete_handle(handle))
+            _cleanup_preserving_primary(lambda: self.close_handle(handle))
+            raise
+
+    def _open_path(
+        self,
+        path: Path,
+        access: int,
+        flags: int,
+        *,
+        creation: int = _OPEN_EXISTING,
+        share: int = _FILE_SHARE_ALL,
+    ) -> int:
         handle = self._kernel32.CreateFileW(
             str(path),
             access,
-            self._FILE_SHARE_ALL,
+            share,
             None,
-            self._OPEN_EXISTING,
+            creation,
             flags,
             None,
         )
@@ -601,7 +659,7 @@ class _WindowsNativeApi:
                 )
             return self.handle_identity(handle)
         finally:
-            self.close_handle(handle)
+            _cleanup_preserving_primary(lambda: self.close_handle(handle))
 
     def rename_handle(
         self, handle: int, directory_handle: int, final_name: str
@@ -1100,7 +1158,7 @@ def _duplicate_stream(descriptor: int, mode: str) -> BinaryIO:
         return cast(BinaryIO, stream)
     except BaseException:
         if duplicate != -1:
-            os.close(duplicate)
+            _cleanup_preserving_primary(lambda: os.close(duplicate))
         raise
 
 
@@ -1139,7 +1197,7 @@ def _open_output_directory(path: Path) -> int:
         return descriptor
     except BaseException:
         if "descriptor" in locals():
-            os.close(descriptor)
+            _cleanup_preserving_primary(lambda: os.close(descriptor))
         raise
 
 

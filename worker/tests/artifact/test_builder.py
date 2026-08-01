@@ -8,8 +8,10 @@ import json
 import os
 import socket
 import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import BinaryIO
 from zipfile import ZipFile
 
@@ -96,6 +98,13 @@ class FaultingBinaryFile:
 
 
 class FakeWindowsNativeApi:
+    GENERIC_READ = 0x80000000
+    GENERIC_WRITE = 0x40000000
+    DELETE = 0x00010000
+    FILE_SHARE_READ = 0x00000001
+    FILE_SHARE_WRITE = 0x00000002
+    FILE_SHARE_DELETE = 0x00000004
+
     def __init__(self, output: Path, staged: Path, final: Path) -> None:
         self.output = output
         self.staged = staged
@@ -115,6 +124,18 @@ class FakeWindowsNativeApi:
         self.close_failures: set[int] = set()
         self.reparse_handles: set[int] = set()
         self.reparse_paths: set[Path] = set()
+        self.stage_access = self.GENERIC_READ | self.GENERIC_WRITE | self.DELETE
+        self.stage_share = (
+            self.FILE_SHARE_READ | self.FILE_SHARE_WRITE | self.FILE_SHARE_DELETE
+        )
+        self.created_stages: list[Path] = []
+
+    def create_stage(self, path: Path) -> int:
+        self.paths.pop(self.staged, None)
+        self.staged = path
+        self.paths[path] = self.stage_identity
+        self.created_stages.append(path)
+        return 7
 
     def open_directory(self, path: Path) -> int:
         assert path == self.output
@@ -127,6 +148,8 @@ class FakeWindowsNativeApi:
 
     def descriptor_handle(self, descriptor: int) -> int:
         assert descriptor == 7
+        if not self.stage_share & self.FILE_SHARE_DELETE:
+            raise OSError(errno.EACCES, "simulated sharing violation")
         return self.stage_handle
 
     def handle_identity(self, handle: int) -> tuple[int, int]:
@@ -580,6 +603,41 @@ def test_staged_verification_failure_removes_stage_and_cleans_snapshot(
     assert not snapshot.path.exists()
 
 
+def test_builder_delegates_stage_creation_to_publication_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context = build_context(tmp_path)
+    output = tmp_path / "output"
+    output.mkdir()
+    mkstemp = builder_module.tempfile.mkstemp
+
+    class BackendOwnedStage:
+        def __init__(self, wrapped: object) -> None:
+            self.wrapped = wrapped
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self.wrapped, name)
+
+        def create_stage(self) -> tuple[int, Path]:
+            descriptor, name = mkstemp(
+                prefix=".wheelforge-artifact-", suffix=".tmp", dir=output
+            )
+            return descriptor, Path(name)
+
+    def open_backend(kind: str, path: Path) -> object:
+        return BackendOwnedStage(builder_module._UnixPublicationBackend(path))
+
+    def forbidden_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+        raise AssertionError("builder called tempfile.mkstemp directly")
+
+    monkeypatch.setattr(builder_module, "_open_publication_backend", open_backend)
+    monkeypatch.setattr(builder_module.tempfile, "mkstemp", forbidden_mkstemp)
+
+    artifact = ArtifactBuilder().build(context, output)
+
+    assert artifact.path.exists()
+
+
 def test_staged_fdopen_failure_closes_all_descriptors_and_preserves_primary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -623,6 +681,66 @@ def test_staged_fdopen_failure_closes_all_descriptors_and_preserves_primary(
             os.fstat(descriptor)
     assert list(output.iterdir()) == []
     assert not snapshot.path.exists()
+
+
+def test_duplicate_stream_close_failure_does_not_mask_fdopen_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    duplicate = 4242
+    close = builder_module.os.close
+    close_attempts: list[int] = []
+
+    def return_duplicate(descriptor: int) -> int:
+        return duplicate
+
+    def fail_fdopen(descriptor: int, mode: str) -> BinaryIO:
+        raise OSError("primary fdopen failure")
+
+    def fail_duplicate_close(descriptor: int) -> None:
+        if descriptor == duplicate:
+            close_attempts.append(descriptor)
+            raise OSError("duplicate close masked primary")
+        close(descriptor)
+
+    monkeypatch.setattr(builder_module.os, "dup", return_duplicate)
+    monkeypatch.setattr(builder_module.os, "fdopen", fail_fdopen)
+    monkeypatch.setattr(builder_module.os, "close", fail_duplicate_close)
+
+    with pytest.raises(OSError, match="primary fdopen failure"):
+        builder_module._duplicate_stream(12, "rb")
+
+    assert close_attempts == [duplicate]
+
+
+def test_output_directory_close_failure_does_not_mask_inspection_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory_descriptor = 4343
+    close = builder_module.os.close
+    close_attempts: list[int] = []
+
+    def open_directory(path: Path, flags: int) -> int:
+        return directory_descriptor
+
+    def fail_fstat(descriptor: int) -> os.stat_result:
+        if descriptor == directory_descriptor:
+            raise OSError("primary directory inspection failure")
+        return os.fstat(descriptor)
+
+    def fail_directory_close(descriptor: int) -> None:
+        if descriptor == directory_descriptor:
+            close_attempts.append(descriptor)
+            raise OSError("directory close masked primary")
+        close(descriptor)
+
+    monkeypatch.setattr(builder_module.os, "open", open_directory)
+    monkeypatch.setattr(builder_module.os, "fstat", fail_fstat)
+    monkeypatch.setattr(builder_module.os, "close", fail_directory_close)
+
+    with pytest.raises(OSError, match="primary directory inspection failure"):
+        builder_module._open_output_directory(tmp_path)
+
+    assert close_attempts == [directory_descriptor]
 
 
 def test_staged_zip_is_never_reopened_by_path(
@@ -1490,6 +1608,43 @@ def test_windows_backend_uses_stable_handles_without_dir_fd(
     assert api.closed == [api.stage_handle, api.directory_handle]
 
 
+def test_windows_backend_stage_creation_models_delete_share_compatibility(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "output"
+    initial_stage = output / ".unused.tmp"
+    final = output / "artifact.zip"
+    api = FakeWindowsNativeApi(output, initial_stage, final)
+    backend = builder_module._WindowsPublicationBackend(output, api)
+
+    descriptor, staged = backend.create_stage()
+    identity = backend.stage_identity(descriptor, staged)
+
+    assert identity == api.stage_identity
+    assert api.stage_access == api.GENERIC_READ | api.GENERIC_WRITE | api.DELETE
+    assert api.stage_share & api.FILE_SHARE_DELETE
+    assert api.created_stages == [staged]
+    backend.close()
+
+
+def test_windows_backend_reopen_fails_when_stage_does_not_share_delete(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "output"
+    initial_stage = output / ".unused.tmp"
+    final = output / "artifact.zip"
+    api = FakeWindowsNativeApi(output, initial_stage, final)
+    api.stage_share = api.FILE_SHARE_READ | api.FILE_SHARE_WRITE
+    backend = builder_module._WindowsPublicationBackend(output, api)
+    descriptor, staged = backend.create_stage()
+
+    with pytest.raises(OSError, match="sharing violation"):
+        backend.stage_identity(descriptor, staged)
+
+    backend.cleanup_unbound_stage(descriptor, staged)
+    backend.close()
+
+
 def test_windows_backend_rejects_reparse_output_handle_at_initialization(
     tmp_path: Path,
 ) -> None:
@@ -1535,6 +1690,196 @@ def test_windows_native_api_opens_paths_without_following_reparse_points(
     open_reparse_point = 0x00200000
     assert [path for path, _flags in api.opened] == [output, staged]
     assert all(flags & open_reparse_point for _path, flags in api.opened)
+
+
+def test_windows_native_api_creates_delete_shareable_stage_and_transfers_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class RecordingWindowsNativeApi(builder_module._WindowsNativeApi):
+        def __init__(self) -> None:
+            self.opened: list[tuple[Path, int, int, int, int]] = []
+
+        def _open_path(
+            self,
+            path: Path,
+            access: int,
+            flags: int,
+            *,
+            creation: int,
+            share: int,
+        ) -> int:
+            self.opened.append((path, access, share, creation, flags))
+            return 505
+
+    transferred: list[tuple[int, int]] = []
+
+    def open_osfhandle(handle: int, flags: int) -> int:
+        transferred.append((handle, flags))
+        return 77
+
+    monkeypatch.setitem(
+        sys.modules,
+        "msvcrt",
+        SimpleNamespace(open_osfhandle=open_osfhandle),
+    )
+    staged = tmp_path / ".wheelforge-artifact-random.tmp"
+    api = RecordingWindowsNativeApi()
+
+    descriptor = api.create_stage(staged)
+
+    assert descriptor == 77
+    assert transferred == [(505, os.O_RDWR | getattr(os, "O_BINARY", 0))]
+    assert api.opened == [
+        (
+            staged,
+            0x80000000 | 0x40000000 | 0x00010000,
+            0x00000001 | 0x00000002 | 0x00000004,
+            1,
+            0x00200000 | 0x00000100,
+        )
+    ]
+
+
+def test_windows_native_stage_transfer_failure_deletes_and_closes_without_masking_primary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class RecordingWindowsNativeApi(builder_module._WindowsNativeApi):
+        def __init__(self) -> None:
+            self.deleted: list[int] = []
+            self.closed: list[int] = []
+            self.cleanup_calls: list[str] = []
+
+        def _open_path(
+            self,
+            path: Path,
+            access: int,
+            flags: int,
+            *,
+            creation: int,
+            share: int,
+        ) -> int:
+            return 606
+
+        def delete_handle(self, handle: int) -> None:
+            self.cleanup_calls.append("delete")
+            self.deleted.append(handle)
+            raise OSError("injected native handle delete failure")
+
+        def close_handle(self, handle: int) -> None:
+            self.cleanup_calls.append("close")
+            self.closed.append(handle)
+            raise OSError("injected native handle close failure")
+
+    def fail_open_osfhandle(handle: int, flags: int) -> int:
+        raise OSError("primary CRT transfer failure")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "msvcrt",
+        SimpleNamespace(open_osfhandle=fail_open_osfhandle),
+    )
+    api = RecordingWindowsNativeApi()
+
+    with pytest.raises(OSError, match="primary CRT transfer failure"):
+        api.create_stage(tmp_path / ".stage.tmp")
+
+    assert api.deleted == [606]
+    assert api.closed == [606]
+    assert api.cleanup_calls == ["delete", "close"]
+
+
+@pytest.mark.parametrize("primary", ["reparse", "identity"])
+def test_windows_path_identity_close_failure_does_not_mask_primary(
+    tmp_path: Path, primary: str
+) -> None:
+    class FaultingWindowsNativeApi(builder_module._WindowsNativeApi):
+        def __init__(self) -> None:
+            self.closed: list[int] = []
+
+        def _open_path(
+            self,
+            path: Path,
+            access: int,
+            flags: int,
+            *,
+            creation: int = 3,
+            share: int = 7,
+        ) -> int:
+            return 707
+
+        def handle_is_reparse(self, handle: int) -> bool:
+            return primary == "reparse"
+
+        def handle_identity(self, handle: int) -> tuple[int, int]:
+            raise ArtifactBuildError("primary Windows identity failure")
+
+        def close_handle(self, handle: int) -> None:
+            self.closed.append(handle)
+            raise OSError("handle close masked primary")
+
+    api = FaultingWindowsNativeApi()
+    expected = (
+        "reparse path substitutions"
+        if primary == "reparse"
+        else "primary Windows identity failure"
+    )
+
+    with pytest.raises(ArtifactBuildError, match=expected):
+        api.path_identity(tmp_path / "stage.tmp", directory=False)
+
+    assert api.closed == [707]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires native Win32 handles")
+def test_windows_native_builder_publishes_no_replace_and_cleans_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    success_root = tmp_path / "success"
+    success_root.mkdir()
+    output = success_root / "output"
+    output.mkdir()
+    artifact = ArtifactBuilder().build(
+        build_context(success_root, os_name="WINDOWS"), output
+    )
+
+    assert artifact.path.exists()
+    assert artifact.sha256 == hashlib.sha256(artifact.path.read_bytes()).hexdigest()
+
+    competing_root = tmp_path / "competing"
+    competing_root.mkdir()
+    competing = build_context(competing_root, os_name="WINDOWS")
+    path_exists = Path.exists
+
+    def hide_existing_final(path: Path) -> bool:
+        if path == artifact.path:
+            return False
+        return path_exists(path)
+
+    monkeypatch.setattr(Path, "exists", hide_existing_final)
+    with pytest.raises(FileExistsError):
+        ArtifactBuilder().build(competing, output)
+    monkeypatch.setattr(Path, "exists", path_exists)
+
+    cleanup_root = tmp_path / "cleanup"
+    cleanup_root.mkdir()
+    cleanup_output = cleanup_root / "output"
+    cleanup_output.mkdir()
+    cleanup_context = replace(
+        build_context(cleanup_root, os_name="WINDOWS"),
+        build_id="223e4567-e89b-12d3-a456-426614174000",
+    )
+
+    def fail_verification(
+        staged: BinaryIO, expected_names: set[str], expected_hashes: dict[str, str]
+    ) -> None:
+        raise ArtifactBuildError("injected native cleanup failure")
+
+    monkeypatch.setattr(builder_module, "_verify_zip", fail_verification)
+    with pytest.raises(ArtifactBuildError, match="native cleanup failure"):
+        ArtifactBuilder().build(cleanup_context, cleanup_output)
+
+    assert list(cleanup_output.iterdir()) == []
+    assert not any(path.name.startswith(".wheelforge-artifact-") for path in output.iterdir())
 
 
 def test_windows_backend_no_replace_rejects_existing_final_without_rename(
