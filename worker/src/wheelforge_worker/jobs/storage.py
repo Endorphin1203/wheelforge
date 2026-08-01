@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import errno
 import os
 import re
 import shutil
 import stat
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO
 from uuid import UUID, uuid4
@@ -14,6 +16,12 @@ from uuid import UUID, uuid4
 
 _DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
 _CHUNK_SIZE = 64 * 1024
+_UUID_PATTERN = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+_GENERATED_STAGE = re.compile(rf"\.wf-stage-{_UUID_PATTERN}\Z")
+_GENERATED_WORKSPACE = re.compile(rf"wf-execution-({_UUID_PATTERN})\Z")
+_GENERATED_ARTIFACT = re.compile(
+    rf"artifacts/{_UUID_PATTERN}/{_UUID_PATTERN}\.zip\Z"
+)
 
 
 class InvalidObjectKey(ValueError):
@@ -45,6 +53,7 @@ class RootedLocalStorage:
         *,
         uuid_factory: Callable[[], UUID] = uuid4,
     ) -> None:
+        _require_supported_host()
         self.root = _require_stable_root(Path(root), "data root")
         self._root_identity = _identity(self.root.lstat())
         self._uuid_factory = uuid_factory
@@ -71,6 +80,18 @@ class RootedLocalStorage:
         if not isinstance(content, bytes):
             raise TypeError("content must be bytes")
         return self._publish(object_key, lambda handle: _write_bytes(handle, content))
+
+    def publish_or_reuse_bytes(
+        self, object_key: str, content: bytes
+    ) -> PublishedObject:
+        try:
+            return self.publish_bytes(object_key, content)
+        except FileExistsError:
+            observed = self.read_bytes(object_key)
+            digest = hashlib.sha256(content).hexdigest()
+            if len(observed) != len(content) or hashlib.sha256(observed).hexdigest() != digest:
+                raise
+            return PublishedObject(object_key, len(content), digest)
 
     def publish_file(self, object_key: str, source: Path) -> PublishedObject:
         source = Path(source)
@@ -120,6 +141,7 @@ class RootedLocalStorage:
                 if digest != expected_sha256:
                     return False
                 _unlink_named(parent, parts[-1])
+                _fsync_parent(parent)
                 return True
             finally:
                 os.close(descriptor)
@@ -149,17 +171,15 @@ class RootedLocalStorage:
             _require_named_identity(parent, stage_name, _identity(status))
             _link_no_replace(parent, stage_name, parts[-1])
             _unlink_named(parent, stage_name)
+            _fsync_parent(parent)
             staged = False
             return PublishedObject(object_key, size, digest)
         finally:
             if descriptor is not None:
-                os.close(descriptor)
+                _best_effort(os.close, descriptor)
             if staged:
-                try:
-                    _unlink_named(parent, stage_name)
-                except FileNotFoundError:
-                    pass
-            parent.close()
+                _best_effort(_unlink_named, parent, stage_name)
+            _best_effort(parent.close)
 
     def _open_parent(self, parts: tuple[str, ...], *, create: bool) -> _ParentBinding:
         self._require_root()
@@ -190,13 +210,7 @@ class RootedLocalStorage:
                 os.close(descriptor)
                 raise
 
-        current = self.root
-        for part in parts:
-            current /= part
-            if create:
-                current.mkdir(mode=0o700, exist_ok=True)
-            _require_plain_directory(current)
-        return _ParentBinding(current, None)
+        raise RuntimeError("safe descriptor-relative storage is unavailable")
 
     def _require_root(self) -> None:
         status = self.root.lstat()
@@ -207,6 +221,48 @@ class RootedLocalStorage:
             or _identity(status) != self._root_identity
         ):
             raise OSError("data root identity changed")
+
+    def sweep_abandoned(
+        self,
+        cutoff: datetime,
+        referenced_artifact_keys: frozenset[str],
+        *,
+        active_execution_ids: frozenset[str],
+    ) -> None:
+        self._require_root()
+        cutoff_timestamp = cutoff.timestamp()
+        for directory, directories, filenames, descriptor in os.fwalk(
+            self.root, topdown=True, follow_symlinks=False
+        ):
+            safe_directories: list[str] = []
+            for name in directories:
+                status = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                if stat.S_ISDIR(status.st_mode) and not stat.S_ISLNK(status.st_mode):
+                    safe_directories.append(name)
+            directories[:] = safe_directories
+            relative_directory = Path(directory).relative_to(self.root)
+            for name in filenames:
+                relative = (relative_directory / name).as_posix()
+                generated_stage = _GENERATED_STAGE.fullmatch(name) is not None
+                generated_artifact = _GENERATED_ARTIFACT.fullmatch(relative) is not None
+                if not generated_stage and not generated_artifact:
+                    continue
+                if active_execution_ids:
+                    continue
+                if generated_artifact and relative in referenced_artifact_keys:
+                    continue
+                status = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                if not stat.S_ISREG(status.st_mode) or status.st_mtime > cutoff_timestamp:
+                    continue
+                os.unlink(name, dir_fd=descriptor)
+                try:
+                    os.fsync(descriptor)
+                except OSError as error:
+                    if error.errno not in {
+                        errno.EINVAL,
+                        getattr(errno, "ENOTSUP", errno.EINVAL),
+                    }:
+                        raise
 
 
 @dataclass(slots=True)
@@ -246,7 +302,7 @@ class OwnedWorkspace:
             finally:
                 os.close(root_descriptor)
         else:
-            shutil.rmtree(self.path)
+            raise RuntimeError("safe descriptor-relative cleanup is unavailable")
         self._cleaned = True
 
 
@@ -257,16 +313,19 @@ class WorkspaceManager:
         *,
         uuid_factory: Callable[[], UUID] = uuid4,
     ) -> None:
+        _require_supported_host()
         self.root = _require_stable_root(Path(root), "workspace root")
         self._root_identity = _identity(self.root.lstat())
         self._uuid_factory = uuid_factory
 
-    def allocate(self) -> OwnedWorkspace:
+    def allocate(self, execution_id: str | None = None) -> OwnedWorkspace:
         root_status = self.root.lstat()
         if _identity(root_status) != self._root_identity:
             raise RuntimeError("workspace root identity changed")
-        for _attempt in range(128):
-            name = f"wf-execution-{self._uuid_factory()}"
+        attempts = 1 if execution_id is not None else 128
+        for _attempt in range(attempts):
+            identifier = UUID(execution_id) if execution_id is not None else self._uuid_factory()
+            name = f"wf-execution-{identifier}"
             path = self.root / name
             try:
                 path.mkdir(mode=0o700)
@@ -283,6 +342,39 @@ class WorkspaceManager:
             )
         raise RuntimeError("could not allocate a unique workspace")
 
+    def sweep_abandoned(
+        self, cutoff: datetime, active_execution_ids: frozenset[str]
+    ) -> None:
+        cutoff_timestamp = cutoff.timestamp()
+        root_descriptor = os.open(
+            self.root,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            with os.scandir(root_descriptor) as entries:
+                for entry in entries:
+                    match = _GENERATED_WORKSPACE.fullmatch(entry.name)
+                    if match is None or match.group(1) in active_execution_ids:
+                        continue
+                    status = entry.stat(follow_symlinks=False)
+                    if (
+                        not stat.S_ISDIR(status.st_mode)
+                        or entry.is_symlink()
+                        or status.st_mtime > cutoff_timestamp
+                    ):
+                        continue
+                    current = os.stat(
+                        entry.name,
+                        dir_fd=root_descriptor,
+                        follow_symlinks=False,
+                    )
+                    if _identity(current) != _identity(status):
+                        continue
+                    shutil.rmtree(entry.name, dir_fd=root_descriptor)
+            _fsync_descriptor(root_descriptor)
+        finally:
+            os.close(root_descriptor)
+
 
 def _object_key_parts(object_key: str) -> tuple[str, ...]:
     if not isinstance(object_key, str) or not object_key or "\x00" in object_key:
@@ -293,6 +385,16 @@ def _object_key_parts(object_key: str) -> tuple[str, ...]:
     if any(part in ("", ".", "..") or _DRIVE_PREFIX.match(part) for part in parts):
         raise InvalidObjectKey("object key must use safe relative components")
     return parts
+
+
+def _require_supported_host() -> None:
+    if os.name == "nt":
+        raise RuntimeError(
+            "Windows Worker hosts are not supported; Windows remains a target platform"
+        )
+    required = (os.open, os.stat, os.mkdir, os.unlink, os.link)
+    if any(operation not in os.supports_dir_fd for operation in required):
+        raise RuntimeError("safe descriptor-relative filesystem operations are unavailable")
 
 
 def _require_stable_root(path: Path, label: str) -> Path:
@@ -378,9 +480,35 @@ def _unlink_named(parent: _ParentBinding, name: str) -> None:
         os.unlink(parent.path / name)
 
 
+def _fsync_parent(parent: _ParentBinding) -> None:
+    if parent.descriptor is None:
+        raise RuntimeError("safe parent directory handle is unavailable")
+    try:
+        os.fsync(parent.descriptor)
+    except OSError as error:
+        if error.errno not in {errno.EINVAL, getattr(errno, "ENOTSUP", errno.EINVAL)}:
+            raise
+
+
+def _fsync_descriptor(descriptor: int) -> None:
+    try:
+        os.fsync(descriptor)
+    except OSError as error:
+        if error.errno not in {errno.EINVAL, getattr(errno, "ENOTSUP", errno.EINVAL)}:
+            raise
+
+
 def _write_bytes(handle: BinaryIO, content: bytes) -> tuple[int, str]:
     handle.write(content)
     return len(content), hashlib.sha256(content).hexdigest()
+
+
+def _best_effort(operation: Callable[..., object], *args: object) -> None:
+    try:
+        operation(*args)
+    except Exception:
+        # Exact generated entries are reconciled by age-qualified maintenance.
+        pass
 
 
 def _hash_descriptor(descriptor: int) -> str:

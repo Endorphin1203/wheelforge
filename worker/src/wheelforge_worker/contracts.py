@@ -3,7 +3,7 @@ import re
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
-from typing import Any, Literal, Self
+from typing import Annotated, Any, Literal, Self
 from uuid import UUID
 
 from pydantic import (
@@ -19,6 +19,13 @@ from pydantic import (
 _RFC3339_DATE_TIME = re.compile(
     r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:[0-5]\d(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})$"
 )
+MAX_JOB_WIRE_BYTES = 64 * 1024
+_MAX_JSON_DEPTH = 10
+_MAX_JSON_NODES = 256
+_MAX_CONTAINER_ITEMS = 128
+_MAX_JSON_STRING = 4096
+_ObjectKey = Annotated[str, Field(min_length=1, max_length=512)]
+_AbiTag = Annotated[str, Field(min_length=1, max_length=50)]
 
 
 class JobType(StrEnum):
@@ -66,23 +73,29 @@ class _StrictPayloadModel(BaseModel):
 
 
 class RequirementParsePayload(_StrictPayloadModel):
-    original_object_key: str = Field(alias="originalObjectKey", min_length=1)
-    normalized_object_key: str = Field(alias="normalizedObjectKey", min_length=1)
+    original_object_key: _ObjectKey = Field(alias="originalObjectKey")
+    normalized_object_key: _ObjectKey = Field(alias="normalizedObjectKey")
 
 
 class TargetSnapshot(_StrictPayloadModel):
-    profile_id: str = Field(alias="profileId", min_length=1)
-    profile_code: str = Field(alias="profileCode", min_length=1)
-    os: str = Field(min_length=1)
-    architecture: str = Field(min_length=1)
-    python_implementation: str = Field(alias="pythonImplementation", min_length=1)
-    python_version: str = Field(alias="pythonVersion", min_length=1)
-    python_full_version: str = Field(alias="pythonFullVersion", min_length=1)
-    platform_tag: str = Field(alias="platformTag", min_length=1)
-    abi_tags: list[str] = Field(alias="abiTags", min_length=1)
-    validation_type: str = Field(alias="validationType", min_length=1)
+    profile_id: str = Field(alias="profileId", min_length=1, max_length=36)
+    profile_code: str = Field(alias="profileCode", min_length=1, max_length=100)
+    os: str = Field(min_length=1, max_length=20)
+    architecture: str = Field(min_length=1, max_length=20)
+    python_implementation: str = Field(
+        alias="pythonImplementation", min_length=1, max_length=20
+    )
+    python_version: str = Field(alias="pythonVersion", min_length=1, max_length=20)
+    python_full_version: str = Field(
+        alias="pythonFullVersion", min_length=1, max_length=30
+    )
+    platform_tag: str = Field(alias="platformTag", min_length=1, max_length=100)
+    abi_tags: list[_AbiTag] = Field(alias="abiTags", min_length=1, max_length=16)
+    validation_type: str = Field(
+        alias="validationType", min_length=1, max_length=20
+    )
     validation_policy_version: str = Field(
-        alias="validationPolicyVersion", min_length=1
+        alias="validationPolicyVersion", min_length=1, max_length=100
     )
     profile_version: StrictInt = Field(alias="profileVersion", ge=0)
 
@@ -111,8 +124,10 @@ class TargetSnapshot(_StrictPayloadModel):
 
 
 class BuildPayload(_StrictPayloadModel):
-    requirement_file_id: str = Field(alias="requirementFileId", min_length=1)
-    normalized_object_key: str = Field(alias="normalizedObjectKey", min_length=1)
+    requirement_file_id: str = Field(
+        alias="requirementFileId", min_length=1, max_length=36
+    )
+    normalized_object_key: _ObjectKey = Field(alias="normalizedObjectKey")
     solve_mode: Literal["COMPATIBLE"] = Field(alias="solveMode")
     target_snapshot: TargetSnapshot = Field(alias="targetSnapshot")
 
@@ -133,7 +148,7 @@ class JobPayload(BaseModel):
     schema_version: Literal[1] = Field(alias="schemaVersion")
     job_type: JobType = Field(alias="jobType")
     subject_id: UUID = Field(alias="subjectId")
-    created_at: str = Field(alias="createdAt")
+    created_at: str = Field(alias="createdAt", max_length=64)
     payload: dict[str, Any]
 
     @classmethod
@@ -142,13 +157,16 @@ class JobPayload(BaseModel):
     ) -> Self:
         if any(value is not None for value in kwargs.values()):
             raise ValueError("model_validate_json uses fixed database wire settings")
-        wire_payload = _DatabaseWirePayload.model_validate(
-            json.loads(
-                json_data,
-                parse_float=Decimal,
-                parse_constant=reject_non_standard_json_constant,
-            )
+        raw = json_data.encode("utf-8") if isinstance(json_data, str) else bytes(json_data)
+        if len(raw) > MAX_JOB_WIRE_BYTES:
+            raise ValueError("job payload exceeds the wire byte limit")
+        decoded = json.loads(
+            raw,
+            parse_float=Decimal,
+            parse_constant=reject_non_standard_json_constant,
         )
+        _validate_json_shape(decoded)
+        wire_payload = _DatabaseWirePayload.model_validate(decoded)
         return cls.model_validate(
             {
                 "schema_version": wire_payload.schema_version,
@@ -193,7 +211,7 @@ class _DatabaseWirePayload(BaseModel):
     schema_version: StrictInt = Field(alias="schemaVersion")
     job_type: JobType = Field(alias="jobType")
     subject_id: UUID = Field(alias="subjectId")
-    created_at: str = Field(alias="createdAt")
+    created_at: str = Field(alias="createdAt", max_length=64)
     payload: dict[str, Any]
 
     @field_validator("schema_version", mode="before")
@@ -272,3 +290,42 @@ def validate_canonical_uuid(value: str, field: str) -> str:
 
 def reject_non_standard_json_constant(constant: str) -> None:
     raise ValueError(f"non-standard JSON constant: {constant}")
+
+
+def bounded_database_payload_json(payload: object) -> str:
+    _validate_json_shape(payload)
+    encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
+    if len(encoded.encode("utf-8")) > MAX_JOB_WIRE_BYTES:
+        raise ValueError("job payload exceeds the wire byte limit")
+    return encoded
+
+
+def _validate_json_shape(root: object) -> None:
+    nodes = 0
+    stack: list[tuple[object, int]] = [(root, 1)]
+    while stack:
+        value, depth = stack.pop()
+        nodes += 1
+        if nodes > _MAX_JSON_NODES:
+            raise ValueError("job payload exceeds the JSON node limit")
+        if depth > _MAX_JSON_DEPTH:
+            raise ValueError("job payload exceeds the JSON depth limit")
+        if isinstance(value, str):
+            if len(value) > _MAX_JSON_STRING:
+                raise ValueError("job payload exceeds the JSON string limit")
+            continue
+        if isinstance(value, dict):
+            if len(value) > _MAX_CONTAINER_ITEMS:
+                raise ValueError("job payload exceeds the JSON container limit")
+            for key, item in value.items():
+                if not isinstance(key, str) or len(key) > _MAX_JSON_STRING:
+                    raise ValueError("job payload contains an invalid JSON object key")
+                nodes += 1
+                if nodes > _MAX_JSON_NODES:
+                    raise ValueError("job payload exceeds the JSON node limit")
+                stack.append((item, depth + 1))
+            continue
+        if isinstance(value, list):
+            if len(value) > _MAX_CONTAINER_ITEMS:
+                raise ValueError("job payload exceeds the JSON container limit")
+            stack.extend((item, depth + 1) for item in value)

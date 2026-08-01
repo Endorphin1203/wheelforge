@@ -11,6 +11,7 @@ class Settings:
     workspace_root: Path
     queue_poll_seconds: int
     job_lease_seconds: int
+    maintenance_age_seconds: int
     worker_id: str
 
     @classmethod
@@ -25,6 +26,13 @@ class Settings:
         job_lease_seconds = cls._positive_integer("WF_JOB_LEASE_SECONDS", "60")
         if job_lease_seconds < 30:
             raise ValueError("WF_JOB_LEASE_SECONDS must be at least 30 seconds")
+        maintenance_age_seconds = cls._positive_integer(
+            "WF_MAINTENANCE_AGE_SECONDS", "86400"
+        )
+        if maintenance_age_seconds < 3600:
+            raise ValueError(
+                "WF_MAINTENANCE_AGE_SECONDS must be at least 3600 seconds"
+            )
 
         return cls(
             database_url=cls._database_url(),
@@ -32,6 +40,7 @@ class Settings:
             workspace_root=workspace_root,
             queue_poll_seconds=queue_poll_seconds,
             job_lease_seconds=job_lease_seconds,
+            maintenance_age_seconds=maintenance_age_seconds,
             worker_id=cls._required_value("WF_WORKER_ID", "wheelforge-worker-1"),
         )
 

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import signal
 import threading
+from datetime import timedelta
 
 from sqlalchemy import create_engine
 
 from wheelforge_worker.jobs.consumer import JobConsumer
+from wheelforge_worker.jobs.maintenance import MaintenanceService
 from wheelforge_worker.jobs.pipeline import DefaultBuildStages, JobPipeline
 from wheelforge_worker.jobs.repository import JobRepository
 from wheelforge_worker.jobs.storage import RootedLocalStorage, WorkspaceManager
@@ -24,6 +26,12 @@ def create_consumer(settings: Settings, stop: threading.Event) -> JobConsumer:
     )
     storage = RootedLocalStorage(settings.data_root)
     workspaces = WorkspaceManager(settings.workspace_root)
+    MaintenanceService(
+        repository,
+        storage,
+        workspaces,
+        minimum_age=timedelta(seconds=settings.maintenance_age_seconds),
+    ).run()
     pipeline = JobPipeline(
         repository,
         storage,

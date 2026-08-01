@@ -31,8 +31,13 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.sql import Select
 
 from wheelforge_worker.parser import ParsedRequirements
+from wheelforge_worker.contracts import bounded_database_payload_json
+from wheelforge_worker.download import DownloadedWheel
 from wheelforge_worker.resolver import ResolutionResult, VersionChangeKind
+from wheelforge_worker.validation import StaticValidationReport
 
+from .errors import sanitize_structure, sanitize_text
+from .maintenance import MaintenanceSnapshot
 from .storage import PublishedObject
 
 
@@ -184,6 +189,32 @@ class JobLease:
     execution_id: str
     attempts: int
     max_attempts: int
+    reclaimed: bool = False
+    previous_execution_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ParseSubject:
+    id: str
+    user_id: str
+    original_object_key: str
+    normalized_object_key: str
+    size_bytes: int
+    sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class BuildSubject:
+    id: str
+    user_id: str
+    requirement_file_id: str
+    original_object_key: str
+    normalized_object_key: str
+    original_size_bytes: int
+    original_sha256: str
+    solve_mode: str
+    target_profile_id: str
+    target_snapshot: dict[str, Any]
 
 
 class LostLeaseError(RuntimeError):
@@ -246,6 +277,12 @@ class JobRepository:
                     continue
 
                 execution_id = str(self._uuid_factory())
+                reclaimed = row["status"] == "RUNNING"
+                previous_execution_id = (
+                    str(row["execution_id"])
+                    if reclaimed and row["execution_id"] is not None
+                    else None
+                )
                 attempts = int(row["attempts"]) + 1
                 result = connection.execute(
                     update(build_jobs)
@@ -269,7 +306,11 @@ class JobRepository:
                     continue
                 payload = row["payload_json"]
                 if not isinstance(payload, str):
-                    payload = json.dumps(payload, separators=(",", ":"))
+                    try:
+                        payload = bounded_database_payload_json(payload)
+                    except ValueError:
+                        # Keep the lease so the pipeline can terminalize malformed input.
+                        payload = "{}"
                 return JobLease(
                     id=str(row["id"]),
                     job_type=str(row["job_type"]),
@@ -280,6 +321,8 @@ class JobRepository:
                     execution_id=execution_id,
                     attempts=attempts,
                     max_attempts=int(row["max_attempts"]),
+                    reclaimed=reclaimed,
+                    previous_execution_id=previous_execution_id,
                 )
 
     def heartbeat(self, lease: JobLease) -> bool:
@@ -323,7 +366,7 @@ class JobRepository:
         retry_delay_seconds: int = 5,
     ) -> bool:
         now = self._clock()
-        bounded_error = _bounded(error, 2000)
+        bounded_error = sanitize_text(error, limit=2000)
         with self.engine.begin() as connection:
             if retryable and lease.attempts < lease.max_attempts:
                 values = {
@@ -373,7 +416,7 @@ class JobRepository:
 
     def fail_terminal(self, lease: JobLease, code: str, error: str) -> bool:
         now = self._clock()
-        message = _bounded(error, 2000)
+        message = sanitize_text(error, limit=2000)
         with self.engine.begin() as connection:
             result = connection.execute(
                 update(build_jobs)
@@ -396,16 +439,36 @@ class JobRepository:
             )
             return True
 
-    def claim_requirement_file(self, lease: JobLease) -> bool:
+    def claim_parse_subject(self, lease: JobLease) -> ParseSubject | None:
         now = self._clock()
         with self.engine.begin() as connection:
             if not self._owns(connection, lease, now):
-                return False
+                return None
+            row = (
+                connection.execute(
+                    select(requirement_files)
+                    .where(requirement_files.c.id == lease.subject_id)
+                    .with_for_update()
+                )
+                .mappings()
+                .first()
+            )
+            expected_status = "PARSING" if lease.reclaimed else "PENDING"
+            if (
+                row is None
+                or row["parse_status"] != expected_status
+                or (lease.reclaimed and lease.previous_execution_id is None)
+            ):
+                self._fail_subject_claim(
+                    connection, lease, now, "parse subject cannot be claimed"
+                )
+                return None
             result = connection.execute(
                 update(requirement_files)
                 .where(
                     requirement_files.c.id == lease.subject_id,
-                    requirement_files.c.parse_status == "PENDING",
+                    requirement_files.c.version_no == row["version_no"],
+                    requirement_files.c.parse_status == expected_status,
                 )
                 .values(
                     parse_status="PARSING",
@@ -413,7 +476,22 @@ class JobRepository:
                     version_no=requirement_files.c.version_no + 1,
                 )
             )
-            return result.rowcount == 1
+            if result.rowcount != 1:
+                self._fail_subject_claim(
+                    connection, lease, now, "parse subject claim raced"
+                )
+                return None
+            return ParseSubject(
+                id=str(row["id"]),
+                user_id=str(row["user_id"]),
+                original_object_key=str(row["original_object_key"]),
+                normalized_object_key=str(row["normalized_object_key"]),
+                size_bytes=int(row["size_bytes"]),
+                sha256=str(row["sha256"]),
+            )
+
+    def claim_requirement_file(self, lease: JobLease) -> bool:
+        return self.claim_parse_subject(lease) is not None
 
     def complete_parse(
         self,
@@ -473,17 +551,90 @@ class JobRepository:
                 raise LostLeaseError("parse publication lost job ownership")
             return True
 
-    def claim_build(self, lease: JobLease) -> bool:
+    def claim_build_subject(self, lease: JobLease) -> BuildSubject | None:
         now = self._clock()
         with self.engine.begin() as connection:
             if not self._owns(connection, lease, now):
-                return False
+                return None
+            row = (
+                connection.execute(
+                    select(
+                        build_tasks.c.id,
+                        build_tasks.c.user_id,
+                        build_tasks.c.requirement_file_id,
+                        build_tasks.c.target_profile_id,
+                        build_tasks.c.execution_id,
+                        build_tasks.c.status,
+                        build_tasks.c.solve_mode,
+                        build_tasks.c.target_snapshot,
+                        build_tasks.c.deleted_at,
+                        build_tasks.c.version_no,
+                        requirement_files.c.user_id.label("file_user_id"),
+                        requirement_files.c.original_object_key,
+                        requirement_files.c.normalized_object_key,
+                        requirement_files.c.size_bytes,
+                        requirement_files.c.sha256,
+                        requirement_files.c.parse_status,
+                    )
+                    .select_from(
+                        build_tasks.join(
+                            requirement_files,
+                            requirement_files.c.id
+                            == build_tasks.c.requirement_file_id,
+                        )
+                    )
+                    .where(build_tasks.c.id == lease.subject_id)
+                    .with_for_update()
+                )
+                .mappings()
+                .first()
+            )
+            nonterminal = {
+                "QUEUED",
+                "RESOLVING",
+                "DOWNLOADING",
+                "VALIDATING",
+                "PACKAGING",
+            }
+            initial = (
+                not lease.reclaimed
+                and row is not None
+                and row["status"] == "QUEUED"
+                and row["execution_id"] is None
+            )
+            takeover = (
+                lease.reclaimed
+                and lease.previous_execution_id is not None
+                and row is not None
+                and row["status"] in nonterminal
+                and row["execution_id"] == lease.previous_execution_id
+            )
+            valid_binding = (
+                row is not None
+                and row["deleted_at"] is None
+                and row["parse_status"] == "PARSED"
+                and row["normalized_object_key"] is not None
+                and row["user_id"] == row["file_user_id"]
+                and isinstance(row["target_snapshot"], (dict, str))
+            )
+            if not valid_binding or not (initial or takeover):
+                self._fail_subject_claim(
+                    connection, lease, now, "build subject cannot be claimed"
+                )
+                return None
+            assert row is not None
             result = connection.execute(
                 update(build_tasks)
                 .where(
                     build_tasks.c.id == lease.subject_id,
-                    build_tasks.c.status == "QUEUED",
-                    build_tasks.c.execution_id.is_(None),
+                    build_tasks.c.version_no == row["version_no"],
+                    build_tasks.c.status == row["status"],
+                    (
+                        build_tasks.c.execution_id
+                        == lease.previous_execution_id
+                        if takeover
+                        else build_tasks.c.execution_id.is_(None)
+                    ),
                 )
                 .values(
                     execution_id=lease.execution_id,
@@ -496,7 +647,37 @@ class JobRepository:
                     version_no=build_tasks.c.version_no + 1,
                 )
             )
-            return result.rowcount == 1
+            if result.rowcount != 1:
+                self._fail_subject_claim(
+                    connection, lease, now, "build subject claim raced"
+                )
+                return None
+            snapshot = row["target_snapshot"]
+            if isinstance(snapshot, str):
+                snapshot = json.loads(snapshot)
+            if (
+                not isinstance(snapshot, dict)
+                or snapshot.get("profileId") != row["target_profile_id"]
+            ):
+                self._fail_subject_claim(
+                    connection, lease, now, "build target snapshot is malformed"
+                )
+                return None
+            return BuildSubject(
+                id=str(row["id"]),
+                user_id=str(row["user_id"]),
+                requirement_file_id=str(row["requirement_file_id"]),
+                original_object_key=str(row["original_object_key"]),
+                normalized_object_key=str(row["normalized_object_key"]),
+                original_size_bytes=int(row["size_bytes"]),
+                original_sha256=str(row["sha256"]),
+                solve_mode=str(row["solve_mode"]),
+                target_profile_id=str(row["target_profile_id"]),
+                target_snapshot=snapshot,
+            )
+
+    def claim_build(self, lease: JobLease) -> bool:
+        return self.claim_build_subject(lease) is not None
 
     def is_cancel_requested(self, lease: JobLease) -> bool:
         now = self._clock()
@@ -611,6 +792,7 @@ class JobRepository:
 
     def persist_resolution(self, lease: JobLease, resolution: ResolutionResult) -> None:
         changes = {change.package: change for change in resolution.changes}
+        audit = _resolution_audit(resolution)
         now = self._clock()
         with self.engine.begin() as connection:
             if not self._owns(connection, lease, now):
@@ -643,7 +825,7 @@ class JobRepository:
                             else VersionChangeKind.UNCHANGED.value
                         ),
                         change_reason=(change.reason if change else None),
-                        attempts_json=[],
+                        attempts_json=audit,
                         wheel_filename=package.wheel_filename,
                         package_source_code=(
                             resolution.source.value if resolution.source else None
@@ -651,6 +833,66 @@ class JobRepository:
                         wheel_status="RESOLVED",
                     )
                 )
+
+    def persist_package_results(
+        self,
+        lease: JobLease,
+        resolution: ResolutionResult,
+        wheels: tuple[DownloadedWheel, ...],
+        validation: StaticValidationReport,
+        download_failures: dict[str, str],
+    ) -> None:
+        now = self._clock()
+        observed = {wheel.package: wheel for wheel in wheels}
+        issues: dict[str, list[str]] = {}
+        for issue in validation.issues:
+            issues.setdefault(issue.package, []).append(
+                sanitize_text(f"{issue.code.value}: {issue.detail}", limit=2000)
+            )
+        with self.engine.begin() as connection:
+            if not self._owns(connection, lease, now):
+                raise LostLeaseError("job lease is no longer owned")
+            for package in resolution.packages:
+                wheel = observed.get(package.name)
+                package_issues = issues.get(package.name, [])
+                if wheel is None:
+                    status = "MISSING"
+                    error = download_failures.get(package.name) or (
+                        "; ".join(package_issues) if package_issues else "Wheel is missing"
+                    )
+                elif package_issues:
+                    status = "STATIC_FAILED"
+                    error = "; ".join(package_issues)
+                else:
+                    status = "STATIC_PASSED"
+                    error = None
+                result = connection.execute(
+                    update(resolved_packages)
+                    .where(
+                        resolved_packages.c.build_task_id == lease.subject_id,
+                        resolved_packages.c.normalized_name == package.name,
+                    )
+                    .values(
+                        wheel_filename=(wheel.filename if wheel else package.wheel_filename),
+                        wheel_tags=(
+                            sorted(str(tag) for tag in wheel.tags) if wheel else None
+                        ),
+                        package_source_code=(
+                            wheel.source.value
+                            if wheel is not None
+                            else resolution.source.value
+                            if resolution.source is not None
+                            else None
+                        ),
+                        sha256=(wheel.sha256 if wheel else None),
+                        wheel_status=status,
+                        error_message=(
+                            sanitize_text(error, limit=2000) if error else None
+                        ),
+                    )
+                )
+                if result.rowcount != 1:
+                    raise LostLeaseError("resolved package audit row is unavailable")
 
     def publish_artifact_terminal(
         self,
@@ -719,6 +961,24 @@ class JobRepository:
             )
             return str(value) if value is not None else None
 
+    def maintenance_snapshot(self) -> MaintenanceSnapshot:
+        now = self._clock()
+        with self.engine.connect() as connection:
+            active = connection.scalars(
+                select(build_jobs.c.execution_id).where(
+                    build_jobs.c.status == "RUNNING",
+                    build_jobs.c.execution_id.is_not(None),
+                    build_jobs.c.lease_expires_at > now,
+                )
+            ).all()
+            referenced = connection.scalars(
+                select(artifacts.c.object_key).where(artifacts.c.cleaned_at.is_(None))
+            ).all()
+        return MaintenanceSnapshot(
+            frozenset(str(value) for value in active if value is not None),
+            frozenset(str(value) for value in referenced),
+        )
+
     def _append_log(
         self,
         connection: Connection,
@@ -752,7 +1012,9 @@ class JobRepository:
         )
         safe_context: dict[str, Any] | None = None
         if context is not None:
-            encoded = json.dumps(context, ensure_ascii=True, default=str)
+            encoded = json.dumps(
+                sanitize_structure(context), ensure_ascii=True, default=str
+            )
             safe_context = (
                 json.loads(encoded[:8000])
                 if len(encoded) <= 8000
@@ -765,7 +1027,7 @@ class JobRepository:
                 sequence_no=sequence,
                 stage=_bounded(stage, 50),
                 level=_bounded(level, 20),
-                message=_bounded(message, 4000),
+                message=sanitize_text(message, limit=4000),
                 context_json=safe_context,
                 created_at=now,
             )
@@ -779,13 +1041,18 @@ class JobRepository:
         now: datetime | None = None,
     ) -> bool:
         observed_at = self._clock() if now is None else now
+        return connection.scalar(
+            self._owned_job_statement(lease, observed_at)
+        ) is not None
+
+    @staticmethod
+    def _owned_job_statement(
+        lease: JobLease, observed_at: datetime
+    ) -> Select[tuple[Any, ...]]:
         return (
-            connection.scalar(
-                select(func.count())
-                .select_from(build_jobs)
-                .where(*self._ownership(lease, observed_at))
-            )
-            == 1
+            select(build_jobs.c.id)
+            .where(*JobRepository._ownership(lease, observed_at))
+            .with_for_update()
         )
 
     def _complete_job(
@@ -805,6 +1072,37 @@ class JobRepository:
             )
         )
         return result.rowcount == 1
+
+    def _fail_subject_claim(
+        self,
+        connection: Connection,
+        lease: JobLease,
+        now: datetime,
+        message: str,
+    ) -> None:
+        result = connection.execute(
+            update(build_jobs)
+            .where(*self._ownership(lease, now))
+            .values(
+                status="FAILED",
+                lease_owner=None,
+                execution_id=None,
+                lease_expires_at=None,
+                heartbeat_at=None,
+                last_error=sanitize_text(message, limit=2000),
+                finished_at=now,
+                version_no=build_jobs.c.version_no + 1,
+            )
+        )
+        if result.rowcount == 1:
+            self._terminalize_subject(
+                connection,
+                lease.job_type,
+                lease.subject_id,
+                now,
+                "SUBJECT_CLAIM_FAILED",
+                message,
+            )
 
     @staticmethod
     def _reset_subject_for_retry(connection: Connection, lease: JobLease) -> None:
@@ -922,3 +1220,29 @@ class JobRepository:
 def _bounded(value: str, limit: int) -> str:
     sanitized = value.replace("\x00", "?")
     return sanitized[:limit]
+
+
+def _resolution_audit(resolution: ResolutionResult) -> list[dict[str, Any]]:
+    attempts = [
+        {
+            "source": attempt.source.value,
+            "failure": attempt.failure.value if attempt.failure else None,
+            "reason": sanitize_text(attempt.reason, limit=1000),
+            "selections": [
+                {"package": item.package, "version": str(item.version)}
+                for item in attempt.selections[:500]
+            ],
+        }
+        for attempt in resolution.attempts[:100]
+    ]
+    rejections = [
+        {
+            "package": item.package,
+            "version": item.version,
+            "source": item.source.value,
+            "code": item.code.value,
+            "reason": sanitize_text(item.reason, limit=1000),
+        }
+        for item in resolution.rejections[:2000]
+    ]
+    return [{"attempts": attempts, "rejections": rejections}]

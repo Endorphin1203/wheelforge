@@ -6,7 +6,14 @@ import pytest
 from jsonschema import Draft202012Validator, FormatChecker
 from pydantic import ValidationError
 
-from wheelforge_worker.contracts import BuildStatus, JobPayload, JobStatus, JobType
+from wheelforge_worker.contracts import (
+    MAX_JOB_WIRE_BYTES,
+    BuildStatus,
+    JobPayload,
+    JobStatus,
+    JobType,
+    bounded_database_payload_json,
+)
 
 
 FIXTURES = Path(__file__).parents[2] / "contracts" / "examples"
@@ -131,6 +138,52 @@ def test_database_wire_parser_rejects_non_default_options() -> None:
         JobPayload.model_validate_json(
             (FIXTURES / "build-v1.json").read_text(), strict=True
         )
+
+
+def test_database_wire_parser_rejects_oversized_raw_payload_before_json() -> None:
+    with pytest.raises(ValueError, match="byte limit"):
+        JobPayload.model_validate_json(b" " * (MAX_JOB_WIRE_BYTES + 1))
+
+
+def test_database_wire_parser_rejects_excessive_depth_and_nodes() -> None:
+    deep: object = "leaf"
+    for _ in range(20):
+        deep = {"value": deep}
+    with pytest.raises(ValueError, match="depth limit"):
+        JobPayload.model_validate_json(json.dumps(deep))
+
+    wide = {
+        str(group): {str(index): index for index in range(100)}
+        for group in range(3)
+    }
+    with pytest.raises(ValueError, match="node limit"):
+        JobPayload.model_validate_json(json.dumps(wide))
+
+
+def test_database_wire_parser_rejects_large_container_and_string() -> None:
+    with pytest.raises(ValueError, match="container limit"):
+        JobPayload.model_validate_json(json.dumps(list(range(200))))
+    with pytest.raises(ValueError, match="string limit"):
+        JobPayload.model_validate_json(json.dumps("x" * 5000))
+
+
+def test_contract_fields_reject_oversized_keys_and_abi_lists() -> None:
+    build = load_json_fixture(FIXTURES / "build-v1.json")
+    assert isinstance(build, dict)
+    build["payload"]["normalizedObjectKey"] = "x" * 513
+    with pytest.raises(ValidationError, match="normalizedObjectKey"):
+        JobPayload.model_validate_json(json.dumps(build))
+
+    build = load_json_fixture(FIXTURES / "build-v1.json")
+    assert isinstance(build, dict)
+    build["payload"]["targetSnapshot"]["abiTags"] = ["abi3"] * 17
+    with pytest.raises(ValidationError, match="abiTags"):
+        JobPayload.model_validate_json(json.dumps(build))
+
+
+def test_decoded_database_json_is_bounded_before_serialization() -> None:
+    with pytest.raises(ValueError, match="string limit"):
+        bounded_database_payload_json({"payload": "x" * 5000})
 
 
 @pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])

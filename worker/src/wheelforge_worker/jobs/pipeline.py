@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-import re
+import hashlib
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterable
@@ -31,6 +31,7 @@ from wheelforge_worker.contracts import (
 from wheelforge_worker.download import (
     DownloadCancelledError,
     DownloadedWheel,
+    WheelDownloadError,
     WheelDownloader,
 )
 from wheelforge_worker.parser import (
@@ -42,6 +43,7 @@ from wheelforge_worker.resolver import (
     CandidateMetadata,
     CompatibleResolver,
     ResolveLimits,
+    ResolvedPackage,
     ResolutionResult,
     ResolverError,
     StrictResolver,
@@ -56,12 +58,12 @@ from wheelforge_worker.validation import (
     validate_wheel_archive,
 )
 
+from .errors import contains_exception, sanitize_error
 from .repository import JobLease, JobRepository, LostLeaseError
 from .heartbeat import LeaseHeartbeat
 from .storage import RootedLocalStorage, WorkspaceManager
 
 
-_CREDENTIALS = re.compile(r"(?i)(https?://)[^/@\s:]+:[^/@\s]+@")
 _MAX_INDEX_BYTES = 8 * 1024 * 1024
 _INDEX_JSON_BASES = {
     PackageSource.TSINGHUA: "https://pypi.tuna.tsinghua.edu.cn/pypi",
@@ -82,6 +84,29 @@ class PipelineResult:
 class BuildValidation:
     wheels: tuple[ValidatedWheel, ...]
     report: StaticValidationReport
+    download_failures: tuple[PackageFailure, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class PackageFailure:
+    package: str
+    error: str
+
+
+@dataclass(frozen=True, slots=True)
+class BuildDownload:
+    wheels: tuple[DownloadedWheel, ...]
+    failures: tuple[PackageFailure, ...]
+
+
+class _Downloader(Protocol):
+    def download_one(
+        self,
+        package: ResolvedPackage,
+        profile: TargetProfile,
+        destination: Path,
+        cancel: Callable[[], bool],
+    ) -> DownloadedWheel: ...
 
 
 class BuildStages(Protocol):
@@ -95,7 +120,7 @@ class BuildStages(Protocol):
         target: TargetProfile,
         workspace: Path,
         cancel: Callable[[], bool],
-    ) -> Iterable[DownloadedWheel]: ...
+    ) -> BuildDownload: ...
 
     def validate(
         self,
@@ -179,9 +204,13 @@ class BuiltinCandidateProvider:
 
 class DefaultBuildStages:
     def __init__(
-        self, candidate_provider: BuiltinCandidateProvider | None = None
+        self,
+        candidate_provider: BuiltinCandidateProvider | None = None,
+        *,
+        downloader_factory: Callable[[Path], _Downloader] = WheelDownloader,
     ) -> None:
         self._candidate_provider = candidate_provider or BuiltinCandidateProvider()
+        self._downloader_factory = downloader_factory
 
     def resolve(
         self, parsed: ParsedRequirements, target: TargetProfile, workspace: Path
@@ -196,13 +225,33 @@ class DefaultBuildStages:
         target: TargetProfile,
         workspace: Path,
         cancel: Callable[[], bool],
-    ) -> tuple[DownloadedWheel, ...]:
+    ) -> BuildDownload:
         download_root = workspace / "download-work"
         download_root.mkdir(mode=0o700)
-        downloader = WheelDownloader(download_root)
-        return tuple(
-            downloader.download(resolution, target, download_root / "wheels", cancel)
-        )
+        if len(resolution.packages) > 500:
+            raise ValueError("resolved package count exceeds the limit")
+        downloader = self._downloader_factory(download_root)
+        wheels: list[DownloadedWheel] = []
+        failures: list[PackageFailure] = []
+        total_bytes = 0
+        for index, package in enumerate(resolution.packages):
+            try:
+                wheel = downloader.download_one(
+                    package,
+                    target,
+                    download_root / f"wheels-{index:04d}",
+                    cancel,
+                )
+            except DownloadCancelledError:
+                raise
+            except WheelDownloadError as error:
+                failures.append(PackageFailure(package.name, str(error)[:2000]))
+                continue
+            total_bytes += wheel.byte_size
+            if total_bytes > 2 * 1024 * 1024 * 1024:
+                raise ValueError("total downloaded Wheel byte limit exceeded")
+            wheels.append(wheel)
+        return BuildDownload(tuple(wheels), tuple(failures))
 
     def validate(
         self,
@@ -284,42 +333,56 @@ class JobPipeline:
             return self._run_build(lease, build_payload)
         except (ValidationError, ValueError, json.JSONDecodeError) as error:
             self._repository.fail_terminal(
-                lease, "MALFORMED_JOB_PAYLOAD", _safe_error(error)
+                lease, "MALFORMED_JOB_PAYLOAD", sanitize_error(error)
             )
             return PipelineResult(BuildStatus.FAILED, None)
 
     def _run_parse(
         self, lease: JobLease, payload: RequirementParsePayload
     ) -> PipelineResult:
-        if not self._repository.claim_requirement_file(lease):
+        subject = self._repository.claim_parse_subject(lease)
+        if subject is None:
             return PipelineResult(BuildStatus.FAILED, None)
         published = None
         try:
-            parsed = parse_requirements(
-                self._storage.read_bytes(payload.original_object_key)
+            if (
+                payload.original_object_key != subject.original_object_key
+                or payload.normalized_object_key != subject.normalized_object_key
+            ):
+                raise ValueError("parse payload disagrees with database subject")
+            original = self._storage.read_bytes(subject.original_object_key)
+            _require_file_observation(
+                original, subject.size_bytes, subject.sha256, "original requirements"
             )
-            published = self._storage.publish_bytes(
-                payload.normalized_object_key, parsed.normalized_text.encode("utf-8")
+            parsed = parse_requirements(original)
+            published = self._storage.publish_or_reuse_bytes(
+                subject.normalized_object_key,
+                parsed.normalized_text.encode("utf-8"),
             )
             completed = self._repository.complete_parse(
-                lease, parsed, payload.normalized_object_key
+                lease, parsed, subject.normalized_object_key
             )
             if not completed:
                 raise LostLeaseError("parse result could not be published")
             return PipelineResult(BuildStatus.SUCCESS, None)
         except RequirementsParseError as error:
             self._repository.fail_terminal(
-                lease, "INVALID_REQUIREMENTS", _safe_error(error)
+                lease, "INVALID_REQUIREMENTS", sanitize_error(error)
             )
             return PipelineResult(BuildStatus.FAILED, None)
         except BaseException as error:
             if published is not None:
-                self._storage.delete_if_owned(published.object_key, published.sha256)
+                orphan = published
+                _best_effort_cleanup(
+                    lambda: self._storage.delete_if_owned(
+                        orphan.object_key, orphan.sha256
+                    )
+                )
             if isinstance(error, (KeyboardInterrupt, SystemExit)):
                 raise
             self._repository.retry_or_fail(
                 lease,
-                _safe_error(error),
+                sanitize_error(error),
                 retryable=not isinstance(error, LostLeaseError),
             )
             status = (
@@ -331,21 +394,39 @@ class JobPipeline:
             return PipelineResult(status, None)
 
     def _run_build(self, lease: JobLease, payload: BuildPayload) -> PipelineResult:
-        if not self._repository.claim_build(lease):
+        subject = self._repository.claim_build_subject(lease)
+        if subject is None:
             return PipelineResult(BuildStatus.FAILED, None)
-        owned_workspace = self._workspaces.allocate()
+        owned_workspace = self._workspaces.allocate(lease.execution_id)
         published = None
         try:
-            target = TargetProfile.model_validate(
-                payload.target_snapshot.model_dump(by_alias=True)
-            )
+            payload_target = payload.target_snapshot.model_dump(by_alias=True)
+            if (
+                payload.requirement_file_id != subject.requirement_file_id
+                or payload.normalized_object_key != subject.normalized_object_key
+                or payload.solve_mode != subject.solve_mode
+                or payload_target != subject.target_snapshot
+                or payload.target_snapshot.profile_id != subject.target_profile_id
+            ):
+                raise ValueError("build payload disagrees with database subject")
+            target = TargetProfile.model_validate(subject.target_snapshot)
             cancelled = self._cancel_if_requested(lease)
             if cancelled is not None:
                 return cancelled
 
-            normalized = self._storage.read_bytes(payload.normalized_object_key)
+            original = self._storage.read_bytes(subject.original_object_key)
+            _require_file_observation(
+                original,
+                subject.original_size_bytes,
+                subject.original_sha256,
+                "original requirements",
+            )
+            original_parsed = parse_requirements(original)
+            normalized = self._storage.read_bytes(subject.normalized_object_key)
+            if normalized != original_parsed.normalized_text.encode("utf-8"):
+                raise ValueError("normalized requirements content is not database-bound")
             parsed = parse_requirements(normalized)
-            original_text = self._original_requirements(payload, normalized)
+            original_text = _decode_requirements(original)
             cancelled = self._cancel_if_requested(lease)
             if cancelled is not None:
                 return cancelled
@@ -365,17 +446,16 @@ class JobPipeline:
             self._repository.advance_build(
                 lease, "DOWNLOADING", 40, "DOWNLOADING", "Downloading target Wheels"
             )
-            downloaded = tuple(
-                self._during_lease(
-                    lease,
-                    lambda: self._stages.download(
-                        resolution,
-                        target,
-                        owned_workspace.path,
-                        lambda: self._repository.is_cancel_requested(lease),
-                    ),
-                )
+            download = self._during_lease(
+                lease,
+                lambda: self._stages.download(
+                    resolution,
+                    target,
+                    owned_workspace.path,
+                    lambda: self._repository.is_cancel_requested(lease),
+                ),
             )
+            downloaded = download.wheels
             cancelled = self._cancel_if_requested(lease)
             if cancelled is not None:
                 return cancelled
@@ -386,6 +466,18 @@ class JobPipeline:
             validation = self._during_lease(
                 lease,
                 lambda: self._stages.validate(resolution, downloaded, target),
+            )
+            validation = BuildValidation(
+                validation.wheels,
+                validation.report,
+                (*download.failures, *validation.download_failures),
+            )
+            self._repository.persist_package_results(
+                lease,
+                resolution,
+                downloaded,
+                validation.report,
+                {item.package: item.error for item in validation.download_failures},
             )
             cancelled = self._cancel_if_requested(lease)
             if cancelled is not None:
@@ -434,7 +526,12 @@ class JobPipeline:
                 raise OSError("artifact digest changed during local publication")
             cancelled = self._cancel_if_requested(lease)
             if cancelled is not None:
-                self._storage.delete_if_owned(published.object_key, published.sha256)
+                orphan = published
+                _best_effort_cleanup(
+                    lambda: self._storage.delete_if_owned(
+                        orphan.object_key, orphan.sha256
+                    )
+                )
                 published = None
                 return cancelled
 
@@ -455,24 +552,31 @@ class JobPipeline:
             return result or PipelineResult(BuildStatus.CANCELLED, None)
         except (RequirementsParseError, WheelArchiveValidationError) as error:
             self._repository.fail_terminal(
-                lease, "PERMANENT_BUILD_FAILURE", _safe_error(error)
+                lease, "PERMANENT_BUILD_FAILURE", sanitize_error(error)
             )
             return PipelineResult(BuildStatus.FAILED, None)
         except BaseException as error:
             if published is not None:
-                self._storage.delete_if_owned(published.object_key, published.sha256)
+                orphan = published
+                _best_effort_cleanup(
+                    lambda: self._storage.delete_if_owned(
+                        orphan.object_key, orphan.sha256
+                    )
+                )
             if isinstance(error, (KeyboardInterrupt, SystemExit)):
                 raise
+            if _contains_lost_lease(error):
+                return PipelineResult(BuildStatus.FAILED, None)
             retryable = _retryable(error)
             updated = self._repository.retry_or_fail(
-                lease, _safe_error(error), retryable=retryable
+                lease, sanitize_error(error), retryable=retryable
             )
             queued = updated and retryable and lease.attempts < lease.max_attempts
             return PipelineResult(
                 BuildStatus.QUEUED if queued else BuildStatus.FAILED, None
             )
         finally:
-            owned_workspace.cleanup()
+            _best_effort_cleanup(owned_workspace.cleanup)
 
     def _cancel_if_requested(self, lease: JobLease) -> PipelineResult | None:
         if not self._repository.is_cancel_requested(lease):
@@ -494,20 +598,27 @@ class JobPipeline:
             heartbeat.check()
             return result
 
-    def _original_requirements(self, payload: BuildPayload, normalized: bytes) -> str:
-        key = self._repository.requirement_original_key(payload.requirement_file_id)
-        if key is None:
-            return normalized.decode("utf-8")
-        raw = self._storage.read_bytes(key)
-        for encoding in ("utf-8-sig", "utf-8", "gbk"):
-            try:
-                return raw.decode(encoding)
-            except UnicodeDecodeError:
-                continue
-        return normalized.decode("utf-8")
+def _decode_requirements(raw: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "gbk"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    raise ValueError("requirements text cannot be decoded")
+
+
+def _require_file_observation(
+    content: bytes, expected_size: int, expected_sha256: str, label: str
+) -> None:
+    if len(content) != expected_size or hashlib.sha256(content).hexdigest() != expected_sha256:
+        raise ValueError(f"{label} does not match its database observation")
 
 
 def _retryable(error: BaseException) -> bool:
+    if isinstance(error, BaseExceptionGroup):
+        return bool(error.exceptions) and all(
+            _retryable(child) for child in error.exceptions
+        )
     if isinstance(error, LostLeaseError):
         return False
     if isinstance(error, (OSError, ResolverError, RuntimeError)):
@@ -515,6 +626,13 @@ def _retryable(error: BaseException) -> bool:
     return False
 
 
-def _safe_error(error: BaseException) -> str:
-    value = _CREDENTIALS.sub(r"\1***:***@", str(error))
-    return value.replace("\x00", "?")[:2000]
+def _contains_lost_lease(error: BaseException) -> bool:
+    return contains_exception(error, LostLeaseError)
+
+
+def _best_effort_cleanup(operation: Callable[[], object]) -> None:
+    try:
+        operation()
+    except Exception:
+        # Generated storage/workspace entries are covered by startup maintenance.
+        pass

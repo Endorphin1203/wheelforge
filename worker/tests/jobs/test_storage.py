@@ -7,6 +7,7 @@ from uuid import UUID
 
 import pytest
 
+import wheelforge_worker.jobs.storage as storage_module
 from wheelforge_worker.jobs.storage import (
     InvalidObjectKey,
     RootedLocalStorage,
@@ -73,6 +74,21 @@ def test_publish_is_no_replace_and_returns_verified_digest(
     assert storage.read_bytes("normalized/a.txt") == content
 
 
+def test_publish_or_reuse_accepts_only_exact_existing_regular_file(
+    storage: RootedLocalStorage,
+) -> None:
+    content = b"numpy==1.26.4\n"
+    first = storage.publish_bytes("normalized/recover.txt", content)
+
+    recovered = storage.publish_or_reuse_bytes("normalized/recover.txt", content)
+
+    assert recovered == first
+    with pytest.raises(FileExistsError):
+        storage.publish_or_reuse_bytes(
+            "normalized/recover.txt", b"numpy==2.0.0\n"
+        )
+
+
 def test_compensation_deletes_only_the_exact_owned_content(
     storage: RootedLocalStorage,
 ) -> None:
@@ -121,3 +137,36 @@ def test_workspace_cleanup_refuses_replaced_directory(tmp_path: Path) -> None:
         owned.cleanup()
 
     assert (original / "keep.txt").read_text() == "keep"
+
+
+def test_windows_worker_host_fails_closed_before_path_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setattr(storage_module.os, "name", "nt")
+
+    with pytest.raises(RuntimeError, match="Windows Worker hosts are not supported"):
+        RootedLocalStorage(root)
+    with pytest.raises(RuntimeError, match="Windows Worker hosts are not supported"):
+        WorkspaceManager(root)
+
+
+def test_publish_cleanup_failure_does_not_replace_writer_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "data"
+    root.mkdir()
+    storage = RootedLocalStorage(root)
+
+    def fail_write(_handle: object, _content: bytes) -> tuple[int, str]:
+        raise ValueError("primary writer failure")
+
+    def fail_unlink(_parent: object, _name: str) -> None:
+        raise OSError("secondary unlink failure")
+
+    monkeypatch.setattr(storage_module, "_write_bytes", fail_write)
+    monkeypatch.setattr(storage_module, "_unlink_named", fail_unlink)
+
+    with pytest.raises(ValueError, match="primary writer failure"):
+        storage.publish_bytes("generated/output.bin", b"content")

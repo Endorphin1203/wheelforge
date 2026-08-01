@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from wheelforge_worker.contracts import BuildStatus
 from wheelforge_worker.jobs.consumer import JobConsumer
 from wheelforge_worker.jobs.pipeline import PipelineResult
-from wheelforge_worker.jobs.repository import JobLease
+from wheelforge_worker.jobs.repository import JobLease, LostLeaseError
 
 
 LEASE = JobLease(
@@ -76,7 +76,48 @@ def test_unexpected_pipeline_error_returns_owned_job_for_retry() -> None:
     )
 
     assert consumer.run_once() is True
-    assert repository.failures == [(LEASE, "database connection interrupted", True)]
+    assert repository.failures == [
+        (LEASE, "RuntimeError: database connection interrupted", True)
+    ]
+
+
+def test_unexpected_pipeline_error_is_sanitized_before_persistence() -> None:
+    repository = FakeRepository(LEASE, [])
+    consumer = JobConsumer(
+        repository,
+        RecordingPipeline(
+            ExceptionGroup(
+                "consumer",
+                [RuntimeError("mysql://user:secret@db/wf?token=hidden")],
+            )
+        ),
+        "worker-a",
+        poll_seconds=2,
+    )
+
+    assert consumer.run_once() is True
+    persisted = repository.failures[0][1]
+    assert "secret" not in persisted
+    assert "hidden" not in persisted
+    assert "RuntimeError" in persisted
+
+
+def test_consumer_does_not_mutate_state_for_nested_lost_lease() -> None:
+    repository = FakeRepository(LEASE, [])
+    consumer = JobConsumer(
+        repository,
+        RecordingPipeline(
+            ExceptionGroup(
+                "lost ownership",
+                [OSError("network"), LostLeaseError("lease expired")],
+            )
+        ),
+        "worker-a",
+        poll_seconds=2,
+    )
+
+    assert consumer.run_once() is True
+    assert repository.failures == []
 
 
 def test_run_forever_waits_only_when_queue_is_empty() -> None:

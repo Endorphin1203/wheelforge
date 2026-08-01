@@ -30,6 +30,7 @@ def test_settings_require_absolute_workspace(monkeypatch, tmp_path: Path) -> Non
     assert settings.database_url.startswith("mysql+pymysql://")
     assert settings.queue_poll_seconds == 2
     assert settings.job_lease_seconds == 60
+    assert settings.maintenance_age_seconds == 86400
     assert settings.worker_id == "wheelforge-worker-1"
 
 
@@ -123,4 +124,14 @@ def test_settings_reject_short_leases(monkeypatch, tmp_path: Path) -> None:
     with pytest.raises(
         ValueError, match="WF_JOB_LEASE_SECONDS must be at least 30 seconds"
     ):
+        Settings.from_env()
+
+
+def test_settings_reject_maintenance_age_under_one_hour(
+    monkeypatch, tmp_path: Path
+) -> None:
+    configure_environment(monkeypatch, tmp_path)
+    monkeypatch.setenv("WF_MAINTENANCE_AGE_SECONDS", "3599")
+
+    with pytest.raises(ValueError, match="at least 3600 seconds"):
         Settings.from_env()

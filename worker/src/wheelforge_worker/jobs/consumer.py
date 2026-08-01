@@ -4,8 +4,9 @@ import time
 from collections.abc import Callable
 from typing import Protocol
 
+from .errors import contains_exception, sanitize_error
 from .pipeline import JobPipeline, PipelineResult
-from .repository import JobLease, JobRepository
+from .repository import JobLease, JobRepository, LostLeaseError
 
 
 class _Repository(Protocol):
@@ -49,7 +50,11 @@ class JobConsumer:
         except (KeyboardInterrupt, SystemExit):
             raise
         except BaseException as error:
-            self._repository.retry_or_fail(lease, _safe_error(error), retryable=True)
+            if contains_exception(error, LostLeaseError):
+                return True
+            self._repository.retry_or_fail(
+                lease, sanitize_error(error), retryable=True
+            )
         return True
 
     def run_forever(self) -> None:
@@ -58,10 +63,6 @@ class JobConsumer:
                 continue
             if self._wait(float(self._poll_seconds)):
                 return
-
-
-def _safe_error(error: BaseException) -> str:
-    return str(error).replace("\x00", "?")[:2000]
 
 
 def build_consumer(

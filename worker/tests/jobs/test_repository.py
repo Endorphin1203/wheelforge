@@ -3,10 +3,13 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta
 from itertools import count
+from pathlib import Path
 from uuid import UUID
 
 import pytest
-from sqlalchemy import create_engine, insert, select
+from packaging.tags import Tag
+from packaging.version import Version
+from sqlalchemy import create_engine, insert, select, update
 from sqlalchemy.dialects import mysql
 from sqlalchemy.pool import StaticPool
 
@@ -19,8 +22,24 @@ from wheelforge_worker.jobs.repository import (
     build_tasks,
     claim_candidate_statement,
     metadata,
+    requirement_files,
+    resolved_packages,
 )
 from wheelforge_worker.jobs.storage import PublishedObject
+from wheelforge_worker.download import DownloadedWheel
+from wheelforge_worker.resolver import (
+    CandidateSelection,
+    CompatibilityFailureCode,
+    ResolutionAttempt,
+    ResolvedPackage,
+    ResolutionResult,
+)
+from wheelforge_worker.sources import PackageSource
+from wheelforge_worker.validation import (
+    StaticValidationReport,
+    ValidationIssue,
+    ValidationIssueCode,
+)
 
 
 NOW = datetime(2026, 8, 1, 8, 0, 0)
@@ -67,14 +86,29 @@ def _repository(*, attempts: int = 0, max_attempts: int = 3) -> JobRepository:
     metadata.create_all(engine)
     with engine.begin() as connection:
         connection.execute(
+            insert(requirement_files).values(
+                id="30000000-0000-4000-8000-000000000001",
+                user_id="70000000-0000-4000-8000-000000000001",
+                original_name="requirements.txt",
+                size_bytes=13,
+                sha256="a" * 64,
+                original_object_key="requirements/original/input.txt",
+                normalized_object_key="requirements/normalized/input.txt",
+                parse_status="PARSED",
+                created_at=NOW,
+                version_no=0,
+            )
+        )
+        connection.execute(
             insert(build_tasks).values(
                 id=TASK_ID,
+                user_id="70000000-0000-4000-8000-000000000001",
                 requirement_file_id="30000000-0000-4000-8000-000000000001",
                 target_profile_id="40000000-0000-4000-8000-000000000001",
                 status="QUEUED",
                 progress=0,
                 solve_mode="COMPATIBLE",
-                target_snapshot={},
+                target_snapshot=json.loads(_payload())["payload"]["targetSnapshot"],
                 cancel_requested=False,
                 version_no=0,
             )
@@ -116,6 +150,21 @@ def test_only_one_worker_leases_a_ready_job() -> None:
     assert second is None
 
 
+def test_decoded_oversized_payload_is_leased_as_malformed_without_serializing_it() -> None:
+    repository = _repository()
+    with repository.engine.begin() as connection:
+        connection.execute(
+            update(build_jobs)
+            .where(build_jobs.c.id == JOB_ID)
+            .values(payload_json={"payload": "x" * 5000})
+        )
+
+    lease = repository.claim_next("worker-a")
+
+    assert lease is not None
+    assert lease.payload_json == "{}"
+
+
 def test_expired_lease_is_taken_over_with_a_new_execution() -> None:
     repository = _repository()
     first = repository.claim_next("worker-a")
@@ -128,6 +177,122 @@ def test_expired_lease_is_taken_over_with_a_new_execution() -> None:
     assert successor.id == first.id
     assert successor.execution_id != first.execution_id
     assert successor.attempts == 2
+    assert successor.reclaimed is True
+    assert successor.previous_execution_id == first.execution_id
+
+
+def test_repository_sanitizes_persisted_errors_and_log_context() -> None:
+    repository = _repository()
+    lease = repository.claim_next("worker-a")
+    assert lease is not None
+    assert repository.claim_build(lease)
+    secret = "mysql://user:db-password@db/wf?access_token=query-token"
+
+    repository.append_log(
+        lease,
+        "DOWNLOADING",
+        "ERROR",
+        secret,
+        {"nested": {"authorization": "Bearer bearer-token"}},
+    )
+    assert repository.retry_or_fail(lease, secret, retryable=True)
+
+    with repository.engine.connect() as connection:
+        persisted_error = connection.scalar(select(build_jobs.c.last_error))
+        log = connection.execute(
+            select(build_logs.c.message, build_logs.c.context_json)
+        ).one()
+    combined = f"{persisted_error} {log.message} {log.context_json}"
+    assert "db-password" not in combined
+    assert "query-token" not in combined
+    assert "bearer-token" not in combined
+
+
+@pytest.mark.parametrize(
+    "stage", ["RESOLVING", "DOWNLOADING", "VALIDATING", "PACKAGING"]
+)
+def test_expired_build_reclaims_exact_prior_execution(stage: str) -> None:
+    repository = _repository()
+    first = repository.claim_next("worker-a")
+    assert first is not None
+    with repository.engine.begin() as connection:
+        connection.execute(
+            update(build_tasks)
+            .where(build_tasks.c.id == TASK_ID)
+            .values(status=stage, execution_id=first.execution_id)
+        )
+    repository._clock = lambda: NOW + timedelta(seconds=61)
+
+    successor = repository.claim_next("worker-b")
+    assert successor is not None
+    subject = repository.claim_build_subject(successor)
+
+    assert subject is not None
+    assert subject.id == TASK_ID
+    with repository.engine.connect() as connection:
+        task = connection.execute(
+            select(build_tasks.c.status, build_tasks.c.execution_id)
+        ).one()
+    assert task == ("RESOLVING", successor.execution_id)
+
+
+def test_expired_parse_recovers_parsing_subject_from_same_job() -> None:
+    repository = _repository()
+    with repository.engine.begin() as connection:
+        connection.execute(
+            insert(requirement_files).values(
+                id="30000000-0000-4000-8000-000000000002",
+                user_id="70000000-0000-4000-8000-000000000001",
+                original_name="requirements.txt",
+                size_bytes=4,
+                sha256="a" * 64,
+                original_object_key="requirements/original/a.txt",
+                normalized_object_key="requirements/normalized/a.txt",
+                parse_status="PARSING",
+                created_at=NOW,
+                version_no=0,
+            )
+        )
+        connection.execute(
+            update(build_jobs).where(build_jobs.c.id == JOB_ID).values(
+                job_type="REQUIREMENT_PARSE",
+                subject_id="30000000-0000-4000-8000-000000000002",
+                status="RUNNING",
+                attempts=1,
+                lease_owner="dead-worker",
+                execution_id="80000000-0000-4000-8000-000000000001",
+                lease_expires_at=NOW - timedelta(seconds=1),
+                heartbeat_at=NOW - timedelta(seconds=61),
+            )
+        )
+
+    successor = repository.claim_next("worker-b")
+    assert successor is not None and successor.reclaimed
+    subject = repository.claim_parse_subject(successor)
+
+    assert subject is not None
+    assert subject.id == successor.subject_id
+    assert subject.original_object_key == "requirements/original/a.txt"
+
+
+def test_subject_claim_failure_terminalizes_newly_reclaimed_job() -> None:
+    repository = _repository()
+    first = repository.claim_next("worker-a")
+    assert first is not None
+    with repository.engine.begin() as connection:
+        connection.execute(
+            update(build_tasks)
+            .where(build_tasks.c.id == TASK_ID)
+            .values(status="DOWNLOADING", execution_id="wrong-execution")
+        )
+    repository._clock = lambda: NOW + timedelta(seconds=61)
+    successor = repository.claim_next("worker-b")
+    assert successor is not None
+
+    assert repository.claim_build_subject(successor) is None
+
+    with repository.engine.connect() as connection:
+        assert connection.scalar(select(build_jobs.c.status)) == "FAILED"
 
 
 def test_stale_owner_cannot_heartbeat_or_complete_after_takeover() -> None:
@@ -227,3 +392,106 @@ def test_mysql_claim_query_uses_row_lock_skip_locked() -> None:
     assert "FOR UPDATE SKIP LOCKED" in sql
     assert "AVAILABLE_AT <=" in sql
     assert "LEASE_EXPIRES_AT <=" in sql
+
+
+def test_owned_subject_operations_lock_the_exact_unexpired_job_row() -> None:
+    repository = _repository()
+    lease = repository.claim_next("worker-a")
+    assert lease is not None
+
+    sql = str(
+        repository._owned_job_statement(lease, NOW).compile(
+            dialect=mysql.dialect(), compile_kwargs={"literal_binds": True}
+        )
+    ).upper()
+
+    assert "FOR UPDATE" in sql
+    assert "LEASE_EXPIRES_AT" in sql
+    assert "EXECUTION_ID" in sql
+
+
+def test_package_audit_persists_attempts_and_final_static_outcomes() -> None:
+    repository = _repository()
+    lease = repository.claim_next("worker-a")
+    assert lease is not None
+    assert repository.claim_build_subject(lease) is not None
+    alpha = ResolvedPackage(
+        "alpha",
+        Version("1.0"),
+        True,
+        "https://files.pythonhosted.org/alpha.whl",
+        "alpha-1.0-py3-none-any.whl",
+        (),
+        None,
+        (),
+    )
+    beta = ResolvedPackage(
+        "beta",
+        Version("2.0"),
+        False,
+        "https://files.pythonhosted.org/beta.whl",
+        "beta-2.0-py3-none-any.whl",
+        (),
+        None,
+        (),
+    )
+    resolution = ResolutionResult(
+        "1",
+        (alpha, beta),
+        attempts=(
+            ResolutionAttempt(
+                (CandidateSelection("alpha", Version("1.0")),),
+                PackageSource.PYPI,
+                CompatibilityFailureCode.STRICT_RESOLUTION,
+                "first source failed",
+            ),
+        ),
+        source=PackageSource.PYPI,
+    )
+    repository.persist_resolution(lease, resolution)
+    wheel = DownloadedWheel(
+        "alpha",
+        Version("1.0"),
+        alpha.wheel_filename,
+        Path("/trusted/alpha.whl"),
+        PackageSource.PYPI,
+        5,
+        "b" * 64,
+        frozenset({Tag("py3", "none", "any")}),
+    )
+    validation = StaticValidationReport(
+        (
+            ValidationIssue(
+                ValidationIssueCode.WHEEL_MISSING,
+                "beta",
+                "no matching Wheel was downloaded",
+            ),
+        ),
+        False,
+    )
+
+    repository.persist_package_results(
+        lease,
+        resolution,
+        (wheel,),
+        validation,
+        {"beta": "no target Wheel"},
+    )
+
+    with repository.engine.connect() as connection:
+        rows = connection.execute(
+            select(
+                resolved_packages.c.normalized_name,
+                resolved_packages.c.wheel_status,
+                resolved_packages.c.sha256,
+                resolved_packages.c.wheel_tags,
+                resolved_packages.c.error_message,
+                resolved_packages.c.attempts_json,
+            ).order_by(resolved_packages.c.normalized_name)
+        ).mappings().all()
+    assert rows[0]["wheel_status"] == "STATIC_PASSED"
+    assert rows[0]["sha256"] == "b" * 64
+    assert rows[0]["wheel_tags"] == ["py3-none-any"]
+    assert rows[0]["attempts_json"]
+    assert rows[1]["wheel_status"] == "MISSING"
+    assert rows[1]["error_message"] == "no target Wheel"

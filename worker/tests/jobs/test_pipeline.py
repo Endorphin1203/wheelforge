@@ -12,19 +12,24 @@ from typing import cast
 from uuid import UUID
 
 import pytest
+from packaging.tags import Tag
+from packaging.version import Version
 from sqlalchemy import create_engine, insert, select, update
 from sqlalchemy.pool import StaticPool
 
-from wheelforge_worker.artifact import ArtifactBuildContext, BuiltArtifact
+from wheelforge_worker.artifact import ArtifactBuildContext, BuiltArtifact, ValidatedWheel
 from wheelforge_worker.contracts import BuildStatus
-from wheelforge_worker.resolver import ResolutionResult
-from wheelforge_worker.validation import StaticValidationReport
+from wheelforge_worker.resolver import ResolvedPackage, ResolutionResult
+from wheelforge_worker.sources import PackageSource
+from wheelforge_worker.validation import StaticValidationReport, validate_closure
 import wheelforge_worker.jobs.pipeline as pipeline_module
-from wheelforge_worker.download import DownloadedWheel
+from wheelforge_worker.download import DownloadedWheel, WheelDownloadError
 from wheelforge_worker.jobs.pipeline import (
+    BuildDownload,
     BuildValidation,
     DefaultBuildStages,
     JobPipeline,
+    PackageFailure,
     PipelineResult,
 )
 from wheelforge_worker.jobs.repository import (
@@ -37,6 +42,7 @@ from wheelforge_worker.jobs.repository import (
     metadata,
     requirement_files,
     requirement_items,
+    resolved_packages,
 )
 from wheelforge_worker.jobs.storage import RootedLocalStorage, WorkspaceManager
 from wheelforge_worker.target import TargetProfile
@@ -48,6 +54,7 @@ TASK_ID = "20000000-0000-4000-8000-000000000001"
 FILE_ID = "30000000-0000-4000-8000-000000000001"
 PROFILE_ID = "40000000-0000-4000-8000-000000000001"
 JOB_ID = "10000000-0000-4000-8000-000000000001"
+BUILD_REQUIREMENTS = b"numpy==1.26.4\n"
 
 
 def _target() -> dict[str, object]:
@@ -95,9 +102,9 @@ class RecordingStages:
         target: object,
         workspace: Path,
         cancel: object,
-    ) -> tuple[object, ...]:
+    ) -> BuildDownload:
         self.calls.append("download")
-        return ()
+        return BuildDownload((), ())
 
     def validate(
         self,
@@ -132,6 +139,105 @@ class CleanupSnapshot:
 @dataclass
 class SnapshotReport:
     snapshot: CleanupSnapshot
+
+
+def _resolved_package(name: str, version: str) -> ResolvedPackage:
+    filename = f"{name}-{version}-py3-none-any.whl"
+    return ResolvedPackage(
+        name=name,
+        version=Version(version),
+        requested=True,
+        artifact_url=f"https://files.pythonhosted.org/{filename}",
+        wheel_filename=filename,
+        requires_dist=(),
+        requires_python=">=3.9",
+        archive_hashes=(),
+    )
+
+
+def test_default_download_retains_successes_when_later_package_is_missing(
+    tmp_path: Path,
+) -> None:
+    first = _resolved_package("alpha", "1.0")
+    second = _resolved_package("beta", "2.0")
+
+    class PartialDownloader:
+        def download_one(
+            self,
+            package: ResolvedPackage,
+            target: object,
+            destination: Path,
+            cancel: object,
+        ) -> DownloadedWheel:
+            if package.name == "beta":
+                raise WheelDownloadError("no target Wheel")
+            destination.mkdir()
+            path = destination / package.wheel_filename
+            path.write_bytes(b"wheel")
+            return DownloadedWheel(
+                package=package.name,
+                version=package.version,
+                filename=package.wheel_filename,
+                path=path,
+                source=PackageSource.PYPI,
+                byte_size=5,
+                sha256=hashlib.sha256(b"wheel").hexdigest(),
+                tags=frozenset({Tag("py3", "none", "any")}),
+            )
+
+    work = tmp_path / "work"
+    work.mkdir()
+    stages = DefaultBuildStages(
+        downloader_factory=lambda _root: PartialDownloader()
+    )
+
+    result = stages.download(
+        ResolutionResult("1", (first, second)),
+        cast(TargetProfile, object()),
+        work,
+        lambda: False,
+    )
+
+    assert [wheel.package for wheel in result.wheels] == ["alpha"]
+    assert len(result.failures) == 1
+    assert result.failures[0].package == "beta"
+    assert result.failures[0].error == "no target Wheel"
+
+
+def test_default_validation_retains_valid_wheel_and_reports_missing_package(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    present = _resolved_package("alpha", "1.0")
+    missing = _resolved_package("beta", "2.0")
+    path = tmp_path / present.wheel_filename
+    path.write_bytes(b"validated by adapter stub")
+    wheel = DownloadedWheel(
+        package=present.name,
+        version=present.version,
+        filename=present.wheel_filename,
+        path=path,
+        source=PackageSource.PYPI,
+        byte_size=path.stat().st_size,
+        sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        tags=frozenset({Tag("py3", "none", "any")}),
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "validate_wheel_archive",
+        lambda *_args: SimpleNamespace(snapshot=None),
+    )
+
+    result = DefaultBuildStages().validate(
+        ResolutionResult("1", (present, missing)),
+        (wheel,),
+        TargetProfile.model_validate(_target()),
+    )
+
+    assert len(result.wheels) == 1
+    assert result.report.complete is False
+    assert [(issue.package, issue.code.value) for issue in result.report.issues] == [
+        ("beta", "WHEEL_MISSING")
+    ]
 
 
 def test_default_validation_cleans_prior_snapshots_when_later_wheel_fails(
@@ -207,8 +313,23 @@ def _seed_build(repository: JobRepository, payload_json: str | None = None) -> J
     )
     with repository.engine.begin() as connection:
         connection.execute(
+            insert(requirement_files).values(
+                id=FILE_ID,
+                user_id="70000000-0000-4000-8000-000000000001",
+                original_name="requirements.txt",
+                size_bytes=len(BUILD_REQUIREMENTS),
+                sha256=hashlib.sha256(BUILD_REQUIREMENTS).hexdigest(),
+                original_object_key="requirements/original/input.txt",
+                normalized_object_key="requirements/normalized/input.txt",
+                parse_status="PARSED",
+                created_at=NOW,
+                version_no=0,
+            )
+        )
+        connection.execute(
             insert(build_tasks).values(
                 id=TASK_ID,
+                user_id="70000000-0000-4000-8000-000000000001",
                 requirement_file_id=FILE_ID,
                 target_profile_id=PROFILE_ID,
                 status="QUEUED",
@@ -239,6 +360,16 @@ def _seed_build(repository: JobRepository, payload_json: str | None = None) -> J
     lease = repository.claim_next("worker-a")
     assert lease is not None
     return lease
+
+
+def _publish_build_inputs(
+    storage: RootedLocalStorage,
+    *,
+    original: bytes = BUILD_REQUIREMENTS,
+    normalized: bytes = BUILD_REQUIREMENTS,
+) -> None:
+    storage.publish_bytes("requirements/original/input.txt", original)
+    storage.publish_bytes("requirements/normalized/input.txt", normalized)
 
 
 def test_requirement_parse_publishes_normalized_text_and_items(tmp_path: Path) -> None:
@@ -305,6 +436,110 @@ def test_requirement_parse_publishes_normalized_text_and_items(tmp_path: Path) -
     assert job_status == "COMPLETED"
 
 
+@pytest.mark.parametrize("forgery", ["original", "normalized"])
+def test_parse_rejects_payload_keys_that_disagree_with_subject(
+    tmp_path: Path, forgery: str
+) -> None:
+    repository, storage, workspaces = _environment(tmp_path)
+    original = storage.publish_bytes(
+        "requirements/original/input.txt", BUILD_REQUIREMENTS
+    )
+    payload = {
+        "originalObjectKey": original.object_key,
+        "normalizedObjectKey": "requirements/normalized/input.txt",
+    }
+    payload[f"{forgery}ObjectKey"] = f"requirements/{forgery}/forged.txt"
+    with repository.engine.begin() as connection:
+        connection.execute(
+            insert(requirement_files).values(
+                id=FILE_ID,
+                user_id="70000000-0000-4000-8000-000000000001",
+                original_object_key=original.object_key,
+                normalized_object_key="requirements/normalized/input.txt",
+                parse_status="PENDING",
+                size_bytes=original.size_bytes,
+                sha256=original.sha256,
+                created_at=NOW,
+                version_no=0,
+            )
+        )
+        connection.execute(
+            insert(build_jobs).values(
+                id=JOB_ID,
+                job_type="REQUIREMENT_PARSE",
+                payload_version=1,
+                subject_id=FILE_ID,
+                payload_json=_wire("REQUIREMENT_PARSE", FILE_ID, payload),
+                status="READY",
+                priority_no=100,
+                available_at=NOW,
+                attempts=0,
+                max_attempts=3,
+                created_at=NOW,
+                version_no=0,
+            )
+        )
+    lease = repository.claim_next("worker-a")
+    assert lease is not None
+
+    result = JobPipeline(repository, storage, workspaces, RecordingStages()).run(lease)
+
+    assert result.status is BuildStatus.QUEUED
+    with repository.engine.connect() as connection:
+        assert connection.scalar(select(requirement_files.c.parse_status)) == "PENDING"
+        assert connection.scalar(select(build_jobs.c.status)) == "READY"
+
+
+def test_parse_rejects_tampered_original_file(tmp_path: Path) -> None:
+    repository, storage, workspaces = _environment(tmp_path)
+    observed = b"numpy==1.26.4\n"
+    storage.publish_bytes("requirements/original/input.txt", b"numpy==9.9.9\n")
+    with repository.engine.begin() as connection:
+        connection.execute(
+            insert(requirement_files).values(
+                id=FILE_ID,
+                user_id="70000000-0000-4000-8000-000000000001",
+                original_object_key="requirements/original/input.txt",
+                normalized_object_key="requirements/normalized/input.txt",
+                parse_status="PENDING",
+                size_bytes=len(observed),
+                sha256=hashlib.sha256(observed).hexdigest(),
+                created_at=NOW,
+                version_no=0,
+            )
+        )
+        connection.execute(
+            insert(build_jobs).values(
+                id=JOB_ID,
+                job_type="REQUIREMENT_PARSE",
+                payload_version=1,
+                subject_id=FILE_ID,
+                payload_json=_wire(
+                    "REQUIREMENT_PARSE",
+                    FILE_ID,
+                    {
+                        "originalObjectKey": "requirements/original/input.txt",
+                        "normalizedObjectKey": "requirements/normalized/input.txt",
+                    },
+                ),
+                status="READY",
+                priority_no=100,
+                available_at=NOW,
+                attempts=0,
+                max_attempts=3,
+                created_at=NOW,
+                version_no=0,
+            )
+        )
+    lease = repository.claim_next("worker-a")
+    assert lease is not None
+
+    result = JobPipeline(repository, storage, workspaces, RecordingStages()).run(lease)
+
+    assert result.status is BuildStatus.QUEUED
+    assert not (storage.root / "requirements/normalized/input.txt").exists()
+
+
 def test_malformed_payload_terminally_fails_job_and_subject(tmp_path: Path) -> None:
     repository, storage, workspaces = _environment(tmp_path)
     lease = _seed_build(repository, payload_json='{"schemaVersion": 1}')
@@ -318,11 +553,84 @@ def test_malformed_payload_terminally_fails_job_and_subject(tmp_path: Path) -> N
         assert connection.scalar(select(build_tasks.c.status)) == "FAILED"
 
 
+@pytest.mark.parametrize("forgery", ["requirement", "key", "target"])
+def test_build_rejects_payload_fields_that_disagree_with_locked_subject(
+    tmp_path: Path, forgery: str
+) -> None:
+    repository, storage, workspaces = _environment(tmp_path)
+    _publish_build_inputs(storage)
+    payload: dict[str, object] = {
+        "requirementFileId": FILE_ID,
+        "normalizedObjectKey": "requirements/normalized/input.txt",
+        "solveMode": "COMPATIBLE",
+        "targetSnapshot": _target(),
+    }
+    if forgery == "requirement":
+        payload["requirementFileId"] = "30000000-0000-4000-8000-000000000099"
+    elif forgery == "key":
+        payload["normalizedObjectKey"] = "requirements/normalized/forged.txt"
+        storage.publish_bytes(
+            "requirements/normalized/forged.txt", BUILD_REQUIREMENTS
+        )
+    else:
+        target = _target()
+        target["profileId"] = "40000000-0000-4000-8000-000000000099"
+        payload["targetSnapshot"] = target
+    lease = _seed_build(repository, _wire("BUILD", TASK_ID, payload))
+    stages = RecordingStages()
+
+    result = JobPipeline(repository, storage, workspaces, stages).run(lease)
+
+    assert result == PipelineResult(BuildStatus.FAILED, None)
+    assert stages.calls == []
+
+
+def test_build_rejects_cross_user_requirement_binding(tmp_path: Path) -> None:
+    repository, storage, workspaces = _environment(tmp_path)
+    _publish_build_inputs(storage)
+    lease = _seed_build(repository)
+    with repository.engine.begin() as connection:
+        connection.execute(
+            update(requirement_files)
+            .where(requirement_files.c.id == FILE_ID)
+            .values(user_id="70000000-0000-4000-8000-000000000099")
+        )
+    stages = RecordingStages()
+
+    result = JobPipeline(repository, storage, workspaces, stages).run(lease)
+
+    assert result == PipelineResult(BuildStatus.FAILED, None)
+    assert stages.calls == []
+    with repository.engine.connect() as connection:
+        assert connection.scalar(select(build_jobs.c.status)) == "FAILED"
+
+
+@pytest.mark.parametrize("tampered", ["original", "normalized"])
+def test_build_rejects_tampered_requirement_objects(
+    tmp_path: Path, tampered: str
+) -> None:
+    repository, storage, workspaces = _environment(tmp_path)
+    _publish_build_inputs(
+        storage,
+        original=(b"numpy==9.9.9\n" if tampered == "original" else BUILD_REQUIREMENTS),
+        normalized=(
+            b"numpy==9.9.9\n" if tampered == "normalized" else BUILD_REQUIREMENTS
+        ),
+    )
+    lease = _seed_build(repository)
+    stages = RecordingStages()
+
+    result = JobPipeline(repository, storage, workspaces, stages).run(lease)
+
+    assert result == PipelineResult(BuildStatus.FAILED, None)
+    assert stages.calls == []
+
+
 def test_successful_build_publishes_artifact_and_terminal_states(
     tmp_path: Path,
 ) -> None:
     repository, storage, workspaces = _environment(tmp_path)
-    storage.publish_bytes("requirements/normalized/input.txt", b"numpy==1.26.4\n")
+    _publish_build_inputs(storage)
     lease = _seed_build(repository)
     stages = RecordingStages()
     pipeline = JobPipeline(repository, storage, workspaces, stages)
@@ -341,6 +649,82 @@ def test_successful_build_publishes_artifact_and_terminal_states(
     assert storage.read_bytes(artifact.object_key) == b"verified zip bytes"
     assert artifact.sha256 == hashlib.sha256(b"verified zip bytes").hexdigest()
     assert list(workspaces.root.iterdir()) == []
+
+
+def test_partial_build_publishes_verified_successes_and_package_audit(
+    tmp_path: Path,
+) -> None:
+    class PartialStages(RecordingStages):
+        def __init__(self) -> None:
+            super().__init__()
+            self.resolution = ResolutionResult(
+                "1", (_resolved_package("alpha", "1.0"), _resolved_package("beta", "2.0"))
+            )
+
+        def resolve(
+            self, parsed: object, target: object, workspace: Path
+        ) -> ResolutionResult:
+            self.calls.append("resolve")
+            return self.resolution
+
+        def download(
+            self,
+            resolution: ResolutionResult,
+            target: object,
+            workspace: Path,
+            cancel: object,
+        ) -> BuildDownload:
+            self.calls.append("download")
+            package = resolution.packages[0]
+            path = workspace / package.wheel_filename
+            path.write_bytes(b"wheel")
+            wheel = DownloadedWheel(
+                package=package.name,
+                version=package.version,
+                filename=package.wheel_filename,
+                path=path,
+                source=PackageSource.PYPI,
+                byte_size=path.stat().st_size,
+                sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                tags=frozenset({Tag("py3", "none", "any")}),
+            )
+            return BuildDownload(
+                (wheel,), (PackageFailure("beta", "no target Wheel"),)
+            )
+
+        def validate(
+            self,
+            resolution: ResolutionResult,
+            wheels: tuple[DownloadedWheel, ...],
+            target: TargetProfile,
+        ) -> BuildValidation:
+            self.calls.append("validate")
+            report = validate_closure(resolution, wheels, target)
+            validated = cast(
+                ValidatedWheel,
+                SimpleNamespace(download=wheels[0], report=SimpleNamespace(snapshot=None)),
+            )
+            return BuildValidation((validated,), report)
+
+    repository, storage, workspaces = _environment(tmp_path)
+    _publish_build_inputs(storage)
+    lease = _seed_build(repository)
+
+    result = JobPipeline(
+        repository, storage, workspaces, PartialStages()
+    ).run(lease)
+
+    assert result.status is BuildStatus.PARTIAL_SUCCESS
+    assert result.artifact_id is not None
+    with repository.engine.connect() as connection:
+        assert connection.scalar(select(build_tasks.c.status)) == "PARTIAL_SUCCESS"
+        rows = connection.execute(
+            select(
+                resolved_packages.c.normalized_name,
+                resolved_packages.c.wheel_status,
+            ).order_by(resolved_packages.c.normalized_name)
+        ).all()
+    assert rows == [("alpha", "STATIC_PASSED"), ("beta", "MISSING")]
 
 
 class ExpireOnHeartbeatRepository(JobRepository):
@@ -376,7 +760,7 @@ def test_lost_heartbeat_stops_pipeline_before_terminal_publication(
     tmp_path: Path,
 ) -> None:
     source, storage, workspaces = _environment(tmp_path)
-    storage.publish_bytes("requirements/normalized/input.txt", b"numpy==1.26.4\n")
+    _publish_build_inputs(storage)
     lease = _seed_build(source)
     expired = Event()
     repository = ExpireOnHeartbeatRepository(source, expired)
@@ -427,7 +811,7 @@ def test_cancellation_at_each_publication_boundary_never_leaves_artifact(
     tmp_path: Path, cancel_at: int
 ) -> None:
     source, storage, workspaces = _environment(tmp_path)
-    storage.publish_bytes("requirements/normalized/input.txt", b"numpy==1.26.4\n")
+    _publish_build_inputs(storage)
     lease = _seed_build(source)
     repository = CancelAtRepository(source, cancel_at)
     pipeline = JobPipeline(repository, storage, workspaces, RecordingStages())
@@ -455,7 +839,7 @@ def test_artifact_file_is_compensated_when_database_publication_rolls_back(
     tmp_path: Path,
 ) -> None:
     source, storage, workspaces = _environment(tmp_path)
-    storage.publish_bytes("requirements/normalized/input.txt", b"numpy==1.26.4\n")
+    _publish_build_inputs(storage)
     lease = _seed_build(source)
     repository = RollbackRepository(
         source.engine,
@@ -471,6 +855,96 @@ def test_artifact_file_is_compensated_when_database_publication_rolls_back(
     assert not artifact_directory.exists() or not list(
         artifact_directory.rglob("*.zip")
     )
+
+
+class CleanupFailureWorkspace:
+    def __init__(self, root: Path) -> None:
+        self.path = root / "wf-execution-cleanup-failure"
+        self.path.mkdir()
+
+    def cleanup(self) -> None:
+        raise RuntimeError("workspace cleanup failed")
+
+
+class CleanupFailureWorkspaceManager:
+    def __init__(self, root: Path) -> None:
+        self.root = root
+
+    def allocate(self, execution_id: str | None = None) -> CleanupFailureWorkspace:
+        return CleanupFailureWorkspace(self.root)
+
+
+def test_workspace_cleanup_failure_does_not_replace_success_result(
+    tmp_path: Path,
+) -> None:
+    repository, storage, workspaces = _environment(tmp_path)
+    _publish_build_inputs(storage)
+    lease = _seed_build(repository)
+    pipeline = JobPipeline(
+        repository,
+        storage,
+        cast(WorkspaceManager, CleanupFailureWorkspaceManager(workspaces.root)),
+        RecordingStages(),
+    )
+
+    result = pipeline.run(lease)
+
+    assert result.status is BuildStatus.SUCCESS
+    with repository.engine.connect() as connection:
+        assert connection.scalar(select(build_jobs.c.status)) == "COMPLETED"
+
+
+class DeleteFailureStorage(RootedLocalStorage):
+    def delete_if_owned(self, object_key: str, expected_sha256: str) -> bool:
+        raise OSError("compensation delete failed")
+
+
+def test_compensation_delete_failure_preserves_retry_state(tmp_path: Path) -> None:
+    source, storage, workspaces = _environment(tmp_path)
+    _publish_build_inputs(storage)
+    lease = _seed_build(source)
+    repository = RollbackRepository(
+        source.engine,
+        lease_seconds=source.lease_seconds,
+        clock=source._clock,
+    )
+    failing_storage = DeleteFailureStorage(storage.root)
+
+    result = JobPipeline(
+        repository,
+        failing_storage,
+        workspaces,
+        RecordingStages(),
+    ).run(lease)
+
+    assert result.status is BuildStatus.QUEUED
+    with repository.engine.connect() as connection:
+        assert connection.scalar(select(build_jobs.c.status)) == "READY"
+
+
+def test_nested_infrastructure_exception_group_is_retryable() -> None:
+    error = ExceptionGroup(
+        "stage and heartbeat",
+        [OSError("network failed"), ExceptionGroup("db", [RuntimeError("gone")])],
+    )
+
+    assert pipeline_module._retryable(error) is True
+
+
+def test_nested_lost_lease_exception_group_is_never_retryable() -> None:
+    error = ExceptionGroup(
+        "stage and heartbeat",
+        [OSError("network failed"), pipeline_module.LostLeaseError("expired")],
+    )
+
+    assert pipeline_module._retryable(error) is False
+    assert pipeline_module._contains_lost_lease(error) is True
+
+
+def test_mixed_permanent_exception_group_is_not_retryable() -> None:
+    assert pipeline_module._retryable(
+        ExceptionGroup("mixed", [OSError("network"), ValueError("bad archive")])
+    ) is False
 
 
 def test_build_logs_receive_strictly_increasing_sequences(tmp_path: Path) -> None:
