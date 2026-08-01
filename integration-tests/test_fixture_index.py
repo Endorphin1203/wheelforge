@@ -429,11 +429,7 @@ def test_all_wheel_members_use_reproducible_stored_encoding(generated_index: Pat
             assert {member.compress_type for member in archive.infolist()} == {zipfile.ZIP_STORED}
 
 
-def test_real_pip_selects_cp311_arm64_and_transitive_wheels(
-    generated_index: Path, tmp_path: Path
-) -> None:
-    destination = tmp_path / "downloads"
-    destination.mkdir()
+def _pip_environment() -> dict[str, str]:
     environment = dict(os.environ)
     for name in (
         "HTTP_PROXY",
@@ -450,43 +446,92 @@ def test_real_pip_selects_cp311_arm64_and_transitive_wheels(
             "NO_PROXY": "127.0.0.1,localhost",
             "no_proxy": "127.0.0.1,localhost",
             "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+            "PIP_CONFIG_FILE": os.devnull,
             "PIP_NO_CACHE_DIR": "1",
         }
     )
+    return environment
+
+
+def _pip_download(
+    base_url: str, destination: Path, environment: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "--isolated",
+            "download",
+            "--dest",
+            str(destination),
+            "--index-url",
+            f"{base_url}/simple/",
+            "--only-binary=:all:",
+            "--platform=manylinux2014_aarch64",
+            "--python-version=3.11",
+            "--implementation=cp",
+            "--abi=cp311",
+            "demo-direct==1.0.0",
+            "demo-native==1.0.0",
+        ],
+        cwd=ROOT,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=BUILD_TIMEOUT_SECONDS,
+    )
+
+
+def test_real_pip_selects_cp311_arm64_and_transitive_wheels(
+    generated_index: Path, tmp_path: Path
+) -> None:
+    destination = tmp_path / "downloads"
+    destination.mkdir()
 
     with _serve_index(generated_index) as base_url:
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "--isolated",
-                "download",
-                "--dest",
-                str(destination),
-                "--index-url",
-                f"{base_url}/simple/",
-                "--only-binary=:all:",
-                "--platform=manylinux2014_aarch64",
-                "--python-version=3.11",
-                "--implementation=cp",
-                "--abi=cp311",
-                "demo-direct==1.0.0",
-                "demo-native==1.0.0",
-            ],
-            cwd=ROOT,
-            env=environment,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=BUILD_TIMEOUT_SECONDS,
-        )
+        result = _pip_download(base_url, destination, _pip_environment())
 
     assert result.returncode == 0, result.stderr
     assert {path.name for path in destination.iterdir()} == {
         "demo_common-1.2.3-py3-none-any.whl",
         "demo_direct-1.0.0-py3-none-any.whl",
         "demo_native-1.0.0-cp311-cp311-manylinux2014_aarch64.whl",
+    }
+
+
+def test_real_pip_ignores_proxy_from_pip_config(
+    generated_index: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _SentinelProxyHandler.requests = 0
+    proxy = ThreadingHTTPServer(("127.0.0.1", 0), _SentinelProxyHandler)
+    proxy_thread = Thread(target=proxy.serve_forever, daemon=True)
+    proxy_thread.start()
+    proxy_host, proxy_port = proxy.server_address
+    pip_config = tmp_path / "pip.conf"
+    pip_config.write_text(
+        f"[global]\nproxy = http://{proxy_host}:{proxy_port}\n", encoding="utf-8"
+    )
+    destination = tmp_path / "downloads"
+    destination.mkdir()
+    monkeypatch.setenv("PIP_CONFIG_FILE", str(pip_config))
+    environment = _pip_environment()
+    assert environment["PIP_CONFIG_FILE"] == os.devnull
+
+    try:
+        with _serve_index(generated_index) as base_url:
+            result = _pip_download(base_url, destination, environment)
+    finally:
+        proxy.shutdown()
+        proxy.server_close()
+        proxy_thread.join(timeout=HTTP_TIMEOUT_SECONDS)
+        assert not proxy_thread.is_alive(), "sentinel pip proxy did not stop"
+
+    assert result.returncode == 0, result.stderr
+    assert _SentinelProxyHandler.requests == 0
+    assert "demo_direct-1.0.0-py3-none-any.whl" in {
+        path.name for path in destination.iterdir()
     }
 
 
