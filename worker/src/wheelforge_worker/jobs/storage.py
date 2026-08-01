@@ -22,7 +22,8 @@ _GENERATED_STAGE = re.compile(
 )
 _GENERATED_WORKSPACE = re.compile(rf"wf-execution-({_UUID_PATTERN})\Z")
 _GENERATED_ARTIFACT = re.compile(
-    rf"artifacts/(?P<task>{_UUID_PATTERN})/{_UUID_PATTERN}\.zip\Z"
+    rf"artifacts/(?P<task>{_UUID_PATTERN})/"
+    rf"(?:(?P<owner>{_UUID_PATTERN})/)?{_UUID_PATTERN}\.zip\Z"
 )
 
 
@@ -56,9 +57,30 @@ class RootedLocalStorage:
         uuid_factory: Callable[[], UUID] = uuid4,
     ) -> None:
         _require_supported_host()
-        self.root = _require_stable_root(Path(root), "data root")
-        self._root_identity = _identity(self.root.lstat())
+        self._root_descriptor: int | None
+        self.root, descriptor = _open_stable_root(Path(root), "data root")
+        self._root_descriptor = descriptor
+        self._root_identity = _identity(os.fstat(self._root_descriptor))
         self._uuid_factory = uuid_factory
+
+    def close(self) -> None:
+        if self._root_descriptor is not None:
+            os.close(self._root_descriptor)
+            self._root_descriptor = None
+
+    def __del__(self) -> None:
+        descriptor = getattr(self, "_root_descriptor", None)
+        if descriptor is not None:
+            _best_effort(os.close, descriptor)
+
+    def _duplicate_root(self) -> int:
+        if self._root_descriptor is None:
+            raise RuntimeError("data root is closed")
+        return os.dup(self._root_descriptor)
+
+    @property
+    def root_identity(self) -> tuple[int, int]:
+        return self._root_identity
 
     def read_bytes(self, object_key: str) -> bytes:
         parts = _object_key_parts(object_key)
@@ -213,13 +235,9 @@ class RootedLocalStorage:
             _best_effort(parent.close)
 
     def _open_parent(self, parts: tuple[str, ...], *, create: bool) -> _ParentBinding:
-        self._require_root()
         supports_dir_fd = os.open in os.supports_dir_fd
         if supports_dir_fd:
-            descriptor = os.open(
-                self.root,
-                os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
-            )
+            descriptor = self._duplicate_root()
             current = self.root
             try:
                 for part in parts:
@@ -243,105 +261,105 @@ class RootedLocalStorage:
 
         raise RuntimeError("safe descriptor-relative storage is unavailable")
 
-    def _require_root(self) -> None:
-        status = self.root.lstat()
-        if (
-            not stat.S_ISDIR(status.st_mode)
-            or stat.S_ISLNK(status.st_mode)
-            or _is_reparse(status)
-            or _identity(status) != self._root_identity
-        ):
-            raise OSError("data root identity changed")
-
     def sweep_abandoned(
         self,
         cutoff: datetime,
         referenced_artifact_keys: frozenset[str],
         *,
         active_execution_ids: frozenset[str],
-        active_build_task_ids: frozenset[str],
+        active_build_executions: frozenset[tuple[str, str]],
     ) -> None:
-        self._require_root()
         cutoff_timestamp = cutoff.timestamp()
-        for directory, directories, filenames, descriptor in os.fwalk(
-            self.root, topdown=True, follow_symlinks=False
-        ):
-            safe_directories: list[str] = []
-            for name in directories:
-                status = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-                if stat.S_ISDIR(status.st_mode) and not stat.S_ISLNK(status.st_mode):
-                    safe_directories.append(name)
-            directories[:] = safe_directories
-            relative_directory = Path(directory).relative_to(self.root)
-            for name in filenames:
-                relative = (relative_directory / name).as_posix()
-                stage_match = _GENERATED_STAGE.fullmatch(name)
-                artifact_match = _GENERATED_ARTIFACT.fullmatch(relative)
-                if stage_match is None and artifact_match is None:
-                    continue
-                if (
-                    stage_match is not None
-                    and stage_match.group("owner") in active_execution_ids
-                ):
-                    continue
-                if artifact_match is not None and (
-                    relative in referenced_artifact_keys
-                    or artifact_match.group("task") in active_build_task_ids
-                ):
-                    continue
-                status = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-                if not stat.S_ISREG(status.st_mode) or status.st_mtime > cutoff_timestamp:
-                    continue
-                os.unlink(name, dir_fd=descriptor)
-                try:
-                    os.fsync(descriptor)
-                except OSError as error:
-                    if error.errno not in {
-                        errno.EINVAL,
-                        getattr(errno, "ENOTSUP", errno.EINVAL),
-                    }:
-                        raise
+        root_descriptor = self._duplicate_root()
+        try:
+            for directory, directories, filenames, descriptor in os.fwalk(
+                ".", topdown=True, follow_symlinks=False, dir_fd=root_descriptor
+            ):
+                safe_directories: list[str] = []
+                for name in directories:
+                    status = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                    if stat.S_ISDIR(status.st_mode) and not stat.S_ISLNK(status.st_mode):
+                        safe_directories.append(name)
+                directories[:] = safe_directories
+                relative_directory = Path(directory)
+                for name in filenames:
+                    relative = (relative_directory / name).as_posix()
+                    relative = relative.removeprefix("./")
+                    stage_match = _GENERATED_STAGE.fullmatch(name)
+                    artifact_match = _GENERATED_ARTIFACT.fullmatch(relative)
+                    if stage_match is None and artifact_match is None:
+                        continue
+                    if (
+                        stage_match is not None
+                        and stage_match.group("owner") in active_execution_ids
+                    ):
+                        continue
+                    if artifact_match is not None and (
+                        relative in referenced_artifact_keys
+                        or (
+                            artifact_match.group("owner") is not None
+                            and (
+                                artifact_match.group("task"),
+                                artifact_match.group("owner"),
+                            )
+                            in active_build_executions
+                        )
+                    ):
+                        continue
+                    status = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                    if (
+                        not stat.S_ISREG(status.st_mode)
+                        or status.st_mtime > cutoff_timestamp
+                    ):
+                        continue
+                    os.unlink(name, dir_fd=descriptor)
+                    _fsync_descriptor(descriptor)
+        finally:
+            os.close(root_descriptor)
 
 
 @dataclass(slots=True)
 class OwnedWorkspace:
     path: Path
-    _root: Path
-    _root_identity: tuple[int, int]
+    _root_descriptor: int | None
     _identity: tuple[int, int]
     _cleaned: bool = False
 
     def cleanup(self) -> None:
         if self._cleaned:
             return
-        root_status = self._root.lstat()
-        if _identity(root_status) != self._root_identity:
-            raise RuntimeError("workspace root identity changed")
-        child_status = self.path.lstat()
-        if (
-            not stat.S_ISDIR(child_status.st_mode)
-            or stat.S_ISLNK(child_status.st_mode)
-            or _is_reparse(child_status)
-            or _identity(child_status) != self._identity
-        ):
-            raise RuntimeError("workspace identity changed")
-        if os.open in os.supports_dir_fd and shutil.rmtree.avoids_symlink_attacks:
-            root_descriptor = os.open(
-                self._root,
-                os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
-            )
-            try:
-                current = os.stat(
-                    self.path.name, dir_fd=root_descriptor, follow_symlinks=False
-                )
-                if _identity(current) != self._identity:
-                    raise RuntimeError("workspace identity changed")
-                shutil.rmtree(self.path.name, dir_fd=root_descriptor)
-            finally:
-                os.close(root_descriptor)
-        else:
+        if self._root_descriptor is None:
+            raise RuntimeError("workspace root is closed")
+        if not shutil.rmtree.avoids_symlink_attacks:
             raise RuntimeError("safe descriptor-relative cleanup is unavailable")
-        self._cleaned = True
+        root_descriptor = os.dup(self._root_descriptor)
+        try:
+            current = os.stat(
+                self.path.name, dir_fd=root_descriptor, follow_symlinks=False
+            )
+            if (
+                not stat.S_ISDIR(current.st_mode)
+                or stat.S_ISLNK(current.st_mode)
+                or _is_reparse(current)
+                or _identity(current) != self._identity
+            ):
+                raise RuntimeError("workspace identity changed")
+            shutil.rmtree(self.path.name, dir_fd=root_descriptor)
+            _fsync_descriptor(root_descriptor)
+            self._cleaned = True
+            self.close()
+        finally:
+            os.close(root_descriptor)
+
+    def close(self) -> None:
+        if self._root_descriptor is not None:
+            os.close(self._root_descriptor)
+            self._root_descriptor = None
+
+    def __del__(self) -> None:
+        descriptor = getattr(self, "_root_descriptor", None)
+        if descriptor is not None:
+            _best_effort(os.close, descriptor)
 
 
 class WorkspaceManager:
@@ -352,42 +370,87 @@ class WorkspaceManager:
         uuid_factory: Callable[[], UUID] = uuid4,
     ) -> None:
         _require_supported_host()
-        self.root = _require_stable_root(Path(root), "workspace root")
-        self._root_identity = _identity(self.root.lstat())
+        self._root_descriptor: int | None
+        self.root, descriptor = _open_stable_root(Path(root), "workspace root")
+        self._root_descriptor = descriptor
+        self._root_identity = _identity(os.fstat(self._root_descriptor))
         self._uuid_factory = uuid_factory
 
+    def close(self) -> None:
+        if self._root_descriptor is not None:
+            os.close(self._root_descriptor)
+            self._root_descriptor = None
+
+    def __del__(self) -> None:
+        descriptor = getattr(self, "_root_descriptor", None)
+        if descriptor is not None:
+            _best_effort(os.close, descriptor)
+
+    def _duplicate_root(self) -> int:
+        if self._root_descriptor is None:
+            raise RuntimeError("workspace root is closed")
+        return os.dup(self._root_descriptor)
+
+    @property
+    def root_identity(self) -> tuple[int, int]:
+        return self._root_identity
+
     def allocate(self, execution_id: str | None = None) -> OwnedWorkspace:
+        attempts = 1 if execution_id is not None else 128
+        root_descriptor = self._duplicate_root()
+        try:
+            for _attempt in range(attempts):
+                identifier = (
+                    UUID(execution_id)
+                    if execution_id is not None
+                    else self._uuid_factory()
+                )
+                name = f"wf-execution-{identifier}"
+                path = self.root / name
+                try:
+                    os.mkdir(name, 0o700, dir_fd=root_descriptor)
+                except FileExistsError:
+                    continue
+                try:
+                    status = os.stat(
+                        name, dir_fd=root_descriptor, follow_symlinks=False
+                    )
+                    if (
+                        not stat.S_ISDIR(status.st_mode)
+                        or stat.S_ISLNK(status.st_mode)
+                        or _is_reparse(status)
+                    ):
+                        raise RuntimeError(
+                            "allocated workspace is not a plain directory"
+                        )
+                    self._require_path_binding(path, _identity(status))
+                    return OwnedWorkspace(
+                        path,
+                        os.dup(root_descriptor),
+                        _identity(status),
+                    )
+                except BaseException:
+                    _best_effort(shutil.rmtree, name, dir_fd=root_descriptor)
+                    raise
+            raise RuntimeError("could not allocate a unique workspace")
+        finally:
+            os.close(root_descriptor)
+
+    def _require_path_binding(
+        self, workspace_path: Path, workspace_identity: tuple[int, int]
+    ) -> None:
         root_status = self.root.lstat()
         if _identity(root_status) != self._root_identity:
             raise RuntimeError("workspace root identity changed")
-        attempts = 1 if execution_id is not None else 128
-        for _attempt in range(attempts):
-            identifier = UUID(execution_id) if execution_id is not None else self._uuid_factory()
-            name = f"wf-execution-{identifier}"
-            path = self.root / name
-            try:
-                path.mkdir(mode=0o700)
-            except FileExistsError:
-                continue
-            status = path.lstat()
-            if not stat.S_ISDIR(status.st_mode) or _is_reparse(status):
-                raise RuntimeError("allocated workspace is not a plain directory")
-            return OwnedWorkspace(
-                path,
-                self.root,
-                self._root_identity,
-                _identity(status),
-            )
-        raise RuntimeError("could not allocate a unique workspace")
+        workspace_status = workspace_path.lstat()
+        if _identity(workspace_status) != workspace_identity:
+            raise RuntimeError("workspace root identity changed")
 
     def sweep_abandoned(
         self, cutoff: datetime, active_execution_ids: frozenset[str]
     ) -> None:
         cutoff_timestamp = cutoff.timestamp()
-        root_descriptor = os.open(
-            self.root,
-            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
-        )
+        root_descriptor = self._duplicate_root()
         try:
             with os.scandir(root_descriptor) as entries:
                 for entry in entries:
@@ -435,20 +498,32 @@ def _require_supported_host() -> None:
         raise RuntimeError("safe descriptor-relative filesystem operations are unavailable")
 
 
-def _require_stable_root(path: Path, label: str) -> Path:
+def _open_stable_root(path: Path, label: str) -> tuple[Path, int]:
     if not path.is_absolute():
         raise ValueError(f"{label} must be absolute")
-    configured_status = path.lstat()
-    if stat.S_ISLNK(configured_status.st_mode) or _is_reparse(configured_status):
-        raise ValueError(f"{label} must not traverse links")
-    _require_plain_directory(path)
-    current = path
-    while current != current.parent:
-        status = current.lstat()
-        if stat.S_ISLNK(status.st_mode) or _is_reparse(status):
-            raise ValueError(f"{label} must not traverse links")
-        current = current.parent
-    return path.absolute()
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path.anchor, flags)
+    try:
+        for component in path.parts[1:]:
+            try:
+                next_descriptor = os.open(
+                    component, flags, dir_fd=descriptor
+                )
+            except OSError as error:
+                raise ValueError(f"{label} must not traverse links") from error
+            os.close(descriptor)
+            descriptor = next_descriptor
+            status = os.fstat(descriptor)
+            if (
+                not stat.S_ISDIR(status.st_mode)
+                or stat.S_ISLNK(status.st_mode)
+                or _is_reparse(status)
+            ):
+                raise ValueError(f"{label} must not traverse links")
+        return path.absolute(), descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
 
 
 def _require_plain_directory(path: Path) -> None:
@@ -544,9 +619,11 @@ def _write_bytes(handle: BinaryIO, content: bytes) -> tuple[int, str]:
     return len(content), hashlib.sha256(content).hexdigest()
 
 
-def _best_effort(operation: Callable[..., object], *args: object) -> None:
+def _best_effort(
+    operation: Callable[..., object], *args: object, **kwargs: object
+) -> None:
     try:
-        operation(*args)
+        operation(*args, **kwargs)
     except Exception:
         # Exact generated entries are reconciled by age-qualified maintenance.
         pass

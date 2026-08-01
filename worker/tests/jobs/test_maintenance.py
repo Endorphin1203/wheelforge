@@ -4,6 +4,8 @@ import os
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from wheelforge_worker.jobs.maintenance import MaintenanceService, MaintenanceSnapshot
 from wheelforge_worker.jobs.storage import RootedLocalStorage, WorkspaceManager
 
@@ -13,15 +15,20 @@ ACTIVE = "10000000-0000-4000-8000-000000000001"
 STALE = "10000000-0000-4000-8000-000000000002"
 TASK = "20000000-0000-4000-8000-000000000001"
 OTHER_TASK = "20000000-0000-4000-8000-000000000002"
-REFERENCED = f"artifacts/{TASK}/30000000-0000-4000-8000-000000000001.zip"
-ACTIVE_ARTIFACT = f"artifacts/{TASK}/30000000-0000-4000-8000-000000000002.zip"
-ORPHAN = f"artifacts/{OTHER_TASK}/30000000-0000-4000-8000-000000000003.zip"
+REFERENCED = f"artifacts/{TASK}/{STALE}/30000000-0000-4000-8000-000000000001.zip"
+ACTIVE_ARTIFACT = f"artifacts/{TASK}/{ACTIVE}/30000000-0000-4000-8000-000000000002.zip"
+ORPHAN = f"artifacts/{OTHER_TASK}/{STALE}/30000000-0000-4000-8000-000000000003.zip"
+STALE_SAME_TASK = (
+    f"artifacts/{TASK}/{STALE}/30000000-0000-4000-8000-000000000004.zip"
+)
 
 
 class SnapshotRepository:
     def maintenance_snapshot(self) -> MaintenanceSnapshot:
         return MaintenanceSnapshot(
-            frozenset({ACTIVE}), frozenset({TASK}), frozenset({REFERENCED})
+            frozenset({ACTIVE}),
+            frozenset({(TASK, ACTIVE)}),
+            frozenset({REFERENCED}),
         )
 
 
@@ -76,6 +83,32 @@ def test_startup_maintenance_removes_only_old_proven_abandoned_entries(
     assert unrelated.read_text() == "keep"
 
 
+def test_active_successor_does_not_protect_prior_execution_orphan(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "data"
+    workspace_root = tmp_path / "workspace"
+    data_root.mkdir(mode=0o700)
+    workspace_root.mkdir(mode=0o700)
+    storage = RootedLocalStorage(data_root)
+    active = storage.publish_bytes(ACTIVE_ARTIFACT, b"active")
+    stale = storage.publish_bytes(STALE_SAME_TASK, b"stale")
+    old = (NOW - timedelta(days=2)).timestamp()
+    os.utime(data_root / active.object_key, (old, old))
+    os.utime(data_root / stale.object_key, (old, old))
+
+    MaintenanceService(
+        SnapshotRepository(),
+        storage,
+        WorkspaceManager(workspace_root),
+        minimum_age=timedelta(days=1),
+        clock=lambda: NOW,
+    ).run()
+
+    assert (data_root / active.object_key).read_bytes() == b"active"
+    assert not (data_root / stale.object_key).exists()
+
+
 def test_orphan_artifact_is_removed_when_no_execution_is_live(tmp_path: Path) -> None:
     data_root = tmp_path / "data"
     workspace_root = tmp_path / "workspace"
@@ -123,7 +156,7 @@ def test_periodic_maintenance_reconsiders_files_that_age_after_startup(
     clock = [NOW]
     repository = SnapshotRepository()
     repository.maintenance_snapshot = lambda: MaintenanceSnapshot(
-        frozenset({ACTIVE}), frozenset({TASK}), frozenset()
+        frozenset({ACTIVE}), frozenset({(TASK, ACTIVE)}), frozenset()
     )
     service = MaintenanceService(
         repository,
@@ -142,3 +175,41 @@ def test_periodic_maintenance_reconsiders_files_that_age_after_startup(
     clock[0] = NOW + timedelta(minutes=40)
     assert service.run_if_due() is True
     assert not path.exists()
+
+
+def test_failed_periodic_maintenance_is_backed_off_before_retry(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "data"
+    workspace_root = tmp_path / "workspace"
+    data_root.mkdir(mode=0o700)
+    workspace_root.mkdir(mode=0o700)
+    calls = 0
+
+    class FlakyRepository:
+        def maintenance_snapshot(self) -> MaintenanceSnapshot:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError("temporary metadata failure")
+            return MaintenanceSnapshot(frozenset(), frozenset(), frozenset())
+
+    clock = [NOW]
+    service = MaintenanceService(
+        FlakyRepository(),
+        RootedLocalStorage(data_root),
+        WorkspaceManager(workspace_root),
+        minimum_age=timedelta(hours=1),
+        interval=timedelta(hours=1),
+        failure_backoff=timedelta(minutes=10),
+        clock=lambda: clock[0],
+    )
+
+    with pytest.raises(OSError, match="temporary metadata failure"):
+        service.run_if_due()
+    clock[0] = NOW + timedelta(minutes=9)
+    assert service.run_if_due() is False
+    assert calls == 1
+    clock[0] = NOW + timedelta(minutes=10)
+    assert service.run_if_due() is True
+    assert calls == 2

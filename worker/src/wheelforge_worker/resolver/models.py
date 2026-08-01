@@ -118,6 +118,8 @@ class ResolutionResult:
     rejections: tuple[CandidateRejection, ...] = ()
     changes: tuple[VersionChange, ...] = ()
     source: PackageSource | None = None
+    rejections_omitted: int = 0
+    observations_truncated: bool = False
 
 
 class ResolverError(RuntimeError):
@@ -162,9 +164,13 @@ class CompatibilityResolutionError(ResolverError):
         attempts: tuple[ResolutionAttempt, ...],
         rejections: tuple[CandidateRejection, ...],
         changes: tuple[VersionChange, ...],
+        rejections_omitted: int = 0,
+        observations_truncated: bool = False,
     ) -> None:
         self.code = code
         self.attempts = attempts
         self.rejections = rejections
         self.changes = changes
+        self.rejections_omitted = rejections_omitted
+        self.observations_truncated = observations_truncated
         super().__init__(f"compatibility resolution failed: {code.value}")

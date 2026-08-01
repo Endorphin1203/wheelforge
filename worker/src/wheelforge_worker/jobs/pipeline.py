@@ -543,7 +543,9 @@ class JobPipeline:
                 return cancelled
 
             artifact_id = str(self._uuid_factory())
-            object_key = f"artifacts/{lease.subject_id}/{artifact_id}.zip"
+            object_key = (
+                f"artifacts/{lease.subject_id}/{lease.execution_id}/{artifact_id}.zip"
+            )
             published = self._during_lease(
                 lease,
                 lambda: self._storage.publish_file(

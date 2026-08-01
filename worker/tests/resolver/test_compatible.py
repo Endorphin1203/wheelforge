@@ -8,7 +8,11 @@ from packaging.version import Version
 
 from wheelforge_worker.parser import ParsedRequirements, parse_requirements
 from wheelforge_worker.resolver.candidates import CandidateMetadata, ordered_candidates
-from wheelforge_worker.resolver.compatible import CompatibleResolver
+from wheelforge_worker.resolver.compatible import (
+    MAX_RESOLUTION_OBSERVATIONS,
+    MAX_RESOLUTION_REJECTIONS,
+    CompatibleResolver,
+)
 from wheelforge_worker.resolver.models import (
     CandidateRejectionCode,
     CompatibilityFailureCode,
@@ -853,6 +857,35 @@ def test_provider_release_count_and_strings_are_bounded() -> None:
     reasons = [rejection.reason for rejection in captured.value.rejections]
     assert any("version" in reason and "limit" in reason for reason in reasons)
     assert any("release count" in reason for reason in reasons)
+
+
+def test_high_cardinality_provider_has_global_observation_and_rejection_budgets() -> None:
+    parsed = parse_requirements(b"demo==1.0\n")
+    strict = RecordingStrictResolver(lambda _requirements, _source: None)
+    malformed_wheels = tuple(f"not-a-wheel-{index}" for index in range(3))
+    releases = tuple(
+        candidate(f"1.{index}", wheels=malformed_wheels)
+        for index in range(MAX_RESOLUTION_OBSERVATIONS + 100)
+    )
+    provider = RecordingProvider(
+        {
+            ("demo", PackageSource.PYPI): releases,
+            ("demo", PackageSource.ALIYUN): releases,
+        }
+    )
+
+    with pytest.raises(CompatibilityResolutionError) as captured:
+        CompatibleResolver(strict, provider).resolve(
+            parsed,
+            profile(),
+            (PackageSource.PYPI, PackageSource.ALIYUN),
+            ResolveLimits(),
+        )
+
+    failure = captured.value
+    assert len(failure.rejections) <= MAX_RESOLUTION_REJECTIONS
+    assert failure.rejections_omitted > 0
+    assert failure.observations_truncated is True
 
 
 def test_target_profile_is_never_mutated_or_substituted() -> None:

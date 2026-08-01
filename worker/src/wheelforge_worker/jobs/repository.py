@@ -1004,7 +1004,9 @@ class JobRepository:
         return MaintenanceSnapshot(
             frozenset(str(row.execution_id) for row in active),
             frozenset(
-                str(row.subject_id) for row in active if row.job_type == "BUILD"
+                (str(row.subject_id), str(row.execution_id))
+                for row in active
+                if row.job_type == "BUILD"
             ),
             frozenset(str(value) for value in referenced),
         )
@@ -1259,8 +1261,9 @@ def _package_resolution_audit(
 
 
 def _resolution_summary_audit(resolution: ResolutionResult) -> dict[str, Any]:
-    attempt_entries = [
-        {
+    attempts = _AuditAccumulator(_BUILD_AUDIT_SECTION_BYTES)
+    for attempt in resolution.attempts:
+        attempts.add({
             "source": attempt.source.value,
             "failure": attempt.failure.value if attempt.failure else None,
             "reason": _json_string_prefix(
@@ -1276,11 +1279,10 @@ def _resolution_summary_audit(resolution: ResolutionResult) -> dict[str, Any]:
                 }
                 for selection in attempt.selections[:2]
             ],
-        }
-        for attempt in resolution.attempts
-    ]
-    rejection_entries = [
-        {
+        })
+    rejections = _AuditAccumulator(_BUILD_AUDIT_SECTION_BYTES)
+    for item in resolution.rejections:
+        rejections.add({
             "package": _json_string_prefix(canonicalize_name(item.package), 120),
             "version": _json_string_prefix(item.version, 120),
             "source": item.source.value,
@@ -1288,35 +1290,26 @@ def _resolution_summary_audit(resolution: ResolutionResult) -> dict[str, Any]:
             "reason": _json_string_prefix(
                 sanitize_text(item.reason, limit=1000), 240
             ),
-        }
-        for item in resolution.rejections
-    ]
-    attempts = _fit_audit_entries(attempt_entries, _BUILD_AUDIT_SECTION_BYTES)
-    rejections = _fit_audit_entries(
-        rejection_entries, _BUILD_AUDIT_SECTION_BYTES
-    )
+        })
     audit: dict[str, Any] = {
         "version": 1,
         "totals": {
-            "attempts": len(attempt_entries),
-            "rejections": len(rejection_entries),
+            "attempts": attempts.total,
+            "rejections": rejections.total + resolution.rejections_omitted,
         },
-        "attempts": attempts,
-        "rejections": rejections,
+        "attempts": attempts.entries,
+        "rejections": rejections.entries,
         "omitted": {
-            "attempts": len(attempt_entries) - len(attempts),
-            "rejections": len(rejection_entries) - len(rejections),
+            "attempts": attempts.omitted,
+            "rejections": rejections.omitted + resolution.rejections_omitted,
+        },
+        "truncated": {
+            "observations": resolution.observations_truncated,
+            "rejections": resolution.rejections_omitted,
         },
     }
-    while _json_bytes(audit) > MAX_BUILD_AUDIT_BYTES:
-        if audit["rejections"]:
-            audit["rejections"].pop()
-            audit["omitted"]["rejections"] += 1
-        elif audit["attempts"]:
-            audit["attempts"].pop()
-            audit["omitted"]["attempts"] += 1
-        else:
-            raise ValueError("resolution audit metadata exceeds the byte limit")
+    if _json_bytes(audit) > MAX_BUILD_AUDIT_BYTES:
+        raise ValueError("resolution audit metadata exceeds the byte limit")
     return audit
 
 
@@ -1324,8 +1317,8 @@ def _package_resolution_audits(
     resolution: ResolutionResult, packages: tuple[str, ...]
 ) -> dict[str, dict[str, Any]]:
     requested = {canonicalize_name(package) for package in packages}
-    attempt_entries: dict[str, list[dict[str, Any]]] = {
-        package: [] for package in requested
+    attempts = {
+        package: _AuditAccumulator(_AUDIT_SECTION_BYTES) for package in requested
     }
     for attempt in resolution.attempts:
         reason = _json_string_prefix(sanitize_text(attempt.reason, limit=1000), 300)
@@ -1333,24 +1326,22 @@ def _package_resolution_audits(
             package = canonicalize_name(selection.package)
             if package not in requested:
                 continue
-            attempt_entries[package].append(
-                {
+            attempts[package].add({
                     "source": attempt.source.value,
                     "failure": attempt.failure.value if attempt.failure else None,
                     "selectedVersion": _json_string_prefix(
                         str(selection.version), 200
                     ),
                     "reason": reason,
-                }
-            )
-    rejection_entries: dict[str, list[dict[str, Any]]] = {
-        package: [] for package in requested
+                })
+    rejections = {
+        package: _AuditAccumulator(_AUDIT_SECTION_BYTES) for package in requested
     }
     for item in resolution.rejections:
         package = canonicalize_name(item.package)
         if package not in requested:
             continue
-        rejection_entries[package].append({
+        rejections[package].add({
             "version": _json_string_prefix(item.version, 200),
             "source": item.source.value,
             "code": item.code.value,
@@ -1360,7 +1351,10 @@ def _package_resolution_audits(
         })
     return {
         package: _build_package_resolution_audit(
-            package, attempt_entries[package], rejection_entries[package]
+            package,
+            attempts[package],
+            rejections[package],
+            resolution,
         )
         for package in requested
     }
@@ -1368,43 +1362,46 @@ def _package_resolution_audits(
 
 def _build_package_resolution_audit(
     package: str,
-    attempt_entries: list[dict[str, Any]],
-    rejection_entries: list[dict[str, Any]],
+    attempts: _AuditAccumulator,
+    rejections: _AuditAccumulator,
+    resolution: ResolutionResult,
 ) -> dict[str, Any]:
-    attempts = _fit_audit_entries(attempt_entries, _AUDIT_SECTION_BYTES)
-    rejections = _fit_audit_entries(rejection_entries, _AUDIT_SECTION_BYTES)
     audit: dict[str, Any] = {
         "version": 1,
         "package": _json_string_prefix(package, 300),
-        "attempts": attempts,
-        "rejections": rejections,
+        "attempts": attempts.entries,
+        "rejections": rejections.entries,
         "omitted": {
-            "attempts": len(attempt_entries) - len(attempts),
-            "rejections": len(rejection_entries) - len(rejections),
+            "attempts": attempts.omitted,
+            "rejections": rejections.omitted + resolution.rejections_omitted,
+        },
+        "truncated": {
+            "observations": resolution.observations_truncated,
+            "globalRejections": resolution.rejections_omitted,
         },
     }
-    while _json_bytes(audit) > MAX_PACKAGE_AUDIT_BYTES:
-        if audit["rejections"]:
-            audit["rejections"].pop()
-            audit["omitted"]["rejections"] += 1
-        elif audit["attempts"]:
-            audit["attempts"].pop()
-            audit["omitted"]["attempts"] += 1
-        else:
-            raise ValueError("package audit metadata exceeds the byte limit")
+    if _json_bytes(audit) > MAX_PACKAGE_AUDIT_BYTES:
+        raise ValueError("package audit metadata exceeds the byte limit")
     return audit
 
 
-def _fit_audit_entries(
-    entries: list[dict[str, Any]], byte_limit: int
-) -> list[dict[str, Any]]:
-    included: list[dict[str, Any]] = []
-    for entry in entries:
-        candidate = [*included, entry]
-        if _json_bytes(candidate) > byte_limit:
-            break
-        included.append(entry)
-    return included
+class _AuditAccumulator:
+    def __init__(self, byte_limit: int) -> None:
+        self.entries: list[dict[str, Any]] = []
+        self.total = 0
+        self.omitted = 0
+        self._byte_limit = byte_limit
+        self._encoded_bytes = 2
+
+    def add(self, entry: dict[str, Any]) -> None:
+        self.total += 1
+        encoded_bytes = _json_bytes(entry)
+        separator_bytes = 2 if self.entries else 0
+        if self._encoded_bytes + separator_bytes + encoded_bytes > self._byte_limit:
+            self.omitted += 1
+            return
+        self.entries.append(entry)
+        self._encoded_bytes += separator_bytes + encoded_bytes
 
 
 def _json_string_prefix(value: str, byte_limit: int) -> str:

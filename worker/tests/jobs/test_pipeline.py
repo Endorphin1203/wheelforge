@@ -661,6 +661,9 @@ def test_successful_build_publishes_artifact_and_terminal_states(
         assert connection.scalar(select(build_tasks.c.status)) == "SUCCESS"
         assert connection.scalar(select(build_jobs.c.status)) == "COMPLETED"
     assert storage.read_bytes(artifact.object_key) == b"verified zip bytes"
+    assert artifact.object_key == (
+        f"artifacts/{lease.subject_id}/{lease.execution_id}/{result.artifact_id}.zip"
+    )
     assert artifact.sha256 == hashlib.sha256(b"verified zip bytes").hexdigest()
     assert list(workspaces.root.iterdir()) == []
 

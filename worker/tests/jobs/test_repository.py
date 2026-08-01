@@ -626,6 +626,60 @@ def test_full_resolution_audit_is_stored_once_under_a_strict_byte_limit() -> Non
     assert audit["omitted"]["rejections"] > 0
 
 
+def test_high_cardinality_audit_streams_into_fixed_size_accumulators(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = ResolvedPackage(
+        "alpha", Version("1.0"), True, "https://example/alpha", "alpha.whl", (), None, ()
+    )
+    resolution = ResolutionResult(
+        "1",
+        (package,),
+        attempts=tuple(
+            ResolutionAttempt(
+                (CandidateSelection("alpha", Version(f"1.{index}")),),
+                PackageSource.PYPI,
+                CompatibilityFailureCode.STRICT_RESOLUTION,
+                "x" * 1000,
+            )
+            for index in range(10_000)
+        ),
+        rejections=tuple(
+            CandidateRejection(
+                "alpha",
+                str(index),
+                PackageSource.PYPI,
+                CandidateRejectionCode.NO_TARGET_WHEEL,
+                "y" * 1000,
+            )
+            for index in range(10_000)
+        ),
+        rejections_omitted=123,
+        observations_truncated=True,
+    )
+    maximum_retained = 0
+    original_add = repository_module._AuditAccumulator.add
+
+    def tracking_add(self: object, entry: dict[str, object]) -> None:
+        nonlocal maximum_retained
+        original_add(self, entry)
+        maximum_retained = max(maximum_retained, len(self.entries))
+
+    monkeypatch.setattr(repository_module._AuditAccumulator, "add", tracking_add)
+
+    package_audit = repository_module._package_resolution_audit(resolution, "alpha")
+    summary = repository_module._resolution_summary_audit(resolution)
+
+    assert maximum_retained < 100
+    assert package_audit["omitted"]["rejections"] >= 123
+    assert summary["truncated"] == {
+        "observations": True,
+        "rejections": 123,
+    }
+    assert len(json.dumps(package_audit, ensure_ascii=True).encode()) <= MAX_PACKAGE_AUDIT_BYTES
+    assert len(json.dumps(summary, ensure_ascii=True).encode()) <= MAX_BUILD_AUDIT_BYTES
+
+
 def test_persist_resolution_rejects_package_count_before_database_writes() -> None:
     repository = _repository()
     lease = repository.claim_next("worker-a")

@@ -157,3 +157,58 @@ def test_run_forever_runs_periodic_maintenance_while_processing_jobs() -> None:
     consumer.run_forever()
 
     assert len(maintenance_calls) == 2
+
+
+def test_periodic_maintenance_failure_is_sanitized_backed_off_and_does_not_stop_jobs() -> None:
+    repository = FakeRepository(LEASE, [])
+    pipeline = RecordingPipeline()
+    maintenance_calls = 0
+    errors: list[str] = []
+    waits: list[float] = []
+
+    def maintenance() -> None:
+        nonlocal maintenance_calls
+        maintenance_calls += 1
+        if maintenance_calls == 1:
+            raise OSError(
+                "mysql://worker:secret@db/wf?token=hidden " + "x" * 10_000
+            )
+
+    def wait(seconds: float) -> bool:
+        waits.append(seconds)
+        return len(waits) == 2
+
+    consumer = JobConsumer(
+        repository,
+        pipeline,
+        "worker-a",
+        poll_seconds=3,
+        wait=wait,
+        maintenance=maintenance,
+        maintenance_error=errors.append,
+    )
+
+    consumer.run_forever()
+
+    assert pipeline.leases == [LEASE]
+    assert waits == [3, 3]
+    assert len(errors) == 1
+    assert len(errors[0]) <= 2048
+    assert "secret" not in errors[0]
+    assert "hidden" not in errors[0]
+
+
+def test_consumer_close_releases_owned_resources_once() -> None:
+    closes: list[None] = []
+    consumer = JobConsumer(
+        FakeRepository(None, []),
+        RecordingPipeline(),
+        "worker-a",
+        poll_seconds=3,
+        close=lambda: closes.append(None),
+    )
+
+    consumer.close()
+    consumer.close()
+
+    assert closes == [None]

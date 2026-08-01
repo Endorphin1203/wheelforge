@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import time
+import logging
 from collections.abc import Callable
 from typing import Protocol
 
 from .errors import contains_exception, sanitize_error
 from .pipeline import JobPipeline, PipelineResult
 from .repository import JobLease, JobRepository, LostLeaseError
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class _Repository(Protocol):
@@ -31,6 +35,8 @@ class JobConsumer:
         poll_seconds: int,
         wait: Callable[[float], bool | None] = time.sleep,
         maintenance: Callable[[], object] | None = None,
+        maintenance_error: Callable[[str], object] | None = None,
+        close: Callable[[], object] | None = None,
     ) -> None:
         if not worker_id or len(worker_id) > 100:
             raise ValueError("worker_id must contain at most 100 characters")
@@ -42,6 +48,15 @@ class JobConsumer:
         self._poll_seconds = poll_seconds
         self._wait = wait
         self._maintenance = maintenance or _no_maintenance
+        self._maintenance_error = maintenance_error or _log_maintenance_error
+        self._close = close or _no_maintenance
+        self._closed = False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._close()
 
     def run_once(self) -> bool:
         lease = self._repository.claim_next(self._worker_id)
@@ -61,7 +76,19 @@ class JobConsumer:
 
     def run_forever(self) -> None:
         while True:
-            self._maintenance()
+            try:
+                self._maintenance()
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as error:
+                message = sanitize_error(error)
+                try:
+                    self._maintenance_error(message)
+                except Exception:
+                    _LOGGER.exception("maintenance error reporting failed")
+                if self._wait(float(self._poll_seconds)):
+                    return
+                continue
             if self.run_once():
                 continue
             if self._wait(float(self._poll_seconds)):
@@ -86,3 +113,7 @@ def build_consumer(
 
 def _no_maintenance() -> None:
     pass
+
+
+def _log_maintenance_error(message: str) -> None:
+    _LOGGER.error("periodic maintenance failed: %s", message)

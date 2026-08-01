@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
@@ -8,7 +9,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Barrier, Event
 from typing import Iterator
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from packaging.version import Version
@@ -16,7 +17,13 @@ from sqlalchemy import Engine, create_engine, event, insert, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 
-from wheelforge_worker.contracts import JobPayload
+from wheelforge_worker.artifact import ArtifactBuildContext, BuiltArtifact
+from wheelforge_worker.contracts import BuildStatus, JobPayload
+from wheelforge_worker.jobs.pipeline import (
+    BuildDownload,
+    BuildValidation,
+    JobPipeline,
+)
 from wheelforge_worker.jobs.repository import (
     JobRepository,
     LostLeaseError,
@@ -28,8 +35,13 @@ from wheelforge_worker.jobs.repository import (
     requirement_files,
     resolved_packages,
 )
-from wheelforge_worker.jobs.storage import PublishedObject, RootedLocalStorage
+from wheelforge_worker.jobs.storage import (
+    PublishedObject,
+    RootedLocalStorage,
+    WorkspaceManager,
+)
 from wheelforge_worker.resolver import ResolvedPackage, ResolutionResult
+from wheelforge_worker.validation import StaticValidationReport
 
 
 DATABASE_URL = os.getenv("WF_TEST_DATABASE_URL")
@@ -39,6 +51,7 @@ pytestmark = pytest.mark.skipif(
     reason="requires explicit disposable WF_TEST_DATABASE_URL",
 )
 NOW = datetime(2026, 8, 1, 8, 0, 0)
+MYSQL_REQUIREMENTS = b"demo==1.0\n"
 MIGRATION = (
     Path(__file__).parents[3]
     / "backend/src/main/resources/db/migration/V1__baseline.sql"
@@ -281,7 +294,6 @@ def test_mysql_metadata_failure_allows_exact_local_artifact_compensation(
     repository = JobRepository(mysql_engine, lease_seconds=60, clock=lambda: NOW)
     lease = repository.claim_next("worker-a")
     assert lease is not None
-    assert repository.claim_build(lease)
     duplicate_id = str(uuid4())
     with mysql_engine.begin() as connection:
         connection.execute(
@@ -302,26 +314,61 @@ def test_mysql_metadata_failure_allows_exact_local_artifact_compensation(
             )
         )
     root = tmp_path / "data"
+    workspace_root = tmp_path / "workspace"
     root.mkdir()
+    workspace_root.mkdir()
     storage = RootedLocalStorage(root)
-    object_key = f"artifacts/{task_id}/{uuid4()}.zip"
-    published = storage.publish_bytes(object_key, b"orphan")
+    storage.publish_bytes("requirements/7/original.txt", MYSQL_REQUIREMENTS)
+    storage.publish_bytes("requirements/7/normalized.txt", MYSQL_REQUIREMENTS)
 
-    with pytest.raises(IntegrityError):
-        repository.publish_artifact_terminal(
-            lease,
-            duplicate_id,
-            published,
-            "new.zip",
-            "SUCCESS",
-            NOW + timedelta(days=7),
-        )
+    class PackagingStages:
+        def resolve(
+            self, parsed: object, target: object, workspace: Path
+        ) -> ResolutionResult:
+            return ResolutionResult("1", ())
 
-    assert storage.delete_if_owned(object_key, published.sha256) is True
+        def download(
+            self,
+            resolution: ResolutionResult,
+            target: object,
+            workspace: Path,
+            cancel: object,
+        ) -> BuildDownload:
+            return BuildDownload((), ())
+
+        def validate(
+            self,
+            resolution: ResolutionResult,
+            wheels: tuple[object, ...],
+            target: object,
+        ) -> BuildValidation:
+            return BuildValidation((), StaticValidationReport((), True))
+
+        def package(
+            self, context: ArtifactBuildContext, output_directory: Path
+        ) -> BuiltArtifact:
+            path = output_directory / "bundle.zip"
+            content = b"mysql compensation artifact"
+            path.write_bytes(content)
+            return BuiltArtifact(path, hashlib.sha256(content).hexdigest(), {})
+
+    pipeline = JobPipeline(
+        repository,
+        storage,
+        WorkspaceManager(workspace_root),
+        PackagingStages(),
+        uuid_factory=lambda: UUID(duplicate_id),
+    )
+    object_key = f"artifacts/{task_id}/{lease.execution_id}/{duplicate_id}.zip"
+
+    result = pipeline.run(lease)
+
+    assert result.status is BuildStatus.FAILED
     assert not (root / object_key).exists()
     with mysql_engine.connect() as connection:
-        assert connection.scalar(select(build_jobs.c.status)) == "RUNNING"
-        assert connection.scalar(select(build_tasks.c.status)) == "RESOLVING"
+        assert connection.scalar(select(build_jobs.c.status)) == "FAILED"
+        assert connection.scalar(select(build_tasks.c.status)) == "FAILED"
+        assert connection.scalar(select(artifacts.c.id)) == duplicate_id
 
 
 def _seed_build(engine: Engine, *, ordinal: int) -> tuple[str, str]:
@@ -380,8 +427,8 @@ def _seed_build(engine: Engine, *, ordinal: int) -> tuple[str, str]:
                 id=file_id,
                 user_id=user_id,
                 original_name="requirements.txt",
-                size_bytes=13,
-                sha256="a" * 64,
+                size_bytes=len(MYSQL_REQUIREMENTS),
+                sha256=hashlib.sha256(MYSQL_REQUIREMENTS).hexdigest(),
                 original_object_key=f"requirements/{ordinal}/original.txt",
                 normalized_object_key=f"requirements/{ordinal}/normalized.txt",
                 parse_status="PARSED",

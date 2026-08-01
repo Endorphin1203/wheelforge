@@ -42,6 +42,8 @@ from .models import (
 
 
 _MAX_PROVIDER_RELEASES = 2000
+MAX_RESOLUTION_OBSERVATIONS = 2000
+MAX_RESOLUTION_REJECTIONS = 2000
 _MAX_VERSION_CHARS = 512
 _MAX_REQUIRES_PYTHON_CHARS = 1024
 _MAX_WHEELS_PER_RELEASE = 256
@@ -87,6 +89,31 @@ class _StopResolution(Exception):
         self.code = code
 
 
+class _BoundedRejections(list[CandidateRejection]):
+    def __init__(self) -> None:
+        super().__init__()
+        self.omitted = 0
+
+    def append(self, item: CandidateRejection) -> None:
+        if len(self) < MAX_RESOLUTION_REJECTIONS:
+            super().append(item)
+        else:
+            self.omitted += 1
+
+
+@dataclass(slots=True)
+class _ObservationBudget:
+    accepted: int = 0
+    truncated: bool = False
+
+    def reserve(self) -> bool:
+        if self.accepted >= MAX_RESOLUTION_OBSERVATIONS:
+            self.truncated = True
+            return False
+        self.accepted += 1
+        return True
+
+
 class CompatibleResolver:
     def __init__(
         self,
@@ -118,7 +145,8 @@ class CompatibleResolver:
 
         started = self._clock()
         attempts: list[ResolutionAttempt] = []
-        rejections: list[CandidateRejection] = []
+        rejections = _BoundedRejections()
+        observation_budget = _ObservationBudget()
         pins = _relaxable_pins(parsed)
         original_versions = tuple(pin.original for pin in pins)
 
@@ -142,13 +170,21 @@ class CompatibleResolver:
                         source,
                         attempts,
                         rejections,
+                        observation_budget,
                     )
 
             candidate_options: list[_CandidateOptions] = []
             for pin in pins:
                 self._guard(started, attempts, limits)
                 alternatives = self._discover_candidates(
-                    pin, profile, source_order, limits, started, attempts, rejections
+                    pin,
+                    profile,
+                    source_order,
+                    limits,
+                    started,
+                    attempts,
+                    rejections,
+                    observation_budget,
                 )
                 candidate_options.append(alternatives)
 
@@ -183,15 +219,24 @@ class CompatibleResolver:
                             source,
                             attempts,
                             rejections,
+                            observation_budget,
                             original=parsed,
                         )
         except _StopResolution as stopped:
             raise _resolution_failure(
-                stopped.code, parsed, attempts, rejections
+                stopped.code,
+                parsed,
+                attempts,
+                rejections,
+                observation_budget,
             ) from None
 
         raise _resolution_failure(
-            CompatibilityFailureCode.EXHAUSTED, parsed, attempts, rejections
+            CompatibilityFailureCode.EXHAUSTED,
+            parsed,
+            attempts,
+            rejections,
+            observation_budget,
         )
 
     def _guard(
@@ -267,7 +312,8 @@ class CompatibleResolver:
         limits: ResolveLimits,
         started: float,
         attempts: list[ResolutionAttempt],
-        rejections: list[CandidateRejection],
+        rejections: _BoundedRejections,
+        observation_budget: _ObservationBudget,
     ) -> _CandidateOptions:
         observations: list[_Observation] = []
         for source in sources:
@@ -275,7 +321,13 @@ class CompatibleResolver:
             try:
                 releases = self._candidate_provider.candidates(pin.package, source)
                 observations.extend(
-                    _bounded_observations(pin.package, source, releases, rejections)
+                    _bounded_observations(
+                        pin.package,
+                        source,
+                        releases,
+                        rejections,
+                        observation_budget,
+                    )
                 )
             except Exception as error:
                 rejections.append(
@@ -396,7 +448,8 @@ def _bounded_observations(
     package: str,
     source: PackageSource,
     releases: Iterable[CandidateMetadata],
-    rejections: list[CandidateRejection],
+    rejections: _BoundedRejections,
+    observation_budget: _ObservationBudget,
 ) -> list[_Observation]:
     observations: list[_Observation] = []
     try:
@@ -422,6 +475,8 @@ def _bounded_observations(
                 CandidateRejectionCode.MALFORMED_PROVIDER_DATA,
                 f"candidate release count exceeds limit {_MAX_PROVIDER_RELEASES}",
             )
+            break
+        if not observation_budget.reserve():
             break
         if not isinstance(metadata, CandidateMetadata):
             _reject(
@@ -676,7 +731,8 @@ def _successful_result(
     selected: ParsedRequirements,
     source: PackageSource,
     attempts: list[ResolutionAttempt],
-    rejections: list[CandidateRejection],
+    rejections: _BoundedRejections,
+    observation_budget: _ObservationBudget,
     *,
     original: ParsedRequirements | None = None,
 ) -> ResolutionResult:
@@ -687,6 +743,10 @@ def _successful_result(
         rejections=tuple(rejections),
         changes=_version_changes(baseline, result, source),
         source=source,
+        rejections_omitted=result.rejections_omitted + rejections.omitted,
+        observations_truncated=(
+            result.observations_truncated or observation_budget.truncated
+        ),
     )
 
 
@@ -738,7 +798,8 @@ def _resolution_failure(
     code: CompatibilityFailureCode,
     parsed: ParsedRequirements,
     attempts: list[ResolutionAttempt],
-    rejections: list[CandidateRejection],
+    rejections: _BoundedRejections,
+    observation_budget: _ObservationBudget,
 ) -> CompatibilityResolutionError:
     changes = tuple(
         VersionChange(
@@ -753,7 +814,12 @@ def _resolution_failure(
         for item in parsed.items
     )
     return CompatibilityResolutionError(
-        code, tuple(attempts), tuple(rejections), changes
+        code,
+        tuple(attempts),
+        tuple(rejections),
+        changes,
+        rejections.omitted,
+        observation_budget.truncated,
     )
 
 
