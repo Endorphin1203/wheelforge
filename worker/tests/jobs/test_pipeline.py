@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from itertools import count
@@ -48,7 +49,7 @@ from wheelforge_worker.jobs.repository import (
 )
 from wheelforge_worker.jobs.storage import RootedLocalStorage, WorkspaceManager
 from wheelforge_worker.target import TargetProfile
-from wheelforge_worker.validation import WheelArchiveValidationError
+from wheelforge_worker.validation import UnsafeWheelArchive, WheelArchiveValidationError
 
 
 NOW = datetime(2026, 8, 1, 8, 0, 0)
@@ -113,6 +114,7 @@ class RecordingStages:
         resolution: ResolutionResult,
         wheels: tuple[object, ...],
         target: object,
+        workspace: object,
     ) -> BuildValidation:
         self.calls.append("validate")
         return BuildValidation((), StaticValidationReport((), True))
@@ -138,6 +140,16 @@ class PathWorkspaceCapability:
     def external(self, relative: str | Path = Path(".")) -> object:
         path = self.path if Path(relative) == Path(".") else self.path / relative
         return SimpleNamespace(path=path, inherited_fds=())
+
+    def open_external_regular(self, path: Path) -> int:
+        supplied = path if path.is_absolute() else self.path / path
+        return os.open(supplied, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+
+    def duplicate_directory(self) -> int:
+        return os.open(
+            self.path,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+        )
 
 
 class RootReplacingStages(RecordingStages):
@@ -283,7 +295,7 @@ def test_default_validation_retains_valid_wheel_and_reports_missing_package(
     )
     monkeypatch.setattr(
         pipeline_module,
-        "validate_wheel_archive",
+        "validate_wheel_archive_descriptor",
         lambda *_args: SimpleNamespace(snapshot=None),
     )
 
@@ -291,6 +303,7 @@ def test_default_validation_retains_valid_wheel_and_reports_missing_package(
         ResolutionResult("1", (present, missing)),
         (wheel,),
         TargetProfile.model_validate(_target()),
+        cast(Any, PathWorkspaceCapability(tmp_path)),
     )
 
     assert len(result.wheels) == 1
@@ -301,6 +314,7 @@ def test_default_validation_retains_valid_wheel_and_reports_missing_package(
 
 
 def test_default_validation_cleans_prior_snapshots_when_later_wheel_fails(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     first = CleanupSnapshot(fail_cleanup=True)
@@ -316,13 +330,16 @@ def test_default_validation_cleans_prior_snapshots_when_later_wheel_fails(
             return SnapshotReport(second)
         raise WheelArchiveValidationError("third Wheel is invalid")
 
-    monkeypatch.setattr(pipeline_module, "validate_wheel_archive", validate_archive)
+    monkeypatch.setattr(
+        pipeline_module, "validate_wheel_archive_descriptor", validate_archive
+    )
+    paths = tuple(tmp_path / name for name in ("one.whl", "two.whl", "three.whl"))
+    for path in paths:
+        path.write_bytes(b"stub")
     wheels = cast(
         tuple[DownloadedWheel, ...],
         (
-            SimpleNamespace(path=Path("one.whl")),
-            SimpleNamespace(path=Path("two.whl")),
-            SimpleNamespace(path=Path("three.whl")),
+            *(SimpleNamespace(path=path) for path in paths),
         ),
     )
 
@@ -331,10 +348,74 @@ def test_default_validation_cleans_prior_snapshots_when_later_wheel_fails(
             ResolutionResult("1", ()),
             wheels,
             cast(TargetProfile, object()),
+            cast(Any, PathWorkspaceCapability(tmp_path)),
         )
 
     assert first.cleanup_calls == 1
     assert second.cleanup_calls == 1
+
+
+@pytest.mark.parametrize("boundary", ["download-work", "wheel-parent"])
+def test_default_validation_rejects_replaced_workspace_descendant_before_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    workspace_root = tmp_path / "workspaces"
+    workspace_root.mkdir(mode=0o700)
+    manager = WorkspaceManager(workspace_root)
+    owned = manager.allocate("50000000-0000-4000-8000-000000000061")
+    capability = owned.capability
+    package = _resolved_package("alpha", "1.0")
+    relative = Path("download-work/wheels-0000") / package.wheel_filename
+    content = b"owned Wheel observation"
+    capability.write_bytes(relative, content)
+    wheel = DownloadedWheel(
+        package=package.name,
+        version=package.version,
+        filename=package.wheel_filename,
+        path=relative,
+        source=PackageSource.PYPI,
+        byte_size=len(content),
+        sha256=hashlib.sha256(content).hexdigest(),
+        tags=frozenset({Tag("py3", "none", "any")}),
+    )
+    replaced = (
+        owned.path / "download-work"
+        if boundary == "download-work"
+        else owned.path / "download-work/wheels-0000"
+    )
+    retained = replaced.with_name(f"{replaced.name}-retained")
+    replaced.rename(retained)
+    outside = tmp_path / f"outside-{boundary}"
+    outside.mkdir()
+    outside_wheel = outside / package.wheel_filename
+    outside_wheel.write_bytes(b"outside Wheel must not be read")
+    replaced.symlink_to(outside, target_is_directory=True)
+    validator_calls: list[str] = []
+
+    def unexpected_validator(*_args: object) -> object:
+        validator_calls.append("called")
+        return SimpleNamespace(snapshot=None)
+
+    monkeypatch.setattr(
+        pipeline_module, "validate_wheel_archive_descriptor", unexpected_validator
+    )
+
+    try:
+        with pytest.raises(UnsafeWheelArchive, match="workspace"):
+            DefaultBuildStages().validate(
+                ResolutionResult("1", (package,)),
+                (wheel,),
+                TargetProfile.model_validate(_target()),
+                capability,
+            )
+        assert validator_calls == []
+        assert outside_wheel.read_bytes() == b"outside Wheel must not be read"
+        assert list(outside.glob(".wheelforge-validated-*")) == []
+    finally:
+        owned.cleanup()
+        manager.close()
 
 
 def _environment(
@@ -821,6 +902,7 @@ def test_partial_build_publishes_verified_successes_and_package_audit(
             resolution: ResolutionResult,
             wheels: tuple[DownloadedWheel, ...],
             target: TargetProfile,
+            workspace: object,
         ) -> BuildValidation:
             self.calls.append("validate")
             report = validate_closure(resolution, wheels, target)

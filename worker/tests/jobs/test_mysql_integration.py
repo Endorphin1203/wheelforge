@@ -92,6 +92,7 @@ class PackagingStages:
         resolution: ResolutionResult,
         wheels: tuple[object, ...],
         target: object,
+        workspace: object,
     ) -> BuildValidation:
         return BuildValidation((), StaticValidationReport((), True))
 

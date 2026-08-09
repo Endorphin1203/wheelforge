@@ -243,16 +243,33 @@ def test_descriptor_validation_accepts_exact_file_without_trusting_path_ancestor
     snapshots = tmp_path / "snapshots"
     snapshots.mkdir()
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    snapshots_descriptor = os.open(
+        snapshots, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    )
 
     try:
         report = validate_wheel_archive_descriptor(
-            descriptor, expected, ArchiveLimits(), snapshots
+            descriptor, expected, ArchiveLimits(), snapshots_descriptor
         )
         assert report.name == "demo"
         assert report.snapshot is not None
         os.fstat(descriptor)
+        os.close(snapshots_descriptor)
+        snapshots_descriptor = -1
+        retained = tmp_path / "retained-snapshots"
+        snapshots.rename(retained)
+        snapshots.mkdir()
+        replacement = snapshots / report.snapshot.path
+        replacement.parent.mkdir()
+        replacement.write_bytes(b"replacement snapshot")
+        with report.snapshot.open() as snapshot:
+            assert snapshot.read() == path.read_bytes()
         report.snapshot.cleanup()
+        assert not (retained / report.snapshot.path).exists()
+        assert replacement.read_bytes() == b"replacement snapshot"
     finally:
+        if snapshots_descriptor != -1:
+            os.close(snapshots_descriptor)
         os.close(descriptor)
 
 

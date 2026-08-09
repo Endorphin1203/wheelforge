@@ -16,6 +16,8 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 class LocalFileStorageTest {
   @TempDir Path tempDir;
@@ -258,7 +260,7 @@ class LocalFileStorageTest {
   }
 
   @Test
-  void defaultProviderCompletesPutOpenAndDelete() throws Exception {
+  void defaultProviderCompletesPutAndOpen() throws Exception {
     Path root = Files.createDirectory(tempDir.resolve("default-provider-root"));
     String key = "users/user-id/requirements/file-id/original.txt";
     byte[] content = "requests==2.32.4\n".getBytes(UTF_8);
@@ -268,8 +270,7 @@ class LocalFileStorageTest {
 
       assertThat(storage.open(key).readAllBytes()).isEqualTo(content);
 
-      storage.deleteIfExists(key);
-      assertThat(root.resolve(key)).doesNotExist();
+      assertThat(root.resolve(key)).hasBinaryContent(content);
     }
   }
 
@@ -283,8 +284,10 @@ class LocalFileStorageTest {
       storage.putAtomically(key, new ByteArrayInputStream(content), content.length);
       assertThat(storage.open(key).readAllBytes()).isEqualTo(content);
 
-      storage.deleteIfExists(key);
-      assertThat(root.resolve(key)).doesNotExist();
+      assertThatThrownBy(() -> storage.deleteIfExists(key))
+          .isInstanceOf(LocalFileStorage.StorageException.class)
+          .hasMessageContaining("safe deletion");
+      assertThat(root.resolve(key)).hasBinaryContent(content);
     }
   }
 
@@ -299,10 +302,13 @@ class LocalFileStorageTest {
     try (var storage = ordinaryStorage(root)) {
       storage.putAtomically(key, new ByteArrayInputStream(new byte[] {1}), 1);
 
-      storage.deleteIfExists(key);
+      assertThatThrownBy(() -> storage.deleteIfExists(key))
+          .isInstanceOf(LocalFileStorage.StorageException.class)
+          .hasMessageContaining("safe deletion");
 
-      assertThat(root.resolve("artifacts").resolve(task).resolve(execution)).doesNotExist();
-      assertThat(root.resolve("artifacts").resolve(task)).doesNotExist();
+      assertThat(root.resolve(key)).hasBinaryContent(new byte[] {1});
+      assertThat(root.resolve("artifacts").resolve(task).resolve(execution)).isDirectory();
+      assertThat(root.resolve("artifacts").resolve(task)).isDirectory();
       assertThat(root.resolve("artifacts")).isDirectory();
     }
   }
@@ -324,11 +330,14 @@ class LocalFileStorageTest {
       var publication = executor.submit(() -> storage.putAtomically(sibling, stream, 1));
       assertThat(stream.readStarted.await(5, TimeUnit.SECONDS)).isTrue();
 
-      storage.deleteIfExists(first);
+      assertThatThrownBy(() -> storage.deleteIfExists(first))
+          .isInstanceOf(LocalFileStorage.StorageException.class)
+          .hasMessageContaining("safe deletion");
       assertThat(root.resolve("artifacts").resolve(task).resolve(execution)).isDirectory();
 
       stream.continueRead.countDown();
       assertThat(publication.get(5, TimeUnit.SECONDS).key()).isEqualTo(sibling);
+      assertThat(storage.open(first).readAllBytes()).containsExactly(1);
       assertThat(storage.open(sibling).readAllBytes()).containsExactly(2);
       assertThat(root.resolve("artifacts").resolve(task).resolve(execution)).isDirectory();
       assertThat(root.resolve("artifacts").resolve(task)).isDirectory();
@@ -348,11 +357,64 @@ class LocalFileStorageTest {
 
     try (var storage = ordinaryStorage(root)) {
       storage.putAtomically(key, new ByteArrayInputStream(new byte[] {1}), 1);
-      storage.deleteIfExists(key);
+      assertThatThrownBy(() -> storage.deleteIfExists(key))
+          .isInstanceOf(LocalFileStorage.StorageException.class)
+          .hasMessageContaining("safe deletion");
 
+      assertThat(root.resolve(key)).hasBinaryContent(new byte[] {1});
       assertThat(root.resolve("artifacts/not-a-task/10000000-0000-4000-8000-000000000034"))
           .isDirectory();
       assertThat(root.resolve("artifacts/not-a-task")).isDirectory();
+    }
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {"leaf", "execution", "task", "artifacts"})
+  void portableDeleteFailsClosedAfterDeterministicPathReplacement(String boundary)
+      throws Exception {
+    Path root = Files.createDirectory(tempDir.resolve("portable-race-" + boundary));
+    String task = "20000000-0000-4000-8000-000000000041";
+    String execution = "10000000-0000-4000-8000-000000000041";
+    String artifact = "30000000-0000-4000-8000-000000000041.zip";
+    String key = "artifacts/" + task + "/" + execution + "/" + artifact;
+    Path object = root.resolve(key);
+
+    try (var storage = ordinaryStorage(root)) {
+      storage.putAtomically(key, new ByteArrayInputStream("owned".getBytes(UTF_8)), 5);
+      Path retainedObject;
+      Path replacementObject;
+      if (boundary.equals("leaf")) {
+        retainedObject = root.resolve("retained-leaf.zip");
+        Files.move(object, retainedObject);
+        replacementObject = Files.writeString(object, "replacement");
+      } else if (boundary.equals("execution")) {
+        Path retained = root.resolve("retained-execution");
+        Files.move(object.getParent(), retained);
+        retainedObject = retained.resolve(artifact);
+        Files.createDirectories(object.getParent());
+        replacementObject = Files.writeString(object, "replacement");
+      } else if (boundary.equals("task")) {
+        Path retained = root.resolve("retained-task");
+        Files.move(object.getParent().getParent(), retained);
+        retainedObject = retained.resolve(execution).resolve(artifact);
+        Files.createDirectories(object.getParent());
+        replacementObject = Files.writeString(object, "replacement");
+      } else {
+        Path retained = root.resolve("retained-artifacts");
+        Files.move(root.resolve("artifacts"), retained);
+        retainedObject = retained.resolve(task).resolve(execution).resolve(artifact);
+        Path outside = Files.createDirectory(tempDir.resolve("portable-outside-artifacts"));
+        replacementObject = outside.resolve(task).resolve(execution).resolve(artifact);
+        Files.createDirectories(replacementObject.getParent());
+        Files.writeString(replacementObject, "outside-replacement");
+        Files.createSymbolicLink(root.resolve("artifacts"), outside);
+      }
+
+      assertThatThrownBy(() -> storage.deleteIfExists(key))
+          .isInstanceOf(LocalFileStorage.StorageException.class)
+          .hasMessageContaining("safe deletion");
+      assertThat(retainedObject).hasContent("owned");
+      assertThat(replacementObject).exists();
     }
   }
 
@@ -395,7 +457,8 @@ class LocalFileStorageTest {
     try (var storage = ordinaryStorage(root)) {
       assertThatThrownBy(() -> storage.open(key)).isInstanceOf(IllegalArgumentException.class);
       assertThatThrownBy(() -> storage.deleteIfExists(key))
-          .isInstanceOf(IllegalArgumentException.class);
+          .isInstanceOf(LocalFileStorage.StorageException.class)
+          .hasMessageContaining("safe deletion");
       assertThatThrownBy(
               () ->
                   storage.putAtomically(

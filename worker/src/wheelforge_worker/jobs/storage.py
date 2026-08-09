@@ -116,6 +116,29 @@ class WorkspaceCapability:
         finally:
             os.close(parent)
 
+    def open_external_regular(self, path: Path) -> int:
+        supplied = Path(path)
+        if supplied.is_absolute():
+            descriptor = self._require_descriptor()
+            parts = supplied.parts
+            prefix = (supplied.anchor, "proc", "self", "fd", str(descriptor))
+            if (
+                not sys.platform.startswith("linux")
+                or len(parts) <= len(prefix)
+                or parts[: len(prefix)] != prefix
+            ):
+                raise OSError("workspace path is not bound to the owned descriptor")
+            relative = Path(*parts[len(prefix) :])
+        else:
+            relative = supplied
+        try:
+            return self.open_regular(relative)
+        except (InvalidObjectKey, OSError, RuntimeError) as error:
+            raise OSError("workspace descendant cannot be opened safely") from error
+
+    def duplicate_directory(self) -> int:
+        return os.dup(self._require_descriptor())
+
     def external(self, relative: str | Path = Path(".")) -> ExternalWorkspace:
         descriptor = self._require_descriptor()
         require_external_workspace_support()
@@ -173,6 +196,12 @@ class _ParentBinding:
         if self.descriptor is not None:
             os.close(self.descriptor)
             self.descriptor = None
+
+
+@dataclass(slots=True)
+class _QuarantineBinding:
+    name: str
+    descriptor: int
 
 
 class RootedLocalStorage:
@@ -341,9 +370,31 @@ class RootedLocalStorage:
                 _require_named_identity(parent, parts[-1], identity)
                 if digest != expected_sha256:
                     return False
-                _unlink_named(parent, parts[-1])
-                _fsync_parent(parent)
-                deleted = True
+                quarantine = _quarantine_named(
+                    parent, parts[-1], self._uuid_factory
+                )
+                if quarantine is None:
+                    return False
+                try:
+                    isolated = os.stat(
+                        parts[-1],
+                        dir_fd=quarantine.descriptor,
+                        follow_symlinks=False,
+                    )
+                    if stat.S_ISREG(isolated.st_mode) and _identity(isolated) == identity:
+                        os.unlink(parts[-1], dir_fd=quarantine.descriptor)
+                        _fsync_descriptor(quarantine.descriptor)
+                        deleted = True
+                    else:
+                        _restore_quarantined_no_replace(
+                            parent, quarantine, parts[-1]
+                        )
+                finally:
+                    os.close(quarantine.descriptor)
+                if deleted or not _quarantine_contains(
+                    parent, quarantine.name, parts[-1]
+                ):
+                    _remove_quarantine_directory(parent, quarantine.name)
             finally:
                 os.close(descriptor)
         finally:
@@ -742,7 +793,15 @@ def _require_supported_host() -> None:
         raise RuntimeError(
             "Windows Worker hosts are not supported; Windows remains a target platform"
         )
-    required = (os.open, os.stat, os.mkdir, os.unlink, os.rmdir, os.link)
+    required = (
+        os.open,
+        os.stat,
+        os.mkdir,
+        os.unlink,
+        os.rmdir,
+        os.link,
+        os.rename,
+    )
     if any(operation not in os.supports_dir_fd for operation in required):
         raise RuntimeError("safe descriptor-relative filesystem operations are unavailable")
 
@@ -850,6 +909,105 @@ def _unlink_named(parent: _ParentBinding, name: str) -> None:
         os.unlink(name, dir_fd=parent.descriptor)
     else:
         os.unlink(parent.path / name)
+
+
+def _quarantine_named(
+    parent: _ParentBinding,
+    object_name: str,
+    uuid_factory: Callable[[], UUID],
+) -> _QuarantineBinding | None:
+    if parent.descriptor is None:
+        raise RuntimeError("safe parent directory handle is unavailable")
+    for _attempt in range(128):
+        quarantine_name = f".wf-quarantine-{uuid_factory()}"
+        try:
+            os.mkdir(quarantine_name, 0o700, dir_fd=parent.descriptor)
+        except FileExistsError:
+            continue
+        quarantine_descriptor = -1
+        try:
+            quarantine_descriptor = os.open(
+                quarantine_name,
+                os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent.descriptor,
+            )
+            try:
+                os.rename(
+                    object_name,
+                    object_name,
+                    src_dir_fd=parent.descriptor,
+                    dst_dir_fd=quarantine_descriptor,
+                )
+            except FileNotFoundError:
+                os.close(quarantine_descriptor)
+                quarantine_descriptor = -1
+                os.rmdir(quarantine_name, dir_fd=parent.descriptor)
+                _fsync_parent(parent)
+                return None
+            _fsync_parent(parent)
+            _fsync_descriptor(quarantine_descriptor)
+            return _QuarantineBinding(quarantine_name, quarantine_descriptor)
+        except BaseException:
+            if quarantine_descriptor != -1:
+                os.close(quarantine_descriptor)
+            _best_effort(os.rmdir, quarantine_name, dir_fd=parent.descriptor)
+            raise
+    raise RuntimeError("could not allocate a unique compensation quarantine")
+
+
+def _restore_quarantined_no_replace(
+    parent: _ParentBinding,
+    quarantine: _QuarantineBinding,
+    object_name: str,
+) -> None:
+    if parent.descriptor is None:
+        raise RuntimeError("safe parent directory handle is unavailable")
+    try:
+        os.link(
+            object_name,
+            object_name,
+            src_dir_fd=quarantine.descriptor,
+            dst_dir_fd=parent.descriptor,
+            follow_symlinks=False,
+        )
+    except FileExistsError as error:
+        raise OSError(
+            "compensation ownership changed and quarantine could not be restored"
+        ) from error
+    os.unlink(object_name, dir_fd=quarantine.descriptor)
+    _fsync_descriptor(quarantine.descriptor)
+    _fsync_parent(parent)
+
+
+def _quarantine_contains(
+    parent: _ParentBinding, quarantine_name: str, object_name: str
+) -> bool:
+    if parent.descriptor is None:
+        raise RuntimeError("safe parent directory handle is unavailable")
+    quarantine_descriptor = os.open(
+        quarantine_name,
+        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=parent.descriptor,
+    )
+    try:
+        try:
+            os.stat(
+                object_name,
+                dir_fd=quarantine_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return False
+        return True
+    finally:
+        os.close(quarantine_descriptor)
+
+
+def _remove_quarantine_directory(parent: _ParentBinding, name: str) -> None:
+    if parent.descriptor is None:
+        raise RuntimeError("safe parent directory handle is unavailable")
+    os.rmdir(name, dir_fd=parent.descriptor)
+    _fsync_parent(parent)
 
 
 def _fsync_parent(parent: _ParentBinding) -> None:

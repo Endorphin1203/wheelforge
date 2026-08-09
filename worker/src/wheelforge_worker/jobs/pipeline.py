@@ -3,8 +3,6 @@ from __future__ import annotations
 import json
 import hashlib
 import os
-import stat
-import sys
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterable
@@ -65,7 +63,6 @@ from wheelforge_worker.validation import (
     UnsafeWheelArchive,
     WheelArchiveValidationError,
     validate_closure,
-    validate_wheel_archive,
     validate_wheel_archive_descriptor,
 )
 
@@ -150,6 +147,7 @@ class BuildStages(Protocol):
         resolution: ResolutionResult,
         wheels: tuple[DownloadedWheel, ...],
         target: TargetProfile,
+        workspace: WorkspaceCapability,
     ) -> BuildValidation: ...
 
     def package(
@@ -305,25 +303,36 @@ class DefaultBuildStages:
         resolution: ResolutionResult,
         wheels: tuple[DownloadedWheel, ...],
         target: TargetProfile,
+        workspace: WorkspaceCapability,
     ) -> BuildValidation:
         validated: list[ValidatedWheel] = []
         try:
             for wheel in wheels:
-                descriptor = _open_fd_bound_wheel(wheel.path)
+                descriptor = -1
+                snapshot_parent = -1
                 try:
-                    report = (
-                        validate_wheel_archive(wheel.path, wheel, ArchiveLimits())
-                        if descriptor is None
-                        else validate_wheel_archive_descriptor(
-                            descriptor,
-                            wheel,
-                            ArchiveLimits(),
-                            wheel.path.parent,
-                        )
+                    descriptor = workspace.open_external_regular(wheel.path)
+                    snapshot_parent = workspace.duplicate_directory()
+                except (OSError, RuntimeError) as error:
+                    if descriptor != -1:
+                        os.close(descriptor)
+                    if snapshot_parent != -1:
+                        os.close(snapshot_parent)
+                    raise UnsafeWheelArchive(
+                        "workspace Wheel descendant cannot be opened safely"
+                    ) from error
+                try:
+                    report = validate_wheel_archive_descriptor(
+                        descriptor,
+                        wheel,
+                        ArchiveLimits(),
+                        snapshot_parent,
                     )
                 finally:
-                    if descriptor is not None:
+                    if descriptor != -1:
                         os.close(descriptor)
+                    if snapshot_parent != -1:
+                        os.close(snapshot_parent)
                 validated.append(
                     ValidatedWheel(
                         wheel,
@@ -352,36 +361,6 @@ class DefaultBuildStages:
         external = workspace.external("artifact")
         built = ArtifactBuilder().build(context, external.path)
         return replace(built, path=Path("artifact") / built.path.name)
-
-
-def _open_fd_bound_wheel(path: Path) -> int | None:
-    absolute = Path(path).absolute()
-    parts = absolute.parts
-    prefix = (absolute.anchor, "proc", "self", "fd")
-    if len(parts) < 6 or parts[:4] != prefix:
-        return None
-    if not sys.platform.startswith("linux"):
-        raise UnsafeWheelArchive("fd-bound Wheel paths require a Linux Worker host")
-    try:
-        workspace_descriptor = int(parts[4])
-        opened_workspace = os.fstat(workspace_descriptor)
-        proc_workspace = Path(*parts[:5]).stat()
-    except (OSError, ValueError) as error:
-        raise UnsafeWheelArchive("fd-bound Wheel workspace is unavailable") from error
-    if (
-        workspace_descriptor < 0
-        or not stat.S_ISDIR(opened_workspace.st_mode)
-        or (opened_workspace.st_dev, opened_workspace.st_ino)
-        != (proc_workspace.st_dev, proc_workspace.st_ino)
-    ):
-        raise UnsafeWheelArchive("fd-bound Wheel workspace identity changed")
-    try:
-        return os.open(
-            absolute, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        )
-    except OSError as error:
-        raise UnsafeWheelArchive("fd-bound Wheel cannot be opened safely") from error
-
 
 class JobPipeline:
     def __init__(
@@ -577,7 +556,12 @@ class JobPipeline:
             )
             validation = self._during_lease(
                 lease,
-                lambda: self._stages.validate(resolution, downloaded, target),
+                lambda: self._stages.validate(
+                    resolution,
+                    downloaded,
+                    target,
+                    owned_workspace.capability,
+                ),
             )
             validation = BuildValidation(
                 validation.wheels,

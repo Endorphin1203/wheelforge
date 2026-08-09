@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import csv
+import errno
 import hashlib
 import io
 import math
@@ -20,6 +21,7 @@ from email.message import Message
 from email.parser import BytesParser
 from pathlib import Path
 from typing import BinaryIO, IO
+from uuid import uuid4
 
 from packaging.tags import Tag, parse_tag
 from packaging.utils import InvalidWheelFilename, canonicalize_name, parse_wheel_filename
@@ -64,6 +66,74 @@ class ArchiveMetadataError(WheelArchiveValidationError):
 
 class WheelRecordMismatch(WheelArchiveValidationError):
     """The Wheel RECORD does not account for its archive files faithfully."""
+
+
+@dataclass(slots=True)
+class _DescriptorSnapshotBinding:
+    parent_descriptor: int | None
+    directory_descriptor: int | None
+    directory_name: str
+    filename: str
+
+    def open_regular(self) -> int:
+        if self.directory_descriptor is None:
+            raise UnsafeWheelArchive("validated Wheel snapshot is unavailable")
+        try:
+            return os.open(
+                self.filename,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=self.directory_descriptor,
+            )
+        except OSError as error:
+            raise UnsafeWheelArchive(
+                "validated Wheel snapshot cannot be opened"
+            ) from error
+
+    def cleanup(self, expected_identity: tuple[int, int]) -> None:
+        if self.directory_descriptor is None or self.parent_descriptor is None:
+            return
+        try:
+            current = os.stat(
+                self.filename,
+                dir_fd=self.directory_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            current = None
+        except OSError as error:
+            raise UnsafeWheelArchive(
+                "validated Wheel snapshot cannot be inspected"
+            ) from error
+        if current is not None:
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or stat.S_ISLNK(current.st_mode)
+                or (current.st_dev, current.st_ino) != expected_identity
+            ):
+                raise UnsafeWheelArchive("validated Wheel snapshot identity changed")
+            try:
+                os.unlink(self.filename, dir_fd=self.directory_descriptor)
+                _fsync_directory(self.directory_descriptor)
+            except OSError as error:
+                raise UnsafeWheelArchive(
+                    "validated Wheel snapshot cannot be removed"
+                ) from error
+        directory_descriptor = self.directory_descriptor
+        self.directory_descriptor = None
+        os.close(directory_descriptor)
+        try:
+            os.rmdir(self.directory_name, dir_fd=self.parent_descriptor)
+            _fsync_directory(self.parent_descriptor)
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise UnsafeWheelArchive(
+                "validated Wheel snapshot directory cannot be removed"
+            ) from error
+        finally:
+            parent_descriptor = self.parent_descriptor
+            self.parent_descriptor = None
+            os.close(parent_descriptor)
 
 
 def _close_snapshot_revalidation_resource(
@@ -126,28 +196,36 @@ class ValidatedWheelSnapshot:
     _directory: Path = field(repr=False)
     _device: int = field(repr=False)
     _inode: int = field(repr=False)
+    _binding: _DescriptorSnapshotBinding | None = field(
+        default=None, repr=False, compare=False
+    )
 
     def open(self) -> BinaryIO:
         """Open the same private snapshot after rechecking identity and digest."""
-        try:
-            before = self.path.lstat()
-        except OSError as error:
-            raise UnsafeWheelArchive("validated Wheel snapshot is unavailable") from error
-        if (
-            not stat.S_ISREG(before.st_mode)
-            or stat.S_ISLNK(before.st_mode)
-            or getattr(before, "st_nlink", 1) != 1
-            or (before.st_dev, before.st_ino) != (self._device, self._inode)
-            or before.st_size != self.byte_size
-        ):
-            raise UnsafeWheelArchive("validated Wheel snapshot identity changed")
-        flags = os.O_RDONLY
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        try:
-            descriptor = os.open(self.path, flags)
-        except OSError as error:
-            raise UnsafeWheelArchive("validated Wheel snapshot cannot be opened") from error
+        if self._binding is None:
+            try:
+                before = self.path.lstat()
+            except OSError as error:
+                raise UnsafeWheelArchive(
+                    "validated Wheel snapshot is unavailable"
+                ) from error
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or stat.S_ISLNK(before.st_mode)
+                or getattr(before, "st_nlink", 1) != 1
+                or (before.st_dev, before.st_ino) != (self._device, self._inode)
+                or before.st_size != self.byte_size
+            ):
+                raise UnsafeWheelArchive("validated Wheel snapshot identity changed")
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                descriptor = os.open(self.path, flags)
+            except OSError as error:
+                raise UnsafeWheelArchive(
+                    "validated Wheel snapshot cannot be opened"
+                ) from error
+        else:
+            descriptor = self._binding.open_regular()
         handle: BinaryIO | None = None
         try:
             opened = os.fstat(descriptor)
@@ -177,6 +255,9 @@ class ValidatedWheelSnapshot:
 
     def cleanup(self) -> None:
         """Delete this snapshot only while its recorded identity is still present."""
+        if self._binding is not None:
+            self._binding.cleanup((self._device, self._inode))
+            return
         try:
             current = self.path.lstat()
         except FileNotFoundError:
@@ -371,7 +452,7 @@ def validate_wheel_archive_descriptor(
     descriptor: int,
     expected: DownloadedWheel,
     limits: ArchiveLimits,
-    snapshot_parent: Path,
+    snapshot_parent_descriptor: int,
 ) -> ArchiveValidationReport:
     """Validate an exact open Wheel supplied by a trusted directory capability."""
     if type(descriptor) is not int or descriptor < 0:
@@ -384,19 +465,26 @@ def validate_wheel_archive_descriptor(
         raise UnsafeWheelArchive("downloaded Wheel filename differs from observation")
     if not _valid_sha256(expected.sha256):
         raise UnsafeWheelArchive("downloaded Wheel SHA-256 observation is invalid")
-    parent = Path(snapshot_parent)
+    if type(snapshot_parent_descriptor) is not int or snapshot_parent_descriptor < 0:
+        raise ValueError("snapshot parent descriptor must be open")
     try:
-        parent_status = parent.lstat()
+        parent_status = os.fstat(snapshot_parent_descriptor)
     except OSError as error:
-        raise UnsafeWheelArchive("snapshot parent is unavailable") from error
-    if not stat.S_ISDIR(parent_status.st_mode) or stat.S_ISLNK(parent_status.st_mode):
-        raise UnsafeWheelArchive("snapshot parent must be a real directory")
+        raise UnsafeWheelArchive("snapshot parent descriptor is unavailable") from error
+    if not stat.S_ISDIR(parent_status.st_mode):
+        raise UnsafeWheelArchive("snapshot parent descriptor must be a directory")
+    owned_descriptor = -1
     try:
         owned_descriptor = os.dup(descriptor)
+        owned_parent_descriptor = os.dup(snapshot_parent_descriptor)
     except OSError as error:
+        if owned_descriptor != -1:
+            os.close(owned_descriptor)
         raise UnsafeWheelArchive("downloaded Wheel descriptor is unavailable") from error
-    snapshot = _create_verified_snapshot_from_descriptor(
-        owned_descriptor, parent, expected, expected_identity=None
+    snapshot = _create_bound_snapshot_from_descriptors(
+        owned_descriptor,
+        owned_parent_descriptor,
+        expected,
     )
     return _validate_snapshot(snapshot, expected, limits)
 
@@ -493,6 +581,120 @@ def _create_verified_snapshot(
         expected,
         expected_identity=(before.st_dev, before.st_ino),
     )
+
+
+def _create_bound_snapshot_from_descriptors(
+    source_descriptor: int,
+    parent_descriptor: int,
+    expected: DownloadedWheel,
+) -> ValidatedWheelSnapshot:
+    directory_name: str | None = None
+    directory_descriptor = -1
+    snapshot_descriptor = -1
+    try:
+        opened = os.fstat(source_descriptor)
+        if not stat.S_ISREG(opened.st_mode) or getattr(opened, "st_nlink", 1) != 1:
+            raise UnsafeWheelArchive("downloaded Wheel identity changed before validation")
+        if opened.st_size != expected.byte_size:
+            raise UnsafeWheelArchive("downloaded Wheel byte size differs from observation")
+        if os.lseek(source_descriptor, 0, os.SEEK_CUR) != 0:
+            raise UnsafeWheelArchive("downloaded Wheel descriptor must start at offset zero")
+        for _attempt in range(128):
+            candidate = f".wheelforge-validated-{uuid4()}"
+            try:
+                os.mkdir(candidate, 0o700, dir_fd=parent_descriptor)
+            except FileExistsError:
+                continue
+            directory_name = candidate
+            break
+        if directory_name is None:
+            raise UnsafeWheelArchive("validated Wheel snapshot directory is unavailable")
+        directory_descriptor = os.open(
+            directory_name,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_descriptor,
+        )
+        snapshot_descriptor = os.open(
+            expected.filename,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=directory_descriptor,
+        )
+        digest = hashlib.sha256()
+        byte_size = 0
+        source = os.fdopen(source_descriptor, "rb", closefd=True)
+        source_descriptor = -1
+        with source:
+            destination = os.fdopen(snapshot_descriptor, "wb", closefd=True)
+            snapshot_descriptor = -1
+            with destination:
+                while block := source.read(_COPY_CHUNK_BYTES):
+                    byte_size += len(block)
+                    if byte_size > expected.byte_size:
+                        raise UnsafeWheelArchive(
+                            "downloaded Wheel grew while being snapshotted"
+                        )
+                    digest.update(block)
+                    destination.write(block)
+                destination.flush()
+                os.fsync(destination.fileno())
+                os.fchmod(destination.fileno(), 0o400)
+                snapshot_status = os.fstat(destination.fileno())
+        if byte_size != expected.byte_size or digest.hexdigest() != expected.sha256.lower():
+            raise UnsafeWheelArchive(
+                "downloaded Wheel content changed while being snapshotted"
+            )
+        _fsync_directory(directory_descriptor)
+        binding = _DescriptorSnapshotBinding(
+            parent_descriptor,
+            directory_descriptor,
+            directory_name,
+            expected.filename,
+        )
+        parent_descriptor = -1
+        directory_descriptor = -1
+        return ValidatedWheelSnapshot(
+            path=Path(directory_name) / expected.filename,
+            byte_size=byte_size,
+            sha256=digest.hexdigest(),
+            _directory=Path(directory_name),
+            _device=snapshot_status.st_dev,
+            _inode=snapshot_status.st_ino,
+            _binding=binding,
+        )
+    except WheelArchiveValidationError:
+        raise
+    except Exception as error:
+        raise UnsafeWheelArchive("downloaded Wheel snapshot failed") from error
+    finally:
+        if source_descriptor != -1:
+            os.close(source_descriptor)
+        if snapshot_descriptor != -1:
+            os.close(snapshot_descriptor)
+        if directory_descriptor != -1:
+            try:
+                os.unlink(expected.filename, dir_fd=directory_descriptor)
+            except OSError:
+                pass
+            os.close(directory_descriptor)
+        if parent_descriptor != -1:
+            if directory_name is not None:
+                try:
+                    os.rmdir(directory_name, dir_fd=parent_descriptor)
+                except OSError:
+                    pass
+            os.close(parent_descriptor)
+
+
+def _fsync_directory(descriptor: int) -> None:
+    try:
+        os.fsync(descriptor)
+    except OSError as error:
+        if error.errno not in {errno.EINVAL, getattr(errno, "ENOTSUP", errno.EINVAL)}:
+            raise
 
 
 def _create_verified_snapshot_from_descriptor(

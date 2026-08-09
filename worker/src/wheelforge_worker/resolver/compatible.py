@@ -44,6 +44,7 @@ from .models import (
 _MAX_PROVIDER_RELEASES = 2000
 MAX_RESOLUTION_OBSERVATIONS = 2000
 MAX_RESOLUTION_REJECTIONS = 2000
+MAX_RESOLUTION_COMBINATIONS = 10_000
 _MAX_VERSION_CHARS = 512
 _MAX_REQUIRES_PYTHON_CHARS = 1024
 _MAX_WHEELS_PER_RELEASE = 256
@@ -119,6 +120,18 @@ class _ObservationBudget:
         return True
 
 
+@dataclass(slots=True)
+class _CombinationBudget:
+    limit: int
+    visited: int = 0
+
+    def reserve(self) -> bool:
+        if self.visited >= self.limit:
+            return False
+        self.visited += 1
+        return True
+
+
 class CompatibleResolver:
     def __init__(
         self,
@@ -127,6 +140,7 @@ class CompatibleResolver:
         *,
         clock: _Clock = time.monotonic,
         max_observations: int = MAX_RESOLUTION_OBSERVATIONS,
+        max_combinations: int = MAX_RESOLUTION_COMBINATIONS,
     ) -> None:
         if not callable(clock):
             raise ValueError("clock must be callable")
@@ -139,6 +153,12 @@ class CompatibleResolver:
         ):
             raise ValueError("observation limit is out of bounds")
         self._max_observations = max_observations
+        if (
+            type(max_combinations) is not int
+            or not 1 <= max_combinations <= MAX_RESOLUTION_COMBINATIONS
+        ):
+            raise ValueError("combination limit is out of bounds")
+        self._max_combinations = max_combinations
 
     def resolve(
         self,
@@ -159,6 +179,7 @@ class CompatibleResolver:
         attempts: list[ResolutionAttempt] = []
         rejections = _BoundedRejections()
         observation_budget = _ObservationBudget(self._max_observations)
+        combination_budget = _CombinationBudget(self._max_combinations)
         pins = _relaxable_pins(parsed)
         original_versions = tuple(pin.original for pin in pins)
 
@@ -202,43 +223,29 @@ class CompatibleResolver:
                     observation_budget,
                 )
                 candidate_options.append(alternatives)
-                if discovery_incomplete or observation_budget.remaining == 0:
-                    result = self._attempt_discovered_candidates(
-                        parsed,
-                        profile,
-                        source_order,
-                        pins,
-                        candidate_options,
-                        attempts,
-                        started,
-                        limits,
-                        rejections,
-                        observation_budget,
-                        attempted_candidates,
-                    )
-                    if result is not None:
-                        return result
-                    if discovery_incomplete or pin_index < len(pins) - 1:
-                        observation_budget.truncated = True
-                        raise _StopResolution(
-                            CompatibilityFailureCode.RESOURCE_LIMIT
-                        )
-
-            result = self._attempt_discovered_candidates(
-                parsed,
-                profile,
-                source_order,
-                pins,
-                candidate_options,
-                attempts,
-                started,
-                limits,
-                rejections,
-                observation_budget,
-                attempted_candidates,
-            )
-            if result is not None:
-                return result
+                result = self._attempt_candidate_frontier(
+                    parsed,
+                    profile,
+                    source_order,
+                    pins,
+                    candidate_options,
+                    pin_index,
+                    attempts,
+                    started,
+                    limits,
+                    rejections,
+                    observation_budget,
+                    combination_budget,
+                    attempted_candidates,
+                )
+                if result is not None:
+                    return result
+                if discovery_incomplete or (
+                    observation_budget.remaining == 0
+                    and pin_index < len(pins) - 1
+                ):
+                    observation_budget.truncated = True
+                    raise _StopResolution(CompatibilityFailureCode.RESOURCE_LIMIT)
         except _StopResolution as stopped:
             raise _resolution_failure(
                 stopped.code,
@@ -258,18 +265,20 @@ class CompatibleResolver:
             observation_budget,
         )
 
-    def _attempt_discovered_candidates(
+    def _attempt_candidate_frontier(
         self,
         parsed: ParsedRequirements,
         profile: TargetProfile,
         source_order: tuple[PackageSource, ...],
         pins: tuple[_RelaxablePin, ...],
         discovered: list[_CandidateOptions],
+        frontier_index: int,
         attempts: list[ResolutionAttempt],
         started: float,
         limits: ResolveLimits,
         rejections: _BoundedRejections,
         observation_budget: _ObservationBudget,
+        combination_budget: _CombinationBudget,
         attempted: set[tuple[tuple[Version, ...], PackageSource]],
     ) -> ResolutionResult | None:
         options = [
@@ -279,43 +288,60 @@ class CompatibleResolver:
                 for _unused in range(len(pins) - len(discovered))
             ),
         ]
-        original_versions = tuple(pin.original for pin in pins)
-        version_options = [
+        prefix_options = [
             (pin.original, *candidate_options.versions)
-            for pin, candidate_options in zip(pins, options, strict=True)
+            for pin, candidate_options in zip(
+                pins[:frontier_index], options[:frontier_index], strict=True
+            )
         ]
-        for versions in product(*version_options):
-            if versions == original_versions:
-                continue
-            candidate_parsed = _rebuild_requirements(parsed, pins, versions)
-            selections = _selections(pins, versions)
-            for source in source_order:
-                key = (versions, source)
-                if key in attempted or not _source_supports_substitutions(
-                    source, pins, versions, options
-                ):
-                    continue
-                attempted.add(key)
+        prefixes = product(*prefix_options) if prefix_options else ((),)
+        current_options = options[frontier_index].versions
+        trailing_originals = tuple(
+            pin.original for pin in pins[frontier_index + 1 :]
+        )
+        for prefix in prefixes:
+            for current in current_options:
+                versions = (*prefix, current, *trailing_originals)
                 self._guard(started, attempts, limits)
-                result = self._attempt(
-                    candidate_parsed,
-                    profile,
-                    source,
-                    selections,
-                    attempts,
-                    started,
-                    limits,
-                )
-                if result is not None:
-                    return _successful_result(
-                        result,
+                if not combination_budget.reserve():
+                    raise _StopResolution(CompatibilityFailureCode.RESOURCE_LIMIT)
+                viable_sources: list[PackageSource] = []
+                for source in source_order:
+                    self._guard(started, attempts, limits)
+                    key = (versions, source)
+                    if key in attempted:
+                        continue
+                    if _source_supports_substitutions(
+                        source, pins, versions, options
+                    ):
+                        viable_sources.append(source)
+                if not viable_sources:
+                    continue
+                candidate_parsed = _rebuild_requirements(parsed, pins, versions)
+                selections = _selections(pins, versions)
+                for source in viable_sources:
+                    key = (versions, source)
+                    attempted.add(key)
+                    self._guard(started, attempts, limits)
+                    result = self._attempt(
                         candidate_parsed,
+                        profile,
                         source,
+                        selections,
                         attempts,
-                        rejections,
-                        observation_budget,
-                        original=parsed,
+                        started,
+                        limits,
                     )
+                    if result is not None:
+                        return _successful_result(
+                            result,
+                            candidate_parsed,
+                            source,
+                            attempts,
+                            rejections,
+                            observation_budget,
+                            original=parsed,
+                        )
         return None
 
     def _guard(

@@ -4,11 +4,9 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.channels.Channels;
 import java.nio.channels.SeekableByteChannel;
-import java.nio.file.DirectoryNotEmptyException;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
-import java.nio.file.NoSuchFileException;
 import java.nio.file.OpenOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -87,58 +85,9 @@ final class PortableFileStorageBackend implements LocalStorageBackend {
 
   @Override
   public void deleteIfExists(String key) {
-    StorageObjectKey objectKey = StorageObjectKey.parse(key);
-    try {
-      Path parent = validateExistingParent(objectKey.parent());
-      Path object = resolveWithinRoot(parent, objectKey.fileName());
-      if (!Files.exists(object, LinkOption.NOFOLLOW_LINKS)) {
-        return;
-      }
-      requireRegularObject(object);
-      Files.delete(object);
-      pruneGeneratedArtifactDirectories(objectKey);
-    } catch (NoSuchFileException ignored) {
-      // Deletion is idempotent.
-    } catch (IllegalArgumentException exception) {
-      throw exception;
-    } catch (IOException exception) {
-      throw new LocalFileStorage.StorageException("Could not delete local object", exception);
-    }
-  }
-
-  private void pruneGeneratedArtifactDirectories(StorageObjectKey objectKey) throws IOException {
-    GeneratedArtifactPath generated = GeneratedArtifactPath.parse(objectKey.relative());
-    if (generated == null) {
-      return;
-    }
-    Path artifacts = validateExistingParent(Path.of("artifacts"));
-    Path task = resolveWithinRoot(artifacts, Path.of(generated.task()));
-    BasicFileAttributes taskIdentity;
-    try {
-      taskIdentity = identifiedDirectory(task);
-    } catch (NoSuchFileException ignored) {
-      return;
-    }
-    Path execution = resolveWithinRoot(task, Path.of(generated.execution()));
-    try {
-      deleteEmptyDirectoryWithIdentity(execution, identifiedDirectory(execution));
-    } catch (NoSuchFileException ignored) {
-      // A concurrent compensation already removed the execution directory.
-    }
-    deleteEmptyDirectoryWithIdentity(task, taskIdentity);
-  }
-
-  private static void deleteEmptyDirectoryWithIdentity(Path directory, BasicFileAttributes expected)
-      throws IOException {
-    try {
-      BasicFileAttributes current = identifiedDirectory(directory);
-      if (!Objects.equals(current.fileKey(), expected.fileKey())) {
-        throw new IllegalArgumentException("Generated artifact directory identity changed");
-      }
-      Files.delete(directory);
-    } catch (NoSuchFileException | DirectoryNotEmptyException ignored) {
-      // Concurrent removal or sibling content keeps the generated directory safe.
-    }
+    StorageObjectKey.parse(key);
+    throw new LocalFileStorage.StorageException(
+        "Portable storage provider does not support safe deletion", null);
   }
 
   @Override

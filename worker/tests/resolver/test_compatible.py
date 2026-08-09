@@ -6,6 +6,7 @@ import pytest
 from packaging.requirements import Requirement
 from packaging.version import Version
 
+import wheelforge_worker.resolver.compatible as compatible_module
 from wheelforge_worker.parser import ParsedRequirements, parse_requirements
 from wheelforge_worker.resolver.candidates import CandidateMetadata, ordered_candidates
 from wheelforge_worker.resolver.compatible import (
@@ -989,6 +990,125 @@ def test_exact_budget_fails_only_after_collected_pin_cannot_avoid_next_pin() -> 
     assert {"alpha": "1.1", "beta": "1.0"} in [
         pinned_versions(call[0]) for call in strict.calls
     ]
+
+
+def test_final_complete_frontier_is_not_rebuilt_or_invoked_twice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    packages = ("alpha", "beta", "gamma")
+    parsed = parse_requirements(
+        "".join(f"{package}==1.0\n" for package in packages).encode()
+    )
+    strict = RecordingStrictResolver(lambda _requirements, _source: None)
+    provider = BoundedRecordingProvider(
+        {
+            (package, PackageSource.PYPI): (
+                candidate(
+                    "1.1", wheels=(f"{package}-1.1-py3-none-any.whl",)
+                ),
+            )
+            for package in packages
+        }
+    )
+    rebuilds: list[tuple[str, ...]] = []
+    rebuild = compatible_module._rebuild_requirements
+
+    def record_rebuild(
+        original: ParsedRequirements,
+        pins: object,
+        selected: tuple[Version, ...],
+    ) -> ParsedRequirements:
+        rebuilds.append(tuple(str(version) for version in selected))
+        return rebuild(original, pins, selected)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(compatible_module, "_rebuild_requirements", record_rebuild)
+
+    with pytest.raises(CompatibilityResolutionError) as captured:
+        CompatibleResolver(strict, provider, max_observations=3).resolve(
+            parsed,
+            profile(),
+            (PackageSource.PYPI,),
+            ResolveLimits(),
+        )
+
+    assert captured.value.code is CompatibilityFailureCode.EXHAUSTED
+    assert len(rebuilds) == 7
+    assert len(set(rebuilds)) == len(rebuilds)
+    candidate_calls = [
+        tuple(pinned_versions(call[0]).values()) for call in strict.calls[1:]
+    ]
+    assert len(candidate_calls) == 7
+    assert len(set(candidate_calls)) == len(candidate_calls)
+
+
+def test_mixed_source_frontier_charges_each_tuple_before_rebuild(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    packages = tuple(f"package-{index:02d}" for index in range(12))
+    parsed = parse_requirements(
+        "".join(f"{package}==1.0\n" for package in packages).encode()
+    )
+    releases: dict[tuple[str, PackageSource], tuple[CandidateMetadata, ...]] = {}
+    for index, package in enumerate(packages):
+        source = PackageSource.PYPI if index % 2 == 0 else PackageSource.ALIYUN
+        releases[(package, source)] = (
+            candidate(
+                "1.1",
+                wheels=(f"{package.replace('-', '_')}-1.1-py3-none-any.whl",),
+            ),
+        )
+    provider = BoundedRecordingProvider(releases)
+    strict = RecordingStrictResolver(lambda _requirements, _source: None)
+    rebuilds: list[tuple[str, ...]] = []
+    source_checks: list[tuple[tuple[str, ...], PackageSource]] = []
+    rebuild = compatible_module._rebuild_requirements
+    supports = compatible_module._source_supports_substitutions
+
+    def record_rebuild(
+        original: ParsedRequirements,
+        pins: object,
+        selected: tuple[Version, ...],
+    ) -> ParsedRequirements:
+        rebuilds.append(tuple(str(version) for version in selected))
+        return rebuild(original, pins, selected)  # type: ignore[arg-type]
+
+    def record_source_check(
+        source: PackageSource,
+        pins: object,
+        selected: tuple[Version, ...],
+        options: object,
+    ) -> bool:
+        source_checks.append((tuple(str(version) for version in selected), source))
+        return supports(source, pins, selected, options)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(compatible_module, "_rebuild_requirements", record_rebuild)
+    monkeypatch.setattr(
+        compatible_module, "_source_supports_substitutions", record_source_check
+    )
+
+    with pytest.raises(CompatibilityResolutionError) as captured:
+        CompatibleResolver(
+            strict,
+            provider,
+            max_observations=len(packages),
+            max_combinations=64,
+        ).resolve(
+            parsed,
+            profile(),
+            (PackageSource.PYPI, PackageSource.ALIYUN),
+            ResolveLimits(max_resolution_attempts=100),
+        )
+
+    assert captured.value.code is CompatibilityFailureCode.RESOURCE_LIMIT
+    assert len(source_checks) == 64 * 2
+    assert len(set(source_checks)) == len(source_checks)
+    assert len(rebuilds) < 64
+    assert len(set(rebuilds)) == len(rebuilds)
+    strict_keys = [
+        (tuple(pinned_versions(call[0]).values()), call[2]) for call in strict.calls
+    ]
+    assert len(strict_keys) <= 2 + len(rebuilds) * 2
+    assert len(set(strict_keys)) == len(strict_keys)
 
 
 def test_observation_budget_stops_before_next_provider_with_resource_limit() -> None:

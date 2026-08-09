@@ -15,6 +15,7 @@ from wheelforge_worker.jobs.storage import WorkspaceManager
 from wheelforge_worker.parser import parse_requirements
 from wheelforge_worker.process import ProcessRunner, ProcessValidationError
 from wheelforge_worker.target import TargetProfile
+from wheelforge_worker.validation import UnsafeWheelArchive
 
 
 pytestmark = pytest.mark.skipif(
@@ -85,7 +86,9 @@ def test_default_stages_remain_fd_bound_after_workspace_root_replacement(
             "demo-direct",
         }
 
-        validation = stages.validate(resolution, download.wheels, target)
+        validation = stages.validate(
+            resolution, download.wheels, target, capability
+        )
         assert validation.report.complete is True
         capability.mkdir("artifact")
         built = stages.package(
@@ -122,6 +125,66 @@ def test_default_stages_remain_fd_bound_after_workspace_root_replacement(
                 {},
                 inherited_fds=inherited,
             )
+    finally:
+        owned.cleanup()
+        manager.close()
+
+
+@pytest.mark.parametrize("boundary", ["download-work", "wheel-parent"])
+def test_default_validation_fails_closed_after_download_descendant_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    assert FIXTURE_INDEX.is_dir()
+    fixture_url = FIXTURE_INDEX.as_uri()
+    monkeypatch.setattr(
+        pip_report_module, "resolver_source_url", lambda _source: fixture_url
+    )
+    monkeypatch.setattr(wheels_module, "source_url", lambda _source: fixture_url)
+    workspace_root = tmp_path / "workspaces"
+    workspace_root.mkdir(mode=0o700)
+    manager = WorkspaceManager(workspace_root)
+    owned = manager.allocate("50000000-0000-4000-8000-000000000052")
+    capability = owned.capability
+    parsed = parse_requirements(b"demo-direct==1.0.0\n")
+    target = _target()
+    stages = DefaultBuildStages()
+
+    try:
+        resolution = stages.resolve(parsed, target, capability)
+        download = stages.download(
+            resolution, target, capability, lambda: False
+        )
+        assert download.failures == ()
+        first = download.wheels[0]
+        relative_parts = first.path.parts[5:]
+        assert relative_parts[:1] == ("download-work",)
+        relative_wheel = Path(*relative_parts)
+        replaced = (
+            owned.path / "download-work"
+            if boundary == "download-work"
+            else owned.path / relative_wheel.parent
+        )
+        retained = replaced.with_name(f"{replaced.name}-retained")
+        replaced.rename(retained)
+        outside = tmp_path / f"outside-{boundary}"
+        outside.mkdir()
+        replacement_relative = (
+            Path(*relative_parts[1:])
+            if boundary == "download-work"
+            else Path(first.filename)
+        )
+        outside_wheel = outside / replacement_relative
+        outside_wheel.parent.mkdir(parents=True, exist_ok=True)
+        outside_wheel.write_bytes((retained / replacement_relative).read_bytes())
+        replaced.symlink_to(outside, target_is_directory=True)
+
+        with pytest.raises(UnsafeWheelArchive, match="workspace"):
+            stages.validate(resolution, download.wheels, target, capability)
+
+        assert outside_wheel.is_file()
+        assert list(outside.glob(".wheelforge-validated-*")) == []
     finally:
         owned.cleanup()
         manager.close()

@@ -102,6 +102,131 @@ def test_compensation_deletes_only_the_exact_owned_content(
         storage.read_bytes("artifacts/a.zip")
 
 
+def test_compensation_quarantines_name_before_deciding_which_inode_to_delete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "data"
+    root.mkdir(mode=0o700)
+    storage = RootedLocalStorage(root)
+    key = "artifacts/race.zip"
+    published = storage.publish_bytes(key, b"owned")
+    require_identity = storage_module._require_named_identity
+    retained_name = "retained-owned.zip"
+    replaced = False
+
+    def replace_after_identity_check(
+        parent: object, name: str, expected: tuple[int, int]
+    ) -> None:
+        nonlocal replaced
+        require_identity(parent, name, expected)  # type: ignore[arg-type]
+        if replaced:
+            return
+        replaced = True
+        descriptor = parent.descriptor  # type: ignore[attr-defined]
+        assert descriptor is not None
+        os.rename(
+            name,
+            retained_name,
+            src_dir_fd=descriptor,
+            dst_dir_fd=descriptor,
+        )
+        replacement = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=descriptor,
+        )
+        try:
+            os.write(replacement, b"replacement")
+            os.fsync(replacement)
+        finally:
+            os.close(replacement)
+
+    monkeypatch.setattr(
+        storage_module, "_require_named_identity", replace_after_identity_check
+    )
+
+    assert storage.delete_if_owned(key, published.sha256) is False
+
+    assert (root / "artifacts/race.zip").read_bytes() == b"replacement"
+    assert (root / f"artifacts/{retained_name}").read_bytes() == b"owned"
+    assert not list((root / "artifacts").glob(".wf-quarantine-*"))
+
+
+def test_compensation_preserves_quarantine_and_fails_if_restore_name_is_occupied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "data"
+    root.mkdir(mode=0o700)
+    storage = RootedLocalStorage(root)
+    key = "artifacts/race.zip"
+    published = storage.publish_bytes(key, b"owned")
+    require_identity = storage_module._require_named_identity
+    restore = storage_module._restore_quarantined_no_replace
+    retained_name = "retained-owned.zip"
+    replaced = False
+
+    def replace_after_identity_check(
+        parent: object, name: str, expected: tuple[int, int]
+    ) -> None:
+        nonlocal replaced
+        require_identity(parent, name, expected)  # type: ignore[arg-type]
+        if replaced:
+            return
+        replaced = True
+        descriptor = parent.descriptor  # type: ignore[attr-defined]
+        assert descriptor is not None
+        os.rename(
+            name,
+            retained_name,
+            src_dir_fd=descriptor,
+            dst_dir_fd=descriptor,
+        )
+        replacement = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=descriptor,
+        )
+        try:
+            os.write(replacement, b"replacement")
+        finally:
+            os.close(replacement)
+
+    def occupy_name_before_restore(
+        parent: object, quarantine: object, name: str
+    ) -> None:
+        descriptor = parent.descriptor  # type: ignore[attr-defined]
+        assert descriptor is not None
+        occupant = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=descriptor,
+        )
+        try:
+            os.write(occupant, b"occupant")
+        finally:
+            os.close(occupant)
+        restore(parent, quarantine, name)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        storage_module, "_require_named_identity", replace_after_identity_check
+    )
+    monkeypatch.setattr(
+        storage_module, "_restore_quarantined_no_replace", occupy_name_before_restore
+    )
+
+    with pytest.raises(OSError, match="quarantine could not be restored"):
+        storage.delete_if_owned(key, published.sha256)
+
+    assert (root / "artifacts/race.zip").read_bytes() == b"occupant"
+    assert (root / f"artifacts/{retained_name}").read_bytes() == b"owned"
+    quarantines = list((root / "artifacts").glob(".wf-quarantine-*"))
+    assert len(quarantines) == 1
+    assert (quarantines[0] / "race.zip").read_bytes() == b"replacement"
+
+
 def test_compensation_delete_prunes_empty_execution_and_task_directories(
     tmp_path: Path,
 ) -> None:
