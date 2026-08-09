@@ -227,6 +227,448 @@ def test_compensation_preserves_quarantine_and_fails_if_restore_name_is_occupied
     assert (quarantines[0] / "race.zip").read_bytes() == b"replacement"
 
 
+def test_quarantine_isolation_never_replaces_an_occupied_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "data"
+    root.mkdir(mode=0o700)
+    storage = RootedLocalStorage(root)
+    published = storage.publish_bytes("artifacts/race.zip", b"owned")
+    rename_no_replace = storage_module._rename_no_replace
+    injected = False
+
+    def occupy_destination(
+        source_parent: int, source: str, destination_parent: int, destination: str
+    ) -> None:
+        nonlocal injected
+        if not injected and source == destination == "race.zip":
+            injected = True
+            occupant = os.open(
+                destination,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=destination_parent,
+            )
+            try:
+                os.write(occupant, b"occupant")
+            finally:
+                os.close(occupant)
+        rename_no_replace(source_parent, source, destination_parent, destination)
+
+    monkeypatch.setattr(storage_module, "_rename_no_replace", occupy_destination)
+
+    with pytest.raises(FileExistsError):
+        storage.delete_if_owned(published.object_key, published.sha256)
+
+    assert (root / published.object_key).read_bytes() == b"owned"
+    quarantine = next((root / "artifacts").glob(".wf-quarantine-v1-*"))
+    assert (quarantine / "race.zip").read_bytes() == b"occupant"
+
+
+def test_storage_fails_closed_when_atomic_no_replace_primitive_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "data"
+    root.mkdir(mode=0o700)
+    monkeypatch.setattr(
+        storage_module,
+        "_atomic_rename_configuration",
+        lambda: ("missing_atomic_rename_symbol", 1),
+    )
+
+    with pytest.raises(RuntimeError, match="no-replace rename"):
+        RootedLocalStorage(root)
+
+    assert list(root.iterdir()) == []
+
+
+def test_quarantine_isolation_handles_source_disappearance_without_deleting_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "data"
+    root.mkdir(mode=0o700)
+    storage = RootedLocalStorage(root)
+    published = storage.publish_bytes("artifacts/race.zip", b"owned")
+    rename_no_replace = storage_module._rename_no_replace
+    moved = False
+
+    def move_source_first(
+        source_parent: int, source: str, destination_parent: int, destination: str
+    ) -> None:
+        nonlocal moved
+        if not moved and source == "race.zip":
+            moved = True
+            os.rename(
+                source,
+                "retained-owned.zip",
+                src_dir_fd=source_parent,
+                dst_dir_fd=source_parent,
+            )
+        rename_no_replace(source_parent, source, destination_parent, destination)
+
+    monkeypatch.setattr(storage_module, "_rename_no_replace", move_source_first)
+
+    assert storage.delete_if_owned(published.object_key, published.sha256) is False
+    assert (root / "artifacts/retained-owned.zip").read_bytes() == b"owned"
+    assert not list((root / "artifacts").glob(".wf-quarantine-v1-*"))
+
+
+def test_quarantine_verification_preserves_replacement_installed_after_isolation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "data"
+    root.mkdir(mode=0o700)
+    storage = RootedLocalStorage(root)
+    published = storage.publish_bytes("artifacts/race.zip", b"owned")
+    rename_no_replace = storage_module._rename_no_replace
+    replaced = False
+
+    def replace_isolated_source(
+        source_parent: int, source: str, destination_parent: int, destination: str
+    ) -> None:
+        nonlocal replaced
+        rename_no_replace(source_parent, source, destination_parent, destination)
+        if replaced or source != destination or source != "race.zip":
+            return
+        replaced = True
+        os.rename(
+            destination,
+            "retained-owned.zip",
+            src_dir_fd=destination_parent,
+            dst_dir_fd=source_parent,
+        )
+        replacement = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=destination_parent,
+        )
+        try:
+            os.write(replacement, b"replacement")
+        finally:
+            os.close(replacement)
+
+    monkeypatch.setattr(
+        storage_module, "_rename_no_replace", replace_isolated_source
+    )
+
+    assert storage.delete_if_owned(published.object_key, published.sha256) is False
+    assert (root / "artifacts/race.zip").read_bytes() == b"replacement"
+    assert (root / "artifacts/retained-owned.zip").read_bytes() == b"owned"
+
+
+def _leave_quarantine_after_isolation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quarantine_named = storage_module._quarantine_named
+
+    def crash(*args: object, **kwargs: object) -> object:
+        quarantine = quarantine_named(*args, **kwargs)
+        assert quarantine is not None
+        os.close(quarantine.descriptor)
+        raise RuntimeError("simulated crash after quarantine move")
+
+    monkeypatch.setattr(storage_module, "_quarantine_named", crash)
+
+
+@pytest.mark.parametrize("protection", ["active", "referenced"])
+def test_quarantine_maintenance_protects_live_owner_then_restores_when_expired(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, protection: str
+) -> None:
+    root = tmp_path / "data"
+    root.mkdir(mode=0o700)
+    task = "20000000-0000-4000-8000-000000000071"
+    execution = "10000000-0000-4000-8000-000000000071"
+    artifact = "30000000-0000-4000-8000-000000000071"
+    key = f"artifacts/{task}/{execution}/{artifact}.zip"
+    storage = RootedLocalStorage(root, clock=lambda: datetime(2026, 8, 1))
+    published = storage.publish_bytes(key, b"owned")
+    _leave_quarantine_after_isolation(monkeypatch)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        storage.delete_if_owned(key, published.sha256)
+    monkeypatch.undo()
+    quarantine = next(root.rglob(".wf-quarantine-v1-*"))
+    descriptor = os.open(
+        quarantine, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        metadata = storage_module._read_quarantine_metadata(
+            descriptor, quarantine.name.removeprefix(".wf-quarantine-v1-")
+        )
+    finally:
+        os.close(descriptor)
+    assert metadata is not None
+    assert metadata.object_key == key
+    assert metadata.original_name == f"{artifact}.zip"
+    assert metadata.expected_sha256 == published.sha256
+    assert metadata.owner_execution_id == execution
+    assert metadata.created_at == datetime(2026, 8, 1)
+
+    active = frozenset({execution}) if protection == "active" else frozenset()
+    referenced = frozenset({key}) if protection == "referenced" else frozenset()
+    protected = storage.sweep_abandoned(
+        datetime(2026, 8, 2),
+        referenced,
+        active_execution_ids=active,
+        active_build_executions=frozenset({(task, execution)}) if active else frozenset(),
+    )
+
+    assert protected.quarantines_protected == 1
+    assert not (root / key).exists()
+    assert len(list(root.rglob(".wf-quarantine-v1-*"))) == 1
+
+    recovered = storage.sweep_abandoned(
+        datetime(2026, 8, 2),
+        frozenset(),
+        active_execution_ids=frozenset(),
+        active_build_executions=frozenset(),
+    )
+
+    assert recovered.quarantines_restored == 1
+    assert (root / key).read_bytes() == b"owned"
+    assert not list(root.rglob(".wf-quarantine-v1-*"))
+
+
+def test_expired_quarantine_restore_conflict_preserves_both_objects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "data"
+    root.mkdir(mode=0o700)
+    task = "20000000-0000-4000-8000-000000000072"
+    execution = "10000000-0000-4000-8000-000000000072"
+    artifact = "30000000-0000-4000-8000-000000000072"
+    key = f"artifacts/{task}/{execution}/{artifact}.zip"
+    storage = RootedLocalStorage(root, clock=lambda: datetime(2026, 8, 1))
+    published = storage.publish_bytes(key, b"owned")
+    _leave_quarantine_after_isolation(monkeypatch)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        storage.delete_if_owned(key, published.sha256)
+    monkeypatch.undo()
+    storage.publish_bytes(key, b"replacement")
+
+    stats = storage.sweep_abandoned(
+        datetime(2026, 8, 2),
+        frozenset(),
+        active_execution_ids=frozenset(),
+        active_build_executions=frozenset(),
+    )
+
+    assert stats.quarantine_conflicts == 1
+    assert (root / key).read_bytes() == b"replacement"
+    quarantine = next(root.rglob(".wf-quarantine-v1-*"))
+    assert (quarantine / f"{artifact}.zip").read_bytes() == b"owned"
+
+
+def test_maintenance_removes_empty_quarantine_left_after_owned_delete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "data"
+    root.mkdir(mode=0o700)
+    storage = RootedLocalStorage(root, clock=lambda: datetime(2026, 8, 1))
+    published = storage.publish_bytes("artifacts/race.zip", b"owned")
+    real_unlink = storage_module.os.unlink
+    failed = False
+
+    def unlink_then_crash(name: str, *, dir_fd: int | None = None) -> None:
+        nonlocal failed
+        real_unlink(name, dir_fd=dir_fd)
+        if name == "race.zip" and not failed:
+            failed = True
+            raise OSError("simulated crash after owned delete")
+
+    monkeypatch.setattr(storage_module.os, "unlink", unlink_then_crash)
+    with pytest.raises(OSError, match="simulated crash"):
+        storage.delete_if_owned(published.object_key, published.sha256)
+    monkeypatch.undo()
+
+    stats = storage.sweep_abandoned(
+        datetime(2026, 8, 2),
+        frozenset(),
+        active_execution_ids=frozenset(),
+        active_build_executions=frozenset(),
+    )
+
+    assert stats.empty_quarantines_removed == 1
+    assert not list(root.rglob(".wf-quarantine-v1-*"))
+
+
+def test_maintenance_prunes_artifact_directories_after_empty_quarantine_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "data"
+    root.mkdir(mode=0o700)
+    task = "20000000-0000-4000-8000-000000000073"
+    execution = "10000000-0000-4000-8000-000000000073"
+    artifact = "30000000-0000-4000-8000-000000000073"
+    key = f"artifacts/{task}/{execution}/{artifact}.zip"
+    storage = RootedLocalStorage(root, clock=lambda: datetime(2026, 8, 1))
+    published = storage.publish_bytes(key, b"owned")
+    real_unlink = storage_module.os.unlink
+    failed = False
+
+    def unlink_then_crash(name: str, *, dir_fd: int | None = None) -> None:
+        nonlocal failed
+        real_unlink(name, dir_fd=dir_fd)
+        if name == f"{artifact}.zip" and not failed:
+            failed = True
+            raise OSError("simulated crash after owned delete")
+
+    monkeypatch.setattr(storage_module.os, "unlink", unlink_then_crash)
+    with pytest.raises(OSError, match="simulated crash"):
+        storage.delete_if_owned(key, published.sha256)
+    monkeypatch.undo()
+
+    storage.sweep_abandoned(
+        datetime(2026, 8, 2),
+        frozenset(),
+        active_execution_ids=frozenset(),
+        active_build_executions=frozenset(),
+    )
+
+    assert not (root / f"artifacts/{task}/{execution}").exists()
+    assert not (root / f"artifacts/{task}").exists()
+    assert (root / "artifacts").is_dir()
+
+
+def test_maintenance_removes_old_empty_quarantine_left_after_mkdir_crash(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "data"
+    root.mkdir(mode=0o700)
+    storage = RootedLocalStorage(root)
+    quarantine = root / ".wf-quarantine-v1-00000000-0000-4000-8000-000000000074"
+    quarantine.mkdir(mode=0o700)
+    old = datetime(2026, 8, 1).timestamp()
+    os.utime(quarantine, (old, old))
+
+    stats = storage.sweep_abandoned(
+        datetime(2026, 8, 2),
+        frozenset(),
+        active_execution_ids=frozenset(),
+        active_build_executions=frozenset(),
+    )
+
+    assert stats.empty_quarantines_removed == 1
+    assert not quarantine.exists()
+
+
+def test_maintenance_removes_metadata_only_quarantine_without_moving_source(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "data"
+    root.mkdir(mode=0o700)
+    storage = RootedLocalStorage(root)
+    key = "artifacts/race.zip"
+    source = storage.publish_bytes(key, b"owned")
+    quarantine_id = "00000000-0000-4000-8000-000000000075"
+    quarantine = root / "artifacts" / f".wf-quarantine-v1-{quarantine_id}"
+    quarantine.mkdir(mode=0o700)
+    descriptor = os.open(
+        quarantine, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        storage_module._write_quarantine_metadata(
+            descriptor,
+            storage_module._QuarantineMetadata(
+                quarantine_id,
+                key,
+                "race.zip",
+                source.sha256,
+                None,
+                datetime(2026, 8, 1),
+            ),
+        )
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+    stats = storage.sweep_abandoned(
+        datetime(2026, 8, 2),
+        frozenset(),
+        active_execution_ids=frozenset(),
+        active_build_executions=frozenset(),
+    )
+
+    assert stats.empty_quarantines_removed == 1
+    assert (root / key).read_bytes() == b"owned"
+    assert not quarantine.exists()
+
+
+def test_crash_after_quarantine_verification_is_recovered_by_maintenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "data"
+    root.mkdir(mode=0o700)
+    storage = RootedLocalStorage(root, clock=lambda: datetime(2026, 8, 1))
+    published = storage.publish_bytes("artifacts/race.zip", b"owned")
+    real_unlink = storage_module.os.unlink
+
+    def crash_before_delete(name: str, *, dir_fd: int | None = None) -> None:
+        if name == "race.zip":
+            raise OSError("simulated crash after verification")
+        real_unlink(name, dir_fd=dir_fd)
+
+    monkeypatch.setattr(storage_module.os, "unlink", crash_before_delete)
+    with pytest.raises(OSError, match="after verification"):
+        storage.delete_if_owned(published.object_key, published.sha256)
+    monkeypatch.undo()
+
+    stats = storage.sweep_abandoned(
+        datetime(2026, 8, 2),
+        frozenset(),
+        active_execution_ids=frozenset(),
+        active_build_executions=frozenset(),
+    )
+
+    assert stats.quarantines_restored == 1
+    assert (root / published.object_key).read_bytes() == b"owned"
+
+
+def test_crash_after_atomic_restore_leaves_empty_quarantine_for_next_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "data"
+    root.mkdir(mode=0o700)
+    storage = RootedLocalStorage(root, clock=lambda: datetime(2026, 8, 1))
+    published = storage.publish_bytes("artifacts/race.zip", b"owned")
+    _leave_quarantine_after_isolation(monkeypatch)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        storage.delete_if_owned(published.object_key, published.sha256)
+    monkeypatch.undo()
+    rename_no_replace = storage_module._rename_no_replace
+    crashed = False
+
+    def restore_then_crash(
+        source_parent: int, source: str, destination_parent: int, destination: str
+    ) -> None:
+        nonlocal crashed
+        rename_no_replace(source_parent, source, destination_parent, destination)
+        if not crashed and source == destination == "race.zip":
+            crashed = True
+            raise OSError("simulated crash after restore")
+
+    monkeypatch.setattr(storage_module, "_rename_no_replace", restore_then_crash)
+    with pytest.raises(OSError, match="after restore"):
+        storage.sweep_abandoned(
+            datetime(2026, 8, 2),
+            frozenset(),
+            active_execution_ids=frozenset(),
+            active_build_executions=frozenset(),
+        )
+    monkeypatch.undo()
+
+    assert (root / published.object_key).read_bytes() == b"owned"
+    assert len(list(root.rglob(".wf-quarantine-v1-*"))) == 1
+    stats = storage.sweep_abandoned(
+        datetime(2026, 8, 2),
+        frozenset(),
+        active_execution_ids=frozenset(),
+        active_build_executions=frozenset(),
+    )
+    assert stats.empty_quarantines_removed == 1
+    assert not list(root.rglob(".wf-quarantine-v1-*"))
+
+
 def test_compensation_delete_prunes_empty_execution_and_task_directories(
     tmp_path: Path,
 ) -> None:

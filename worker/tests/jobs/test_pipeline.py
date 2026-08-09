@@ -213,6 +213,73 @@ class SnapshotReport:
     snapshot: CleanupSnapshot
 
 
+class DescriptorSnapshot:
+    def __init__(self) -> None:
+        self.descriptors = os.pipe()
+        self.close_calls = 0
+
+    def close(self) -> None:
+        self.close_calls += 1
+        for descriptor in self.descriptors:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+class SnapshotStages(RecordingStages):
+    def __init__(self, snapshot: DescriptorSnapshot) -> None:
+        super().__init__()
+        self.snapshot = snapshot
+        self.resolved = _resolved_package("numpy", "1.26.4")
+        self.wheel = DownloadedWheel(
+            package=self.resolved.name,
+            version=self.resolved.version,
+            filename=self.resolved.wheel_filename,
+            path=Path("download-work/numpy.whl"),
+            source=PackageSource.PYPI,
+            byte_size=5,
+            sha256=hashlib.sha256(b"wheel").hexdigest(),
+            tags=frozenset({Tag("py3", "none", "any")}),
+        )
+
+    def resolve(
+        self, parsed: object, target: object, workspace: object
+    ) -> ResolutionResult:
+        self.calls.append("resolve")
+        return ResolutionResult("1", (self.resolved,), source=PackageSource.PYPI)
+
+    def download(
+        self,
+        resolution: ResolutionResult,
+        target: object,
+        workspace: object,
+        cancel: object,
+    ) -> BuildDownload:
+        self.calls.append("download")
+        return BuildDownload((self.wheel,), ())
+
+    def validate(
+        self,
+        resolution: ResolutionResult,
+        wheels: tuple[object, ...],
+        target: object,
+        workspace: object,
+    ) -> BuildValidation:
+        self.calls.append("validate")
+        report = cast(Any, SnapshotReport(cast(Any, self.snapshot)))
+        validated = ValidatedWheel(self.wheel, report)
+        return BuildValidation(
+            (validated,), StaticValidationReport((), True)
+        )
+
+
+def _assert_descriptors_are_closed(snapshot: DescriptorSnapshot) -> None:
+    for descriptor in snapshot.descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
 def _resolved_package(name: str, version: str) -> ResolvedPackage:
     filename = f"{name}-{version}-py3-none-any.whl"
     return ResolvedPackage(
@@ -1078,7 +1145,10 @@ class CleanupFailureWorkspace:
         self._owned = owned
 
     def cleanup(self) -> None:
-        raise RuntimeError("workspace cleanup failed")
+        retained = self.path.with_name(f"{self.path.name}-retained")
+        self.path.rename(retained)
+        self.path.mkdir(mode=0o700)
+        self._owned.cleanup()
 
 
 class CleanupFailureWorkspaceManager:
@@ -1088,6 +1158,100 @@ class CleanupFailureWorkspaceManager:
 
     def allocate(self, execution_id: str | None = None) -> CleanupFailureWorkspace:
         return CleanupFailureWorkspace(self._manager.allocate(execution_id))
+
+
+class PackageResultFailureRepository(JobRepository):
+    def persist_package_results(self, *args: object, **kwargs: object) -> None:
+        raise OperationalError("UPDATE", {}, OSError("database unavailable"))
+
+
+class PrePackageFailureRepository(JobRepository):
+    def advance_build(
+        self,
+        lease: JobLease,
+        status: str,
+        progress: int,
+        stage: str,
+        message: str,
+    ) -> None:
+        if status == "PACKAGING":
+            raise OSError("packaging transition unavailable")
+        super().advance_build(lease, status, progress, stage, message)
+
+
+def _repository_copy(
+    kind: type[JobRepository], source: JobRepository
+) -> JobRepository:
+    return kind(
+        source.engine,
+        lease_seconds=source.lease_seconds,
+        clock=source._clock,
+    )
+
+
+def test_validation_snapshot_descriptors_close_when_cancelled_after_validation(
+    tmp_path: Path,
+) -> None:
+    source, storage, workspaces = _environment(tmp_path)
+    _publish_build_inputs(storage)
+    lease = _seed_build(source)
+    snapshot = DescriptorSnapshot()
+
+    result = JobPipeline(
+        CancelAtRepository(source, 5),
+        storage,
+        workspaces,
+        SnapshotStages(snapshot),
+    ).run(lease)
+
+    assert result.status is BuildStatus.CANCELLED
+    assert snapshot.close_calls == 1
+    _assert_descriptors_are_closed(snapshot)
+
+
+@pytest.mark.parametrize(
+    "repository_type",
+    [PackageResultFailureRepository, PrePackageFailureRepository],
+    ids=["persist-package-results", "before-package"],
+)
+def test_validation_snapshot_descriptors_close_on_pre_package_failures(
+    tmp_path: Path, repository_type: type[JobRepository]
+) -> None:
+    source, storage, workspaces = _environment(tmp_path)
+    _publish_build_inputs(storage)
+    lease = _seed_build(source)
+    snapshot = DescriptorSnapshot()
+
+    result = JobPipeline(
+        _repository_copy(repository_type, source),
+        storage,
+        workspaces,
+        SnapshotStages(snapshot),
+    ).run(lease)
+
+    assert result.status is BuildStatus.QUEUED
+    assert snapshot.close_calls == 1
+    _assert_descriptors_are_closed(snapshot)
+
+
+def test_validation_snapshot_descriptors_close_when_workspace_cleanup_fails(
+    tmp_path: Path,
+) -> None:
+    repository, storage, workspaces = _environment(tmp_path)
+    _publish_build_inputs(storage)
+    lease = _seed_build(repository)
+    snapshot = DescriptorSnapshot()
+
+    result = JobPipeline(
+        repository,
+        storage,
+        cast(WorkspaceManager, CleanupFailureWorkspaceManager(workspaces)),
+        SnapshotStages(snapshot),
+    ).run(lease)
+
+    assert result.status is BuildStatus.SUCCESS
+    assert snapshot.close_calls >= 1
+    _assert_descriptors_are_closed(snapshot)
 
 
 def test_workspace_cleanup_failure_does_not_replace_success_result(

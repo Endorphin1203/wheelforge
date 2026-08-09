@@ -86,14 +86,13 @@ shared identity or an equivalent narrowly scoped ACL. On Windows, use an NTFS
 ACL limited to the API and Worker service identities plus administrators.
 Ordinary users and unrelated services must not have write access.
 
-When the filesystem provider supports `SecureDirectoryStream`, storage uses
-descriptor-relative traversal for object operations. Other providers use the
-cross-platform fallback: normalized relative keys, per-segment no-follow
-checks, same-directory temporary files, and atomic publication. Pure Java
-cannot completely prevent a local process that can write the data root from
-replacing directories during those fallback checks; such a process is outside
-the deployment threat model, which is why exclusive write permission is
-required.
+The API requires the filesystem provider to expose Java
+`SecureDirectoryStream`. Upload publication, rollback compensation, artifact
+retention, and generated-directory pruning are one complete storage contract;
+the API fails startup when descriptor-relative mutation is unavailable. There
+is no read/write-only portable mode. Confirm this capability on the exact host,
+JDK, and mounted filesystem used in production. Exclusive write permission on
+`WF_DATA_ROOT` remains required in addition to this provider capability.
 
 The application uses Flyway migrations and Hibernate `ddl-auto: validate`
 against MySQL. Flyway is the only schema owner; do not use Hibernate to create

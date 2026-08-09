@@ -3,23 +3,16 @@ package com.wheelforge.api.common.storage;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.channels.Channels;
-import java.nio.channels.SeekableByteChannel;
-import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.OpenOption;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.Objects;
 import java.util.Set;
-import java.util.UUID;
 
 final class PortableFileStorageBackend implements LocalStorageBackend {
-  private static final int TEMP_NAME_ATTEMPTS = 5;
-  private static final Set<OpenOption> CREATE_OPTIONS =
-      Set.of(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS);
   private static final Set<OpenOption> READ_OPTIONS =
       Set.of(StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS);
 
@@ -40,32 +33,7 @@ final class PortableFileStorageBackend implements LocalStorageBackend {
   @Override
   public LocalFileStorage.StoredObject putAtomically(
       String key, InputStream input, long expectedSize) {
-    if (expectedSize < 0) {
-      throw new IllegalArgumentException("Expected size must not be negative");
-    }
-    StorageObjectKey objectKey = StorageObjectKey.parse(key);
-    Path parent = createAndValidateParent(objectKey.parent());
-    TemporaryFile temporary = createTemporaryFile(parent);
-    boolean published = false;
-    try {
-      StorageObjectWriter.WriteResult result =
-          StorageObjectWriter.write(temporary.channel(), input, expectedSize);
-      Path validatedParent = validateExistingParent(objectKey.parent());
-      Path destination = resolveWithinRoot(validatedParent, objectKey.fileName());
-      rejectSymbolicLink(destination);
-      Files.move(temporary.path(), destination, StandardCopyOption.ATOMIC_MOVE);
-      published = true;
-      return new LocalFileStorage.StoredObject(key, result.sizeBytes(), result.sha256());
-    } catch (LocalFileStorage.StorageException exception) {
-      throw exception;
-    } catch (IOException exception) {
-      throw new LocalFileStorage.StorageException("Could not publish local object", exception);
-    } finally {
-      if (!published) {
-        closeQuietly(temporary.channel());
-        deleteTemporaryIfPresent(temporary.path());
-      }
-    }
+    throw unsupportedMutation();
   }
 
   @Override
@@ -85,41 +53,12 @@ final class PortableFileStorageBackend implements LocalStorageBackend {
 
   @Override
   public void deleteIfExists(String key) {
-    StorageObjectKey.parse(key);
-    throw new LocalFileStorage.StorageException(
-        "Portable storage provider does not support safe deletion", null);
+    throw unsupportedMutation();
   }
 
   @Override
   public void close() {
     // This fallback does not retain provider handles.
-  }
-
-  private Path createAndValidateParent(Path relativeParent) {
-    validateRoot();
-    Path current = realRoot;
-    if (relativeParent == null) {
-      return current;
-    }
-    try {
-      for (Path segment : relativeParent) {
-        current = resolveWithinRoot(current, segment);
-        if (!Files.exists(current, LinkOption.NOFOLLOW_LINKS)) {
-          try {
-            Files.createDirectory(current);
-          } catch (FileAlreadyExistsException ignored) {
-            // A concurrent upload may have created the same generated-key directory.
-          }
-        }
-        requireSafeDirectory(current);
-      }
-      return current;
-    } catch (IllegalArgumentException exception) {
-      throw exception;
-    } catch (IOException exception) {
-      throw new LocalFileStorage.StorageException(
-          "Could not create local storage directories", exception);
-    }
   }
 
   private Path validateExistingParent(Path relativeParent) throws IOException {
@@ -189,43 +128,8 @@ final class PortableFileStorageBackend implements LocalStorageBackend {
     }
   }
 
-  private void rejectSymbolicLink(Path object) {
-    if (Files.isSymbolicLink(object)) {
-      throw new IllegalArgumentException("Object key refers to an unsafe object");
-    }
+  private static LocalFileStorage.StorageException unsupportedMutation() {
+    return new LocalFileStorage.StorageException(
+        "Portable storage provider cannot provide complete storage semantics", null);
   }
-
-  private TemporaryFile createTemporaryFile(Path parent) {
-    for (int attempt = 0; attempt < TEMP_NAME_ATTEMPTS; attempt++) {
-      Path candidate = parent.resolve(".wheelforge-" + UUID.randomUUID() + ".tmp");
-      try {
-        return new TemporaryFile(candidate, Files.newByteChannel(candidate, CREATE_OPTIONS));
-      } catch (FileAlreadyExistsException ignored) {
-        // Try another generated name.
-      } catch (IOException exception) {
-        throw new LocalFileStorage.StorageException(
-            "Could not create local storage temporary file", exception);
-      }
-    }
-    throw new LocalFileStorage.StorageException(
-        "Could not allocate a unique storage temporary name", null);
-  }
-
-  private static void closeQuietly(SeekableByteChannel channel) {
-    try {
-      channel.close();
-    } catch (IOException ignored) {
-      // The original publication failure remains the actionable error.
-    }
-  }
-
-  private static void deleteTemporaryIfPresent(Path temporary) {
-    try {
-      Files.deleteIfExists(temporary);
-    } catch (IOException ignored) {
-      // The original publication failure remains the actionable error.
-    }
-  }
-
-  private record TemporaryFile(Path path, SeekableByteChannel channel) {}
 }

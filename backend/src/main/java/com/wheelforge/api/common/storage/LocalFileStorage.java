@@ -45,7 +45,8 @@ public class LocalFileStorage implements AutoCloseable {
       } else {
         openedDirectory.close();
         openedDirectory = null;
-        backend = new PortableFileStorageBackend(realRoot);
+        throw new StorageException(
+            "Local storage requires SecureDirectoryStream for complete storage semantics", null);
       }
     } catch (IOException exception) {
       throw new StorageException("Could not initialize local storage", exception);

@@ -22,6 +22,7 @@ from packaging.version import Version
 
 import wheelforge_worker.validation.archive as archive_module
 from wheelforge_worker.download import DownloadedWheel
+from wheelforge_worker.jobs.storage import WorkspaceManager
 from wheelforge_worker.resolver import PackageSource
 from wheelforge_worker.validation.archive import (
     ArchiveLimits,
@@ -264,8 +265,8 @@ def test_descriptor_validation_accepts_exact_file_without_trusting_path_ancestor
         replacement.write_bytes(b"replacement snapshot")
         with report.snapshot.open() as snapshot:
             assert snapshot.read() == path.read_bytes()
-        report.snapshot.cleanup()
-        assert not (retained / report.snapshot.path).exists()
+        report.snapshot.close()
+        assert (retained / report.snapshot.path).exists()
         assert replacement.read_bytes() == b"replacement snapshot"
     finally:
         if snapshots_descriptor != -1:
@@ -770,6 +771,126 @@ def test_validation_snapshot_is_bound_to_verified_bytes(
     finally:
         report.snapshot.cleanup()
     assert not report.snapshot.path.exists()
+
+
+def test_bound_snapshot_close_is_idempotent_and_never_deletes_a_replacement(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    snapshots = tmp_path / "snapshots"
+    source.mkdir()
+    snapshots.mkdir()
+    path = make_wheel(source)
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    parent = os.open(
+        snapshots, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        report = validate_wheel_archive_descriptor(
+            descriptor, observed(path), ArchiveLimits(), parent
+        )
+    finally:
+        os.close(parent)
+        os.close(descriptor)
+    assert report.snapshot is not None
+    binding = report.snapshot._binding
+    assert binding is not None
+    retained_fds = [binding.directory_descriptor, binding.parent_descriptor]
+    assert all(descriptor is not None for descriptor in retained_fds)
+    snapshot_path = snapshots / report.snapshot.path
+    replacement = snapshot_path.with_name("replacement.whl")
+    snapshot_path.rename(replacement)
+    snapshot_path.write_bytes(b"replacement")
+
+    report.snapshot.close()
+    report.snapshot.close()
+
+    assert snapshot_path.read_bytes() == b"replacement"
+    assert replacement.exists()
+    _assert_file_descriptors_closed(
+        [descriptor for descriptor in retained_fds if descriptor is not None]
+    )
+
+
+def test_bound_snapshot_close_releases_both_descriptors_when_one_close_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    snapshots = tmp_path / "snapshots"
+    source.mkdir()
+    snapshots.mkdir()
+    path = make_wheel(source)
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    parent = os.open(
+        snapshots, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        report = validate_wheel_archive_descriptor(
+            descriptor, observed(path), ArchiveLimits(), parent
+        )
+    finally:
+        os.close(parent)
+        os.close(descriptor)
+    assert report.snapshot is not None
+    binding = report.snapshot._binding
+    assert binding is not None
+    directory_fd = binding.directory_descriptor
+    parent_fd = binding.parent_descriptor
+    assert directory_fd is not None
+    assert parent_fd is not None
+    real_close = os.close
+    raised = False
+
+    def close_then_raise(candidate: int) -> None:
+        nonlocal raised
+        real_close(candidate)
+        if candidate == directory_fd and not raised:
+            raised = True
+            raise OSError("injected close failure")
+
+    monkeypatch.setattr(archive_module.os, "close", close_then_raise)
+
+    with pytest.raises(UnsafeWheelArchive, match="snapshot descriptors"):
+        report.snapshot.close()
+    report.snapshot.close()
+    _assert_file_descriptors_closed([directory_fd, parent_fd])
+
+
+def test_closed_bound_snapshot_content_is_reclaimed_by_owned_workspace(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    workspace_root = tmp_path / "workspaces"
+    source.mkdir()
+    workspace_root.mkdir()
+    path = make_wheel(source)
+    expected = observed(path)
+    manager = WorkspaceManager(workspace_root)
+    owned = manager.allocate("10000000-0000-4000-8000-000000000081")
+    owned.capability.write_bytes(expected.filename, path.read_bytes())
+    descriptor = owned.capability.open_regular(expected.filename)
+    parent = owned.capability.duplicate_directory()
+    try:
+        report = validate_wheel_archive_descriptor(
+            descriptor,
+            replace(expected, path=Path(expected.filename)),
+            ArchiveLimits(),
+            parent,
+        )
+    finally:
+        os.close(parent)
+        os.close(descriptor)
+    assert report.snapshot is not None
+    snapshot_path = owned.path / report.snapshot.path
+    assert snapshot_path.exists()
+
+    report.snapshot.close()
+    report.snapshot.close()
+    assert snapshot_path.exists()
+    owned.cleanup()
+    manager.close()
+
+    assert not owned.path.exists()
 
 
 def test_snapshot_revalidation_wraps_digest_io_failure(

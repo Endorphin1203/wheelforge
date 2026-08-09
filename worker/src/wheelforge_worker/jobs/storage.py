@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import errno
+import json
 import os
 import re
 import shutil
@@ -9,9 +11,9 @@ import stat
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import BinaryIO
+from typing import Any, BinaryIO
 from uuid import UUID, uuid4
 
 
@@ -26,6 +28,13 @@ _GENERATED_ARTIFACT = re.compile(
     rf"artifacts/(?P<task>{_UUID_PATTERN})/"
     rf"(?:(?P<owner>{_UUID_PATTERN})/)?{_UUID_PATTERN}\.zip\Z"
 )
+_QUARANTINE = re.compile(rf"\.wf-quarantine-v1-(?P<id>{_UUID_PATTERN})\Z")
+_QUARANTINE_XATTR = b"user.wheelforge.quarantine-v1"
+_MAX_QUARANTINE_METADATA_BYTES = 8192
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 class InvalidObjectKey(ValueError):
@@ -37,6 +46,15 @@ class PublishedObject:
     object_key: str
     size_bytes: int
     sha256: str
+
+
+@dataclass(slots=True)
+class StorageSweepStats:
+    quarantines_restored: int = 0
+    quarantines_protected: int = 0
+    quarantine_conflicts: int = 0
+    invalid_quarantines: int = 0
+    empty_quarantines_removed: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,19 +222,32 @@ class _QuarantineBinding:
     descriptor: int
 
 
+@dataclass(frozen=True, slots=True)
+class _QuarantineMetadata:
+    quarantine_id: str
+    object_key: str
+    original_name: str
+    expected_sha256: str
+    owner_execution_id: str | None
+    created_at: datetime
+
+
 class RootedLocalStorage:
     def __init__(
         self,
         root: Path,
         *,
         uuid_factory: Callable[[], UUID] = uuid4,
+        clock: Callable[[], datetime] = _utc_now,
     ) -> None:
         _require_supported_host()
+        _require_atomic_no_replace()
         self._root_descriptor: int | None
         self.root, descriptor = _open_stable_root(Path(root), "data root")
         self._root_descriptor = descriptor
         self._root_identity = _identity(os.fstat(self._root_descriptor))
         self._uuid_factory = uuid_factory
+        self._clock = clock
 
     def close(self) -> None:
         if self._root_descriptor is not None:
@@ -370,11 +401,26 @@ class RootedLocalStorage:
                 _require_named_identity(parent, parts[-1], identity)
                 if digest != expected_sha256:
                     return False
+                artifact = _GENERATED_ARTIFACT.fullmatch(object_key)
+                owner_execution_id = (
+                    artifact.group("owner") if artifact is not None else None
+                )
+                quarantine_id = str(self._uuid_factory())
                 quarantine = _quarantine_named(
-                    parent, parts[-1], self._uuid_factory
+                    parent,
+                    parts[-1],
+                    _QuarantineMetadata(
+                        quarantine_id=quarantine_id,
+                        object_key=object_key,
+                        original_name=parts[-1],
+                        expected_sha256=expected_sha256,
+                        owner_execution_id=owner_execution_id,
+                        created_at=self._clock(),
+                    ),
                 )
                 if quarantine is None:
                     return False
+                restored = False
                 try:
                     isolated = os.stat(
                         parts[-1],
@@ -389,12 +435,11 @@ class RootedLocalStorage:
                         _restore_quarantined_no_replace(
                             parent, quarantine, parts[-1]
                         )
+                        restored = True
                 finally:
                     os.close(quarantine.descriptor)
-                if deleted or not _quarantine_contains(
-                    parent, quarantine.name, parts[-1]
-                ):
-                    _remove_quarantine_directory(parent, quarantine.name)
+                if deleted or restored:
+                    _remove_empty_quarantine_directory(parent, quarantine.name)
             finally:
                 os.close(descriptor)
         finally:
@@ -483,10 +528,11 @@ class RootedLocalStorage:
         *,
         active_execution_ids: frozenset[str],
         active_build_executions: frozenset[tuple[str, str]],
-    ) -> None:
+    ) -> StorageSweepStats:
         cutoff_timestamp = cutoff.timestamp()
         root_descriptor = self._duplicate_root()
         prune_candidates: set[tuple[str, str | None]] = set()
+        stats = StorageSweepStats()
         try:
             for directory, directories, filenames, descriptor in os.fwalk(
                 ".", topdown=True, follow_symlinks=False, dir_fd=root_descriptor
@@ -494,6 +540,21 @@ class RootedLocalStorage:
                 safe_directories: list[str] = []
                 for name in directories:
                     status = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                    quarantine_match = _QUARANTINE.fullmatch(name)
+                    if quarantine_match is not None:
+                        _recover_quarantine(
+                            descriptor,
+                            Path(directory),
+                            name,
+                            quarantine_match.group("id"),
+                            cutoff,
+                            referenced_artifact_keys,
+                            active_execution_ids,
+                            active_build_executions,
+                            stats,
+                            prune_candidates,
+                        )
+                        continue
                     if stat.S_ISDIR(status.st_mode) and not stat.S_ISLNK(status.st_mode):
                         safe_directories.append(name)
                 directories[:] = safe_directories
@@ -540,6 +601,7 @@ class RootedLocalStorage:
             _prune_artifact_directories(root_descriptor, prune_candidates)
         finally:
             os.close(root_descriptor)
+        return stats
 
 
 @dataclass(slots=True)
@@ -914,45 +976,47 @@ def _unlink_named(parent: _ParentBinding, name: str) -> None:
 def _quarantine_named(
     parent: _ParentBinding,
     object_name: str,
-    uuid_factory: Callable[[], UUID],
+    metadata: _QuarantineMetadata,
 ) -> _QuarantineBinding | None:
     if parent.descriptor is None:
         raise RuntimeError("safe parent directory handle is unavailable")
-    for _attempt in range(128):
-        quarantine_name = f".wf-quarantine-{uuid_factory()}"
+    quarantine_name = f".wf-quarantine-v1-{metadata.quarantine_id}"
+    os.mkdir(quarantine_name, 0o700, dir_fd=parent.descriptor)
+    quarantine_descriptor = -1
+    moved = False
+    try:
+        quarantine_descriptor = os.open(
+            quarantine_name,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent.descriptor,
+        )
+        _write_quarantine_metadata(quarantine_descriptor, metadata)
+        _fsync_descriptor(quarantine_descriptor)
+        _fsync_parent(parent)
         try:
-            os.mkdir(quarantine_name, 0o700, dir_fd=parent.descriptor)
-        except FileExistsError:
-            continue
-        quarantine_descriptor = -1
-        try:
-            quarantine_descriptor = os.open(
-                quarantine_name,
-                os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
-                dir_fd=parent.descriptor,
+            _rename_no_replace(
+                parent.descriptor,
+                object_name,
+                quarantine_descriptor,
+                object_name,
             )
-            try:
-                os.rename(
-                    object_name,
-                    object_name,
-                    src_dir_fd=parent.descriptor,
-                    dst_dir_fd=quarantine_descriptor,
-                )
-            except FileNotFoundError:
-                os.close(quarantine_descriptor)
-                quarantine_descriptor = -1
-                os.rmdir(quarantine_name, dir_fd=parent.descriptor)
-                _fsync_parent(parent)
-                return None
-            _fsync_parent(parent)
-            _fsync_descriptor(quarantine_descriptor)
-            return _QuarantineBinding(quarantine_name, quarantine_descriptor)
-        except BaseException:
-            if quarantine_descriptor != -1:
-                os.close(quarantine_descriptor)
-            _best_effort(os.rmdir, quarantine_name, dir_fd=parent.descriptor)
-            raise
-    raise RuntimeError("could not allocate a unique compensation quarantine")
+        except FileNotFoundError:
+            os.close(quarantine_descriptor)
+            quarantine_descriptor = -1
+            _remove_empty_quarantine_directory(parent, quarantine_name)
+            return None
+        moved = True
+        _fsync_parent(parent)
+        _fsync_descriptor(quarantine_descriptor)
+        return _QuarantineBinding(quarantine_name, quarantine_descriptor)
+    except BaseException:
+        if quarantine_descriptor != -1:
+            os.close(quarantine_descriptor)
+        if not moved:
+            _best_effort(
+                _remove_empty_quarantine_directory, parent, quarantine_name
+            )
+        raise
 
 
 def _restore_quarantined_no_replace(
@@ -963,51 +1027,388 @@ def _restore_quarantined_no_replace(
     if parent.descriptor is None:
         raise RuntimeError("safe parent directory handle is unavailable")
     try:
-        os.link(
+        _rename_no_replace(
+            quarantine.descriptor,
             object_name,
+            parent.descriptor,
             object_name,
-            src_dir_fd=quarantine.descriptor,
-            dst_dir_fd=parent.descriptor,
-            follow_symlinks=False,
         )
     except FileExistsError as error:
         raise OSError(
             "compensation ownership changed and quarantine could not be restored"
         ) from error
-    os.unlink(object_name, dir_fd=quarantine.descriptor)
     _fsync_descriptor(quarantine.descriptor)
     _fsync_parent(parent)
 
 
-def _quarantine_contains(
-    parent: _ParentBinding, quarantine_name: str, object_name: str
-) -> bool:
-    if parent.descriptor is None:
-        raise RuntimeError("safe parent directory handle is unavailable")
-    quarantine_descriptor = os.open(
-        quarantine_name,
-        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
-        dir_fd=parent.descriptor,
-    )
-    try:
-        try:
-            os.stat(
-                object_name,
-                dir_fd=quarantine_descriptor,
-                follow_symlinks=False,
-            )
-        except FileNotFoundError:
-            return False
-        return True
-    finally:
-        os.close(quarantine_descriptor)
-
-
-def _remove_quarantine_directory(parent: _ParentBinding, name: str) -> None:
+def _remove_empty_quarantine_directory(parent: _ParentBinding, name: str) -> None:
     if parent.descriptor is None:
         raise RuntimeError("safe parent directory handle is unavailable")
     os.rmdir(name, dir_fd=parent.descriptor)
     _fsync_parent(parent)
+
+
+def _require_atomic_no_replace() -> None:
+    symbol, _flag = _atomic_rename_configuration()
+    if getattr(ctypes.CDLL(None), symbol, None) is None:
+        raise RuntimeError("atomic descriptor-relative no-replace rename is unavailable")
+
+
+def _atomic_rename_configuration() -> tuple[str, int]:
+    if sys.platform == "darwin":
+        return "renameatx_np", 0x00000004
+    if sys.platform.startswith("linux"):
+        return "renameat2", 1
+    raise RuntimeError("atomic descriptor-relative no-replace rename is unavailable")
+
+
+def _rename_no_replace(
+    source_parent: int,
+    source: str,
+    destination_parent: int,
+    destination: str,
+) -> None:
+    symbol, flag = _atomic_rename_configuration()
+    library = ctypes.CDLL(None, use_errno=True)
+    function = getattr(library, symbol, None)
+    if function is None:
+        raise RuntimeError("atomic descriptor-relative no-replace rename is unavailable")
+    function.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    function.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    if (
+        function(
+            source_parent,
+            os.fsencode(source),
+            destination_parent,
+            os.fsencode(destination),
+            flag,
+        )
+        != 0
+    ):
+        number = ctypes.get_errno()
+        raise OSError(number, os.strerror(number), source)
+
+
+def _write_quarantine_metadata(
+    descriptor: int, metadata: _QuarantineMetadata
+) -> None:
+    payload = json.dumps(
+        {
+            "schemaVersion": 1,
+            "quarantineId": metadata.quarantine_id,
+            "objectKey": metadata.object_key,
+            "originalName": metadata.original_name,
+            "expectedSha256": metadata.expected_sha256,
+            "ownerExecutionId": metadata.owner_execution_id,
+            "createdAt": metadata.created_at.isoformat(timespec="microseconds"),
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    if len(payload) > _MAX_QUARANTINE_METADATA_BYTES:
+        raise ValueError("quarantine metadata exceeds its byte limit")
+    _set_descriptor_xattr(descriptor, _QUARANTINE_XATTR, payload)
+
+
+def _read_quarantine_metadata(
+    descriptor: int, expected_id: str
+) -> _QuarantineMetadata | None:
+    payload = _get_descriptor_xattr(descriptor, _QUARANTINE_XATTR)
+    if payload is None:
+        return None
+    if len(payload) > _MAX_QUARANTINE_METADATA_BYTES:
+        raise ValueError("quarantine metadata exceeds its byte limit")
+    try:
+        parsed = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("quarantine metadata is malformed") from error
+    expected_keys = {
+        "schemaVersion",
+        "quarantineId",
+        "objectKey",
+        "originalName",
+        "expectedSha256",
+        "ownerExecutionId",
+        "createdAt",
+    }
+    if not isinstance(parsed, dict) or set(parsed) != expected_keys:
+        raise ValueError("quarantine metadata shape is invalid")
+    if parsed["schemaVersion"] != 1 or parsed["quarantineId"] != expected_id:
+        raise ValueError("quarantine metadata identity is invalid")
+    object_key = parsed["objectKey"]
+    original_name = parsed["originalName"]
+    expected_sha256 = parsed["expectedSha256"]
+    owner = parsed["ownerExecutionId"]
+    created = parsed["createdAt"]
+    if not isinstance(object_key, str):
+        raise ValueError("quarantine object key is invalid")
+    parts = _object_key_parts(object_key)
+    if not isinstance(original_name, str) or parts[-1] != original_name:
+        raise ValueError("quarantine original name is invalid")
+    if not isinstance(expected_sha256, str) or re.fullmatch(
+        r"[0-9a-f]{64}", expected_sha256
+    ) is None:
+        raise ValueError("quarantine digest is invalid")
+    if owner is not None:
+        if not isinstance(owner, str):
+            raise ValueError("quarantine execution owner is invalid")
+        owner = str(UUID(owner))
+    if not isinstance(created, str):
+        raise ValueError("quarantine creation time is invalid")
+    try:
+        created_at = datetime.fromisoformat(created)
+    except ValueError as error:
+        raise ValueError("quarantine creation time is invalid") from error
+    return _QuarantineMetadata(
+        quarantine_id=expected_id,
+        object_key=object_key,
+        original_name=original_name,
+        expected_sha256=expected_sha256,
+        owner_execution_id=owner,
+        created_at=created_at,
+    )
+
+
+def _set_descriptor_xattr(descriptor: int, name: bytes, value: bytes) -> None:
+    library = ctypes.CDLL(None, use_errno=True)
+    function = getattr(library, "fsetxattr", None)
+    if function is None:
+        raise RuntimeError("durable quarantine metadata is unavailable")
+    buffer = ctypes.create_string_buffer(value)
+    pointer = ctypes.cast(buffer, ctypes.c_void_p)
+    if sys.platform == "darwin":
+        function.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_uint32,
+            ctypes.c_int,
+        ]
+        arguments: tuple[Any, ...] = (
+            descriptor,
+            name,
+            pointer,
+            len(value),
+            0,
+            0x0002,
+        )
+    else:
+        function.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+        ]
+        arguments = (descriptor, name, pointer, len(value), 1)
+    function.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    if function(*arguments) != 0:
+        number = ctypes.get_errno()
+        raise OSError(number, os.strerror(number))
+
+
+def _get_descriptor_xattr(descriptor: int, name: bytes) -> bytes | None:
+    library = ctypes.CDLL(None, use_errno=True)
+    function = getattr(library, "fgetxattr", None)
+    if function is None:
+        raise RuntimeError("durable quarantine metadata is unavailable")
+    if sys.platform == "darwin":
+        function.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_uint32,
+            ctypes.c_int,
+        ]
+        suffix: tuple[int, ...] = (0, 0)
+    else:
+        function.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+        ]
+        suffix = ()
+    function.restype = ctypes.c_ssize_t
+    ctypes.set_errno(0)
+    size = function(descriptor, name, None, 0, *suffix)
+    if size < 0:
+        number = ctypes.get_errno()
+        missing = {getattr(errno, "ENODATA", -1), getattr(errno, "ENOATTR", 93)}
+        if number in missing:
+            return None
+        raise OSError(number, os.strerror(number))
+    if size > _MAX_QUARANTINE_METADATA_BYTES:
+        raise ValueError("quarantine metadata exceeds its byte limit")
+    buffer = ctypes.create_string_buffer(size)
+    ctypes.set_errno(0)
+    observed = function(descriptor, name, buffer, size, *suffix)
+    if observed < 0:
+        number = ctypes.get_errno()
+        raise OSError(number, os.strerror(number))
+    return bytes(buffer.raw[:observed])
+
+
+def _recover_quarantine(
+    parent_descriptor: int,
+    relative_directory: Path,
+    quarantine_name: str,
+    quarantine_id: str,
+    cutoff: datetime,
+    referenced_artifact_keys: frozenset[str],
+    active_execution_ids: frozenset[str],
+    active_build_executions: frozenset[tuple[str, str]],
+    stats: StorageSweepStats,
+    prune_candidates: set[tuple[str, str | None]],
+) -> None:
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(quarantine_name, flags, dir_fd=parent_descriptor)
+    except OSError:
+        stats.invalid_quarantines += 1
+        return None
+    remove_empty = False
+    metadata: _QuarantineMetadata | None = None
+    restored = False
+    try:
+        try:
+            metadata = _read_quarantine_metadata(descriptor, quarantine_id)
+        except (OSError, RuntimeError, ValueError):
+            stats.invalid_quarantines += 1
+            metadata = None
+        status = os.fstat(descriptor)
+        if metadata is None:
+            if status.st_mtime <= cutoff.timestamp() and _descriptor_directory_empty(
+                descriptor
+            ):
+                remove_empty = True
+            return None
+        expected_parent = Path(*_object_key_parts(metadata.object_key)[:-1])
+        observed_parent = Path(
+            relative_directory.as_posix().removeprefix("./") or "."
+        )
+        if expected_parent != observed_parent:
+            stats.invalid_quarantines += 1
+            return None
+        if metadata.created_at.timestamp() > cutoff.timestamp():
+            return None
+        artifact = _GENERATED_ARTIFACT.fullmatch(metadata.object_key)
+        active_build = (
+            artifact is not None
+            and artifact.group("owner") is not None
+            and (artifact.group("task"), artifact.group("owner"))
+            in active_build_executions
+        )
+        if (
+            metadata.object_key in referenced_artifact_keys
+            or metadata.owner_execution_id in active_execution_ids
+            or active_build
+        ):
+            stats.quarantines_protected += 1
+            return None
+        try:
+            payload_descriptor = os.open(
+                metadata.original_name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=descriptor,
+            )
+        except FileNotFoundError:
+            if _descriptor_directory_empty(descriptor):
+                remove_empty = True
+            else:
+                stats.invalid_quarantines += 1
+            return None
+        try:
+            before = os.fstat(payload_descriptor)
+            digest = _hash_descriptor(payload_descriptor)
+            after = os.fstat(payload_descriptor)
+            _require_same_regular(before, after)
+            named = os.stat(
+                metadata.original_name,
+                dir_fd=descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(named.st_mode)
+                or _identity(named) != _identity(after)
+                or digest != metadata.expected_sha256
+            ):
+                stats.quarantine_conflicts += 1
+                return None
+        finally:
+            os.close(payload_descriptor)
+        try:
+            _rename_no_replace(
+                descriptor,
+                metadata.original_name,
+                parent_descriptor,
+                metadata.original_name,
+            )
+        except FileExistsError:
+            stats.quarantine_conflicts += 1
+            return None
+        _fsync_descriptor(descriptor)
+        _fsync_descriptor(parent_descriptor)
+        restored = True
+        remove_empty = True
+        stats.quarantines_restored += 1
+        return None
+    finally:
+        os.close(descriptor)
+        if remove_empty:
+            try:
+                os.rmdir(quarantine_name, dir_fd=parent_descriptor)
+            except OSError as error:
+                if error.errno in {errno.ENOTEMPTY, errno.EEXIST}:
+                    stats.quarantine_conflicts += 1
+                elif error.errno != errno.ENOENT:
+                    stats.invalid_quarantines += 1
+            else:
+                _fsync_descriptor(parent_descriptor)
+                if not restored:
+                    stats.empty_quarantines_removed += 1
+                    candidate = _quarantine_prune_candidate(
+                        relative_directory, metadata
+                    )
+                    if candidate is not None:
+                        prune_candidates.add(candidate)
+
+
+def _quarantine_prune_candidate(
+    relative_directory: Path, metadata: _QuarantineMetadata | None
+) -> tuple[str, str] | None:
+    if metadata is not None:
+        artifact = _GENERATED_ARTIFACT.fullmatch(metadata.object_key)
+        if artifact is not None and artifact.group("owner") is not None:
+            return artifact.group("task"), artifact.group("owner")
+    parts = tuple(
+        part
+        for part in relative_directory.as_posix().removeprefix("./").split("/")
+        if part
+    )
+    if len(parts) != 3 or parts[0] != "artifacts":
+        return None
+    if re.fullmatch(_UUID_PATTERN, parts[1]) is None or re.fullmatch(
+        _UUID_PATTERN, parts[2]
+    ) is None:
+        return None
+    return parts[1], parts[2]
+
+
+def _descriptor_directory_empty(descriptor: int) -> bool:
+    with os.scandir(descriptor) as entries:
+        return next(entries, None) is None
 
 
 def _fsync_parent(parent: _ParentBinding) -> None:

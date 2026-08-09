@@ -16,8 +16,6 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
-import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
 
 class LocalFileStorageTest {
   @TempDir Path tempDir;
@@ -260,215 +258,69 @@ class LocalFileStorageTest {
   }
 
   @Test
-  void defaultProviderCompletesPutAndOpen() throws Exception {
+  void defaultProviderEitherProvidesCompleteSemanticsOrPreventsStartup() throws Exception {
     Path root = Files.createDirectory(tempDir.resolve("default-provider-root"));
     String key = "users/user-id/requirements/file-id/original.txt";
     byte[] content = "requests==2.32.4\n".getBytes(UTF_8);
+
+    boolean secure;
+    try (DirectoryStream<Path> opened = Files.newDirectoryStream(root)) {
+      secure = opened instanceof java.nio.file.SecureDirectoryStream<?>;
+    }
+    if (!secure) {
+      assertThatThrownBy(() -> new LocalFileStorage(root.toAbsolutePath()))
+          .isInstanceOf(LocalFileStorage.StorageException.class)
+          .hasMessageContaining("complete storage semantics");
+      return;
+    }
 
     try (var storage = new LocalFileStorage(root.toAbsolutePath())) {
       storage.putAtomically(key, new ByteArrayInputStream(content), content.length);
 
       assertThat(storage.open(key).readAllBytes()).isEqualTo(content);
 
-      assertThat(root.resolve(key)).hasBinaryContent(content);
+      storage.deleteIfExists(key);
+
+      assertThat(root.resolve(key)).doesNotExist();
     }
   }
 
   @Test
-  void fallsBackWhenTheProviderDoesNotExposeASecureDirectoryStream() throws Exception {
+  void rejectsProviderWithoutCompleteStorageSemanticsBeforeCreatingObjects() throws Exception {
     Path root = Files.createDirectory(tempDir.resolve("root"));
-    String key = "users/user-id/requirements/file-id/original.txt";
-    byte[] content = "fallback-content".getBytes(UTF_8);
+    assertThatThrownBy(() -> ordinaryStorage(root))
+        .isInstanceOf(LocalFileStorage.StorageException.class)
+        .hasMessageContaining("SecureDirectoryStream")
+        .hasMessageContaining("complete storage semantics");
 
-    try (var storage = ordinaryStorage(root)) {
-      storage.putAtomically(key, new ByteArrayInputStream(content), content.length);
-      assertThat(storage.open(key).readAllBytes()).isEqualTo(content);
-
-      assertThatThrownBy(() -> storage.deleteIfExists(key))
-          .isInstanceOf(LocalFileStorage.StorageException.class)
-          .hasMessageContaining("safe deletion");
-      assertThat(root.resolve(key)).hasBinaryContent(content);
+    try (var entries = Files.list(root)) {
+      assertThat(entries).isEmpty();
     }
   }
 
   @Test
-  void portableArtifactDeletePrunesOnlyEmptyGeneratedDirectories() throws Exception {
-    Path root = Files.createDirectory(tempDir.resolve("portable-prune-root"));
-    String task = "20000000-0000-4000-8000-000000000031";
-    String execution = "10000000-0000-4000-8000-000000000031";
-    String key =
-        "artifacts/" + task + "/" + execution + "/30000000-0000-4000-8000-000000000031.zip";
+  void portableBackendRefusesMutationBeforeReadingInputOrCreatingTemporaryFiles() throws Exception {
+    Path root = Files.createDirectory(tempDir.resolve("portable-root"));
+    var backend = new PortableFileStorageBackend(root.toRealPath());
+    boolean[] inputRead = {false};
+    InputStream input =
+        new ByteArrayInputStream("must-not-be-read".getBytes(UTF_8)) {
+          @Override
+          public synchronized int read(byte[] bytes, int offset, int length) {
+            inputRead[0] = true;
+            return super.read(bytes, offset, length);
+          }
+        };
 
-    try (var storage = ordinaryStorage(root)) {
-      storage.putAtomically(key, new ByteArrayInputStream(new byte[] {1}), 1);
-
-      assertThatThrownBy(() -> storage.deleteIfExists(key))
-          .isInstanceOf(LocalFileStorage.StorageException.class)
-          .hasMessageContaining("safe deletion");
-
-      assertThat(root.resolve(key)).hasBinaryContent(new byte[] {1});
-      assertThat(root.resolve("artifacts").resolve(task).resolve(execution)).isDirectory();
-      assertThat(root.resolve("artifacts").resolve(task)).isDirectory();
-      assertThat(root.resolve("artifacts")).isDirectory();
-    }
-  }
-
-  @Test
-  void portableArtifactDeletePreservesBarrierControlledConcurrentSibling() throws Exception {
-    Path root = Files.createDirectory(tempDir.resolve("portable-concurrent-root"));
-    String task = "20000000-0000-4000-8000-000000000032";
-    String execution = "10000000-0000-4000-8000-000000000032";
-    String first =
-        "artifacts/" + task + "/" + execution + "/30000000-0000-4000-8000-000000000032.zip";
-    String sibling =
-        "artifacts/" + task + "/" + execution + "/30000000-0000-4000-8000-000000000033.zip";
-    var stream = new BlockingInputStream(new byte[] {2});
-    var executor = Executors.newSingleThreadExecutor();
-
-    try (var storage = ordinaryStorage(root)) {
-      storage.putAtomically(first, new ByteArrayInputStream(new byte[] {1}), 1);
-      var publication = executor.submit(() -> storage.putAtomically(sibling, stream, 1));
-      assertThat(stream.readStarted.await(5, TimeUnit.SECONDS)).isTrue();
-
-      assertThatThrownBy(() -> storage.deleteIfExists(first))
-          .isInstanceOf(LocalFileStorage.StorageException.class)
-          .hasMessageContaining("safe deletion");
-      assertThat(root.resolve("artifacts").resolve(task).resolve(execution)).isDirectory();
-
-      stream.continueRead.countDown();
-      assertThat(publication.get(5, TimeUnit.SECONDS).key()).isEqualTo(sibling);
-      assertThat(storage.open(first).readAllBytes()).containsExactly(1);
-      assertThat(storage.open(sibling).readAllBytes()).containsExactly(2);
-      assertThat(root.resolve("artifacts").resolve(task).resolve(execution)).isDirectory();
-      assertThat(root.resolve("artifacts").resolve(task)).isDirectory();
-    } finally {
-      stream.continueRead.countDown();
-      executor.shutdownNow();
-      assertThat(executor.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
-    }
-  }
-
-  @Test
-  void portableDeleteDoesNotPruneDirectoriesForNoncanonicalArtifactKey() throws Exception {
-    Path root = Files.createDirectory(tempDir.resolve("portable-noncanonical-root"));
-    String key =
-        "artifacts/not-a-task/10000000-0000-4000-8000-000000000034/"
-            + "30000000-0000-4000-8000-000000000034.zip";
-
-    try (var storage = ordinaryStorage(root)) {
-      storage.putAtomically(key, new ByteArrayInputStream(new byte[] {1}), 1);
-      assertThatThrownBy(() -> storage.deleteIfExists(key))
-          .isInstanceOf(LocalFileStorage.StorageException.class)
-          .hasMessageContaining("safe deletion");
-
-      assertThat(root.resolve(key)).hasBinaryContent(new byte[] {1});
-      assertThat(root.resolve("artifacts/not-a-task/10000000-0000-4000-8000-000000000034"))
-          .isDirectory();
-      assertThat(root.resolve("artifacts/not-a-task")).isDirectory();
-    }
-  }
-
-  @ParameterizedTest
-  @ValueSource(strings = {"leaf", "execution", "task", "artifacts"})
-  void portableDeleteFailsClosedAfterDeterministicPathReplacement(String boundary)
-      throws Exception {
-    Path root = Files.createDirectory(tempDir.resolve("portable-race-" + boundary));
-    String task = "20000000-0000-4000-8000-000000000041";
-    String execution = "10000000-0000-4000-8000-000000000041";
-    String artifact = "30000000-0000-4000-8000-000000000041.zip";
-    String key = "artifacts/" + task + "/" + execution + "/" + artifact;
-    Path object = root.resolve(key);
-
-    try (var storage = ordinaryStorage(root)) {
-      storage.putAtomically(key, new ByteArrayInputStream("owned".getBytes(UTF_8)), 5);
-      Path retainedObject;
-      Path replacementObject;
-      if (boundary.equals("leaf")) {
-        retainedObject = root.resolve("retained-leaf.zip");
-        Files.move(object, retainedObject);
-        replacementObject = Files.writeString(object, "replacement");
-      } else if (boundary.equals("execution")) {
-        Path retained = root.resolve("retained-execution");
-        Files.move(object.getParent(), retained);
-        retainedObject = retained.resolve(artifact);
-        Files.createDirectories(object.getParent());
-        replacementObject = Files.writeString(object, "replacement");
-      } else if (boundary.equals("task")) {
-        Path retained = root.resolve("retained-task");
-        Files.move(object.getParent().getParent(), retained);
-        retainedObject = retained.resolve(execution).resolve(artifact);
-        Files.createDirectories(object.getParent());
-        replacementObject = Files.writeString(object, "replacement");
-      } else {
-        Path retained = root.resolve("retained-artifacts");
-        Files.move(root.resolve("artifacts"), retained);
-        retainedObject = retained.resolve(task).resolve(execution).resolve(artifact);
-        Path outside = Files.createDirectory(tempDir.resolve("portable-outside-artifacts"));
-        replacementObject = outside.resolve(task).resolve(execution).resolve(artifact);
-        Files.createDirectories(replacementObject.getParent());
-        Files.writeString(replacementObject, "outside-replacement");
-        Files.createSymbolicLink(root.resolve("artifacts"), outside);
-      }
-
-      assertThatThrownBy(() -> storage.deleteIfExists(key))
-          .isInstanceOf(LocalFileStorage.StorageException.class)
-          .hasMessageContaining("safe deletion");
-      assertThat(retainedObject).hasContent("owned");
-      assertThat(replacementObject).exists();
-    }
-  }
-
-  @Test
-  void fallbackRejectsEscapingKeysAndStaticSymlinkParents() throws Exception {
-    Path root = Files.createDirectory(tempDir.resolve("fallback-root"));
-    Path outside = Files.createDirectory(tempDir.resolve("fallback-outside"));
-    Files.createSymbolicLink(root.resolve("users"), outside);
-
-    try (var storage = ordinaryStorage(root)) {
-      assertThatThrownBy(
-              () ->
-                  storage.putAtomically(
-                      "../outside.txt", new ByteArrayInputStream(new byte[] {1}), 1))
-          .isInstanceOf(IllegalArgumentException.class);
-      assertThatThrownBy(
-              () ->
-                  storage.putAtomically(
-                      "users/./original.txt", new ByteArrayInputStream(new byte[] {1}), 1))
-          .isInstanceOf(IllegalArgumentException.class);
-      assertThatThrownBy(
-              () ->
-                  storage.putAtomically(
-                      "users/nested/original.txt", new ByteArrayInputStream(new byte[] {1}), 1))
-          .isInstanceOf(IllegalArgumentException.class);
-    }
-
-    assertThat(outside.resolve("nested")).doesNotExist();
-  }
-
-  @Test
-  void fallbackRejectsSymbolicLinkObjects() throws Exception {
-    Path root = Files.createDirectory(tempDir.resolve("fallback-object-root"));
-    String key = "users/user-id/requirements/file-id/original.txt";
-    Path object = root.resolve(key);
-    Files.createDirectories(object.getParent());
-    Path outside = Files.writeString(tempDir.resolve("outside-object.txt"), "must remain");
-    Files.createSymbolicLink(object, outside);
-
-    try (var storage = ordinaryStorage(root)) {
-      assertThatThrownBy(() -> storage.open(key)).isInstanceOf(IllegalArgumentException.class);
-      assertThatThrownBy(() -> storage.deleteIfExists(key))
-          .isInstanceOf(LocalFileStorage.StorageException.class)
-          .hasMessageContaining("safe deletion");
-      assertThatThrownBy(
-              () ->
-                  storage.putAtomically(
-                      key, new ByteArrayInputStream("replacement".getBytes(UTF_8)), 11))
-          .isInstanceOf(IllegalArgumentException.class);
-    }
-
-    assertThat(outside).hasContent("must remain");
-    try (var files = Files.list(object.getParent())) {
-      assertThat(files.map(path -> path.getFileName().toString())).containsExactly("original.txt");
+    assertThatThrownBy(() -> backend.putAtomically("objects/probe.bin", input, 16))
+        .isInstanceOf(LocalFileStorage.StorageException.class)
+        .hasMessageContaining("complete storage semantics");
+    assertThat(inputRead[0]).isFalse();
+    assertThatThrownBy(() -> backend.deleteIfExists("objects/probe.bin"))
+        .isInstanceOf(LocalFileStorage.StorageException.class)
+        .hasMessageContaining("complete storage semantics");
+    try (var entries = Files.list(root)) {
+      assertThat(entries).isEmpty();
     }
   }
 

@@ -483,6 +483,7 @@ class JobPipeline:
             return PipelineResult(BuildStatus.FAILED, None)
         owned_workspace = self._workspaces.allocate(lease.execution_id)
         published = None
+        validation_snapshots: tuple[object, ...] = ()
         try:
             payload_target = payload.target_snapshot.model_dump(by_alias=True)
             if (
@@ -563,6 +564,7 @@ class JobPipeline:
                     owned_workspace.capability,
                 ),
             )
+            validation_snapshots = _validation_snapshots(validation.wheels)
             validation = BuildValidation(
                 validation.wheels,
                 validation.report,
@@ -684,6 +686,9 @@ class JobPipeline:
                 BuildStatus.QUEUED if queued else BuildStatus.FAILED, None
             )
         finally:
+            _best_effort_cleanup(
+                lambda: _close_validation_snapshots(validation_snapshots)
+            )
             _best_effort_cleanup(owned_workspace.cleanup)
 
     def _cancel_if_requested(self, lease: JobLease) -> PipelineResult | None:
@@ -752,3 +757,28 @@ def _best_effort_cleanup(operation: Callable[[], object]) -> None:
     except Exception:
         # Generated storage/workspace entries are covered by startup maintenance.
         pass
+
+
+def _validation_snapshots(wheels: tuple[ValidatedWheel, ...]) -> tuple[object, ...]:
+    snapshots: list[object] = []
+    identities: set[int] = set()
+    for wheel in wheels:
+        snapshot = getattr(wheel.report, "snapshot", None)
+        if snapshot is None or not callable(getattr(snapshot, "close", None)):
+            continue
+        if id(snapshot) in identities:
+            continue
+        identities.add(id(snapshot))
+        snapshots.append(snapshot)
+    return tuple(snapshots)
+
+
+def _close_validation_snapshots(snapshots: tuple[object, ...]) -> None:
+    first_error: Exception | None = None
+    for snapshot in snapshots:
+        try:
+            snapshot.close()  # type: ignore[attr-defined]
+        except Exception as error:
+            first_error = first_error or error
+    if first_error is not None:
+        raise first_error

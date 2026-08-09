@@ -89,51 +89,22 @@ class _DescriptorSnapshotBinding:
                 "validated Wheel snapshot cannot be opened"
             ) from error
 
-    def cleanup(self, expected_identity: tuple[int, int]) -> None:
-        if self.directory_descriptor is None or self.parent_descriptor is None:
-            return
-        try:
-            current = os.stat(
-                self.filename,
-                dir_fd=self.directory_descriptor,
-                follow_symlinks=False,
-            )
-        except FileNotFoundError:
-            current = None
-        except OSError as error:
-            raise UnsafeWheelArchive(
-                "validated Wheel snapshot cannot be inspected"
-            ) from error
-        if current is not None:
-            if (
-                not stat.S_ISREG(current.st_mode)
-                or stat.S_ISLNK(current.st_mode)
-                or (current.st_dev, current.st_ino) != expected_identity
-            ):
-                raise UnsafeWheelArchive("validated Wheel snapshot identity changed")
-            try:
-                os.unlink(self.filename, dir_fd=self.directory_descriptor)
-                _fsync_directory(self.directory_descriptor)
-            except OSError as error:
-                raise UnsafeWheelArchive(
-                    "validated Wheel snapshot cannot be removed"
-                ) from error
-        directory_descriptor = self.directory_descriptor
+    def close(self) -> None:
+        descriptors = (self.directory_descriptor, self.parent_descriptor)
         self.directory_descriptor = None
-        os.close(directory_descriptor)
-        try:
-            os.rmdir(self.directory_name, dir_fd=self.parent_descriptor)
-            _fsync_directory(self.parent_descriptor)
-        except FileNotFoundError:
-            pass
-        except OSError as error:
+        self.parent_descriptor = None
+        first_error: OSError | None = None
+        for descriptor in descriptors:
+            if descriptor is None:
+                continue
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                first_error = first_error or error
+        if first_error is not None:
             raise UnsafeWheelArchive(
-                "validated Wheel snapshot directory cannot be removed"
-            ) from error
-        finally:
-            parent_descriptor = self.parent_descriptor
-            self.parent_descriptor = None
-            os.close(parent_descriptor)
+                "validated Wheel snapshot descriptors could not be closed"
+            ) from first_error
 
 
 def _close_snapshot_revalidation_resource(
@@ -254,9 +225,9 @@ class ValidatedWheelSnapshot:
             raise
 
     def cleanup(self) -> None:
-        """Delete this snapshot only while its recorded identity is still present."""
+        """Release a bound snapshot or remove a legacy path-backed snapshot."""
         if self._binding is not None:
-            self._binding.cleanup((self._device, self._inode))
+            self._binding.close()
             return
         try:
             current = self.path.lstat()
@@ -276,6 +247,10 @@ class ValidatedWheelSnapshot:
         except OSError as error:
             raise UnsafeWheelArchive("validated Wheel snapshot cannot be removed") from error
         _remove_empty_snapshot_directory(self._directory)
+
+    def close(self) -> None:
+        """Release retained snapshot descriptors; repeated calls are harmless."""
+        self.cleanup()
 
 
 @dataclass(frozen=True, slots=True)
@@ -675,17 +650,8 @@ def _create_bound_snapshot_from_descriptors(
         if snapshot_descriptor != -1:
             os.close(snapshot_descriptor)
         if directory_descriptor != -1:
-            try:
-                os.unlink(expected.filename, dir_fd=directory_descriptor)
-            except OSError:
-                pass
             os.close(directory_descriptor)
         if parent_descriptor != -1:
-            if directory_name is not None:
-                try:
-                    os.rmdir(directory_name, dir_fd=parent_descriptor)
-                except OSError:
-                    pass
             os.close(parent_descriptor)
 
 
