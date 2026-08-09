@@ -8,7 +8,7 @@ import pytest
 
 from wheelforge_worker.jobs.maintenance import MaintenanceService, MaintenanceSnapshot
 from wheelforge_worker.jobs.storage import RootedLocalStorage, WorkspaceManager
-from wheelforge_worker.jobs.storage import StorageSweepStats
+from wheelforge_worker.jobs.storage import StorageSweepStats, WorkspaceSweepStats
 
 
 NOW = datetime(2026, 8, 1, 8, 0, 0)
@@ -235,6 +235,9 @@ def test_maintenance_publishes_bounded_stats_and_rate_limits_operational_signal(
             quarantines_examined=5,
             bytes_hashed=128,
             budget_exhausted=True,
+            queue_record_bytes=4096,
+            queue_segments=3,
+            queue_capacity_events=1,
         )
 
     storage.sweep_abandoned = sweep  # type: ignore[method-assign]
@@ -256,4 +259,118 @@ def test_maintenance_publishes_bounded_stats_and_rate_limits_operational_signal(
     assert vars(summary) if not hasattr(summary, "__slots__") else True
     assert summary.quarantine_conflicts == 2  # type: ignore[attr-defined]
     assert summary.invalid_quarantines == 3  # type: ignore[attr-defined]
+    assert summary.data_queue_record_bytes == 4096  # type: ignore[attr-defined]
+    assert summary.data_queue_segments == 3  # type: ignore[attr-defined]
+    assert summary.data_queue_capacity_events == 1  # type: ignore[attr-defined]
     assert len(repr(summary)) <= 512
+
+
+def test_workspace_queue_capacity_produces_a_rate_limited_signal(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "data"
+    workspace_root = tmp_path / "workspace"
+    data_root.mkdir()
+    workspace_root.mkdir()
+    storage = RootedLocalStorage(data_root)
+    workspaces = WorkspaceManager(workspace_root)
+    signals: list[object] = []
+
+    storage.sweep_abandoned = (  # type: ignore[method-assign]
+        lambda *_args, **_kwargs: StorageSweepStats()
+    )
+    workspaces.sweep_abandoned = (  # type: ignore[method-assign]
+        lambda *_args, **_kwargs: WorkspaceSweepStats(
+            queue_record_bytes=8192,
+            queue_segments=4,
+            queue_capacity_events=2,
+        )
+    )
+
+    summary = MaintenanceService(
+        SnapshotRepository(),
+        storage,
+        workspaces,
+        minimum_age=timedelta(hours=1),
+        clock=lambda: NOW,
+        operational_signal=signals.append,
+    ).run()
+
+    assert summary.workspace_queue_record_bytes == 8192
+    assert summary.workspace_queue_segments == 4
+    assert summary.workspace_queue_capacity_events == 2
+    assert signals == [summary]
+
+
+def test_maintenance_summary_combines_bounded_data_and_workspace_progress(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "data"
+    workspace_root = tmp_path / "workspace"
+    data_root.mkdir()
+    workspace_root.mkdir()
+    storage = RootedLocalStorage(data_root)
+    workspaces = WorkspaceManager(workspace_root)
+    signals: list[object] = []
+    storage.sweep_abandoned = lambda *_args, **_kwargs: StorageSweepStats(  # type: ignore[method-assign]
+        lock_contended=True,
+        budget_exhausted=True,
+        backlog_entries=7,
+        oversized_quarantines=2,
+        quarantines_held=3,
+    )
+    workspaces.sweep_abandoned = lambda *_args, **_kwargs: WorkspaceSweepStats(  # type: ignore[method-assign]
+        budget_exhausted=True,
+        progress_made=False,
+        backlog_entries=5,
+        workspaces_held=1,
+    )
+    service = MaintenanceService(
+        SnapshotRepository(),
+        storage,
+        workspaces,
+        minimum_age=timedelta(hours=1),
+        operational_signal=signals.append,
+        clock=lambda: NOW,
+    )
+
+    first = service.run()
+    second = service.run()
+
+    assert first.data_lock_contended
+    assert first.data_backlog_entries == 7
+    assert first.workspace_backlog_entries == 5
+    assert first.oversized_quarantines == 2
+    assert first.quarantines_held == 3
+    assert first.workspaces_held == 1
+    assert first.budget_exhausted and second.budget_exhausted
+    assert len(signals) == 1
+    assert len(repr(first)) <= 768
+
+
+def test_persistent_budget_exhaustion_without_progress_is_rate_limited(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "data"
+    workspace_root = tmp_path / "workspace"
+    data_root.mkdir()
+    workspace_root.mkdir()
+    storage = RootedLocalStorage(data_root)
+    workspaces = WorkspaceManager(workspace_root)
+    signals: list[object] = []
+    storage.sweep_abandoned = lambda *_args, **_kwargs: StorageSweepStats(  # type: ignore[method-assign]
+        budget_exhausted=True, backlog_entries=4, progress_made=False
+    )
+    workspaces.sweep_abandoned = lambda *_args, **_kwargs: WorkspaceSweepStats()  # type: ignore[method-assign]
+    service = MaintenanceService(
+        SnapshotRepository(), storage, workspaces,
+        minimum_age=timedelta(hours=1),
+        operational_signal=signals.append,
+        clock=lambda: NOW,
+    )
+
+    service.run()
+    service.run()
+    service.run()
+
+    assert len(signals) == 1

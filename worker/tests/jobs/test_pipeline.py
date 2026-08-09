@@ -872,7 +872,8 @@ def test_successful_build_publishes_artifact_and_terminal_states(
         f"artifacts/{lease.subject_id}/{lease.execution_id}/{result.artifact_id}.zip"
     )
     assert artifact.sha256 == hashlib.sha256(b"verified zip bytes").hexdigest()
-    assert list(workspaces.root.iterdir()) == []
+    assert not list(workspaces.root.glob("wf-execution-*"))
+    assert not list(workspaces.root.glob(".wf-retired-v1-*"))
 
 
 @pytest.mark.parametrize("replacement_stage", ["resolve", "download", "package"])
@@ -1104,7 +1105,8 @@ def test_cancellation_at_each_publication_boundary_never_leaves_artifact(
         artifact_directory / lease.subject_id / lease.execution_id
     ).exists()
     assert not (artifact_directory / lease.subject_id).exists()
-    assert list(workspaces.root.iterdir()) == []
+    assert not list(workspaces.root.glob("wf-execution-*"))
+    assert not list(workspaces.root.glob(".wf-retired-v1-*"))
 
 
 class RollbackRepository(JobRepository):

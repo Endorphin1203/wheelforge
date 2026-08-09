@@ -87,6 +87,8 @@ class JobConsumer:
                     self._maintenance_error(message)
                 except Exception:
                     _LOGGER.exception("maintenance error reporting failed")
+                if processed:
+                    continue
                 if self._wait(float(self._poll_seconds)):
                     return
                 continue

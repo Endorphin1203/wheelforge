@@ -13,11 +13,13 @@ import time
 import threading
 from contextlib import contextmanager
 from collections.abc import Callable
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, BinaryIO
 from uuid import UUID, uuid4
+
+from . import segmented_queue as _segmented_queue
 
 
 _DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
@@ -27,23 +29,51 @@ _GENERATED_STAGE = re.compile(
     rf"\.wf-stage-(?:(?P<owner>{_UUID_PATTERN})-)?{_UUID_PATTERN}\Z"
 )
 _GENERATED_WORKSPACE = re.compile(rf"wf-execution-({_UUID_PATTERN})\Z")
+_RETIRED_WORKSPACE = re.compile(rf"\.wf-retired-v1-({_UUID_PATTERN})\Z")
 _GENERATED_ARTIFACT = re.compile(
     rf"artifacts/(?P<task>{_UUID_PATTERN})/"
     rf"(?:(?P<owner>{_UUID_PATTERN})/)?{_UUID_PATTERN}\.zip\Z"
 )
 _QUARANTINE = re.compile(rf"\.wf-quarantine-v1-(?P<id>{_UUID_PATTERN})\Z")
 _QUARANTINE_XATTR = b"user.wheelforge.quarantine-v1"
-_SWEEP_XATTR = b"user.wheelforge.sweep-v1"
+_LEGACY_QUARANTINE_STATE_XATTR = b"user.wheelforge.legacy-quarantine-v1"
+_LEGACY_MIGRATION_STATE_XATTR = b"user.wheelforge.legacy-migration-v1"
+_LEGACY_MIGRATION_COMPLETE = b"complete"
+_LEGACY_MIGRATION_HELD_LIMIT = b"held-limit"
+_WORKSPACE_SWEEP_XATTR = b"user.wheelforge.workspace-sweep-v1"
+_QUEUE_ROOT = ".wf-maintenance-v2"
+_WORKSPACE_QUEUE_ROOT = ".wf-workspace-maint-v2"
+_QUEUE_STATE_XATTR = b"user.wheelforge.queue-v2"
+_QUEUE_RECORD_MAX_BYTES = 8192
+_QUEUE_SEGMENT_SIZE = 128
+_QUEUE_MAX_SEGMENTS = 32
+_QUEUE_MAX_RECORDS = _QUEUE_SEGMENT_SIZE * _QUEUE_MAX_SEGMENTS
+_QUEUE_MAX_RECORD_BYTES = 16 * 1024 * 1024
+_QUEUE_RECONCILE_MAX_MUTATIONS = _QUEUE_MAX_RECORDS * 3
+_LEGACY_MIGRATION_MAX_DIRECTORIES = 4096
+_LEGACY_MIGRATION_MAX_ENTRIES = 32768
 _MAX_QUARANTINE_METADATA_BYTES = 8192
 _MAX_SWEEP_STATE_BYTES = 32768
 _RECOVERY_CANDIDATE = ".wf-recovery-candidate"
+QueueCapacityError = _segmented_queue.QueueCapacityError
 
 
 def _utc_now() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
+def _datetime_timestamp(value: datetime) -> float:
+    try:
+        return value.timestamp()
+    except (OverflowError, ValueError):
+        return float("inf") if value.year >= 9999 else float("-inf")
+
+
 class InvalidObjectKey(ValueError):
+    pass
+
+
+class _LegacyMigrationLimitExceeded(RuntimeError):
     pass
 
 
@@ -67,6 +97,33 @@ class StorageSweepStats:
     directories_scanned: int = 0
     entries_scanned: int = 0
     mutations: int = 0
+    lock_contended: bool = False
+    progress_made: bool = False
+    backlog_entries: int = 0
+    oversized_quarantines: int = 0
+    quarantines_held: int = 0
+    queue_record_bytes: int = 0
+    queue_segments: int = 0
+    queue_capacity_events: int = 0
+
+
+@dataclass(slots=True)
+class WorkspaceSweepStats:
+    workspaces_examined: int = 0
+    workspaces_removed: int = 0
+    workspaces_protected: int = 0
+    invalid_workspaces: int = 0
+    directories_scanned: int = 0
+    entries_scanned: int = 0
+    mutations: int = 0
+    lock_contended: bool = False
+    budget_exhausted: bool = False
+    progress_made: bool = False
+    backlog_entries: int = 0
+    workspaces_held: int = 0
+    queue_record_bytes: int = 0
+    queue_segments: int = 0
+    queue_capacity_events: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -256,6 +313,8 @@ class _ParentBinding:
 class _QuarantineBinding:
     name: str
     descriptor: int
+    queue_descriptor: int | None = None
+    queue_item: _QueueItem | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,6 +325,20 @@ class _QuarantineMetadata:
     expected_sha256: str
     owner_execution_id: str | None
     created_at: datetime
+    source_dev: int | None = None
+    source_ino: int | None = None
+    source_size: int | None = None
+    source_mtime_ns: int | None = None
+    outcome: str | None = None
+    attempt_count: int = 0
+    next_attempt_at: datetime | None = None
+    queue_descriptor: int | None = field(default=None, repr=False, compare=False)
+
+    @property
+    def source_identity(self) -> tuple[int, int] | None:
+        if self.source_dev is None or self.source_ino is None:
+            return None
+        return self.source_dev, self.source_ino
 
 
 class RootedLocalStorage:
@@ -287,14 +360,6 @@ class RootedLocalStorage:
         self._clock = clock
         self._monotonic = monotonic
         self._thread_lock = threading.RLock()
-        self._quarantine_cache: dict[str, tuple[tuple[int, int, int, int], str]] = {}
-        self._quarantine_cursor: str | None = None
-        self._quarantine_cursor_directory: str | None = None
-        self._directory_cursor: str | None = None
-        self._directory_entry_cursor: str | None = None
-        self._directory_entry_cursor_directory: str | None = None
-        self._file_cursor: str | None = None
-        self._file_cursor_directory: str | None = None
         try:
             with _exclusive_descriptor_gate(
                 self._thread_lock, descriptor, timeout_seconds=1.0
@@ -302,7 +367,9 @@ class RootedLocalStorage:
                 if not acquired:
                     raise RuntimeError("data root mutation lock is unavailable")
                 _probe_root_capabilities(descriptor)
-                self._load_sweep_state(descriptor)
+                _ensure_segmented_queue(descriptor, _QUEUE_ROOT)
+                _migrate_nested_legacy_quarantines(descriptor)
+            _probe_lock_reacquire(descriptor)
         except BaseException as error:
             self.close()
             raise RuntimeError("data root capability probe failed") from error
@@ -326,106 +393,6 @@ class RootedLocalStorage:
         if self._root_descriptor is None:
             raise RuntimeError("data root is closed")
         return self._root_descriptor
-
-    def _load_sweep_state(self, descriptor: int) -> None:
-        payload = _get_descriptor_xattr(
-            descriptor, _SWEEP_XATTR, max_bytes=_MAX_SWEEP_STATE_BYTES
-        )
-        if payload is None:
-            return
-        try:
-            parsed = json.loads(payload)
-            if (
-                not isinstance(parsed, dict)
-                or parsed.get("version") != 1
-                or not isinstance(parsed.get("cache"), dict)
-            ):
-                raise ValueError
-            cursor = parsed.get("cursor")
-            quarantine_cursor_directory = parsed.get("cursorDirectory")
-            directory_cursor = parsed.get("directoryCursor")
-            directory_entry_cursor = parsed.get("directoryEntryCursor")
-            directory_entry_cursor_directory = parsed.get(
-                "directoryEntryCursorDirectory"
-            )
-            file_cursor = parsed.get("fileCursor")
-            file_cursor_directory = parsed.get("fileCursorDirectory")
-            if cursor is not None and not isinstance(cursor, str):
-                raise ValueError
-            if quarantine_cursor_directory is not None and not isinstance(
-                quarantine_cursor_directory, str
-            ):
-                raise ValueError
-            if directory_cursor is not None and not isinstance(
-                directory_cursor, str
-            ):
-                raise ValueError
-            if directory_entry_cursor is not None and not isinstance(
-                directory_entry_cursor, str
-            ):
-                raise ValueError
-            if directory_entry_cursor_directory is not None and not isinstance(
-                directory_entry_cursor_directory, str
-            ):
-                raise ValueError
-            if file_cursor is not None and not isinstance(file_cursor, str):
-                raise ValueError
-            if file_cursor_directory is not None and not isinstance(
-                file_cursor_directory, str
-            ):
-                raise ValueError
-            cache: dict[str, tuple[tuple[int, int, int, int], str]] = {}
-            for key, value in list(parsed["cache"].items())[:128]:
-                if (
-                    not isinstance(key, str)
-                    or re.fullmatch(r"[0-9a-f]{64}", key) is None
-                    or not isinstance(value, list)
-                    or len(value) != 5
-                    or not all(isinstance(item, int) for item in value[:4])
-                    or value[4] not in {"conflict", "invalid"}
-                ):
-                    raise ValueError
-                cache[key] = (
-                    (value[0], value[1], value[2], value[3]),
-                    value[4],
-                )
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
-            raise RuntimeError("persistent sweep state is invalid") from error
-        self._quarantine_cursor = cursor
-        self._quarantine_cursor_directory = quarantine_cursor_directory
-        self._directory_cursor = directory_cursor
-        self._directory_entry_cursor = directory_entry_cursor
-        self._directory_entry_cursor_directory = directory_entry_cursor_directory
-        self._file_cursor = file_cursor
-        self._file_cursor_directory = file_cursor_directory
-        self._quarantine_cache = cache
-
-    def _persist_sweep_state(self, descriptor: int) -> None:
-        payload = json.dumps(
-            {
-                "version": 1,
-                "cursor": self._quarantine_cursor,
-                "cursorDirectory": self._quarantine_cursor_directory,
-                "directoryCursor": self._directory_cursor,
-                "directoryEntryCursor": self._directory_entry_cursor,
-                "directoryEntryCursorDirectory": (
-                    self._directory_entry_cursor_directory
-                ),
-                "fileCursor": self._file_cursor,
-                "fileCursorDirectory": self._file_cursor_directory,
-                "cache": {
-                    key: [*fingerprint, outcome]
-                    for key, (fingerprint, outcome) in self._quarantine_cache.items()
-                },
-            },
-            ensure_ascii=True,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        if len(payload) > _MAX_SWEEP_STATE_BYTES:
-            raise RuntimeError("persistent sweep state exceeds its byte limit")
-        _put_descriptor_xattr(descriptor, _SWEEP_XATTR, payload)
-        os.fsync(descriptor)
 
     @property
     def root_identity(self) -> tuple[int, int]:
@@ -591,6 +558,11 @@ class RootedLocalStorage:
                         expected_sha256=expected_sha256,
                         owner_execution_id=owner_execution_id,
                         created_at=self._clock(),
+                        source_dev=after.st_dev,
+                        source_ino=after.st_ino,
+                        source_size=after.st_size,
+                        source_mtime_ns=after.st_mtime_ns,
+                        queue_descriptor=self._root_descriptor_or_raise(),
                     ),
                 )
                 if quarantine is None:
@@ -605,21 +577,11 @@ class RootedLocalStorage:
                         dir_fd=quarantine.descriptor,
                         follow_symlinks=False,
                     )
-                    isolated_descriptor = os.open(
-                        _RECOVERY_CANDIDATE,
-                        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-                        dir_fd=quarantine.descriptor,
-                    )
-                    try:
-                        isolated_digest = _hash_descriptor(isolated_descriptor)
-                        isolated_after = os.fstat(isolated_descriptor)
-                    finally:
-                        os.close(isolated_descriptor)
                     if (
                         stat.S_ISREG(isolated.st_mode)
                         and _identity(isolated) == identity
-                        and _identity(isolated_after) == identity
-                        and isolated_digest == expected_sha256
+                        and isolated.st_size == after.st_size
+                        and isolated.st_mtime_ns == after.st_mtime_ns
                     ):
                         os.unlink(
                             _RECOVERY_CANDIDATE,
@@ -633,6 +595,15 @@ class RootedLocalStorage:
                     os.close(quarantine.descriptor)
                 if deleted or restored:
                     _remove_empty_quarantine_directory(parent, quarantine.name)
+                    if (
+                        quarantine.queue_descriptor is not None
+                        and quarantine.queue_item is not None
+                    ):
+                        _queue_complete(
+                            quarantine.queue_descriptor,
+                            _QUEUE_ROOT,
+                            quarantine.queue_item,
+                        )
             finally:
                 os.close(descriptor)
         finally:
@@ -657,16 +628,40 @@ class RootedLocalStorage:
         owner_execution_id: str | None,
     ) -> PublishedObject:
         parts = _object_key_parts(object_key)
-        parent = self._open_parent(parts[:-1], create=True)
         owner = str(UUID(owner_execution_id)) if owner_execution_id else None
         stage_name = ".wf-stage-{}{}".format(
             f"{owner}-" if owner else "", self._uuid_factory()
         )
+        stage_key = "/".join((*parts[:-1], stage_name))
+        root_descriptor = self._root_descriptor_or_raise()
+        parent: _ParentBinding | None = None
         descriptor: int | None = None
-        staged = False
+        intent: _QueueItem | None = None
         try:
-            descriptor = _create_exclusive(parent, stage_name)
-            staged = True
+            with _exclusive_descriptor_gate(
+                self._thread_lock, root_descriptor, timeout_seconds=5.0
+            ) as acquired:
+                if not acquired:
+                    raise TimeoutError("data root mutation lock timed out")
+                intent = _queue_enqueue(
+                    root_descriptor,
+                    _QUEUE_ROOT,
+                    "ready",
+                    {
+                        "version": 2,
+                        "kind": "publication",
+                        "objectKey": object_key,
+                        "stageObjectKey": stage_key,
+                        "ownerExecutionId": owner,
+                        "createdAt": self._clock().isoformat(
+                            timespec="microseconds"
+                        ),
+                    },
+                )
+                parent = self._open_parent(parts[:-1], create=True)
+                descriptor = _create_exclusive(parent, stage_name)
+            assert parent is not None
+            assert intent is not None
             with os.fdopen(os.dup(descriptor), "wb") as handle:
                 size, digest = writer(handle)
                 handle.flush()
@@ -674,18 +669,78 @@ class RootedLocalStorage:
             status = os.fstat(descriptor)
             if not stat.S_ISREG(status.st_mode) or status.st_size != size:
                 raise OSError("published object changed while it was copied")
-            _require_named_identity(parent, stage_name, _identity(status))
-            _link_no_replace(parent, stage_name, parts[-1])
-            _unlink_named(parent, stage_name)
-            _fsync_parent(parent)
-            staged = False
+            with _exclusive_descriptor_gate(
+                self._thread_lock, root_descriptor, timeout_seconds=5.0
+            ) as acquired:
+                if not acquired:
+                    raise TimeoutError("data root mutation lock timed out")
+                _require_named_identity(parent, stage_name, _identity(status))
+                snapshot = dict(intent.record)
+                snapshot.update(
+                    sourceDev=status.st_dev,
+                    sourceIno=status.st_ino,
+                    sourceSize=status.st_size,
+                    sourceMtimeNs=status.st_mtime_ns,
+                    sha256=digest,
+                )
+                intent = _queue_move(
+                    root_descriptor,
+                    _QUEUE_ROOT,
+                    intent,
+                    "ready",
+                    snapshot,
+                )
+                _link_no_replace(parent, stage_name, parts[-1])
+                _unlink_named(parent, stage_name)
+                _fsync_parent(parent)
+                if _GENERATED_ARTIFACT.fullmatch(object_key) is None:
+                    _queue_complete(root_descriptor, _QUEUE_ROOT, intent)
             return PublishedObject(object_key, size, digest)
+        except BaseException as primary:
+            cleanup_errors: list[BaseException] = []
+            if descriptor is not None and parent is not None:
+                try:
+                    with _exclusive_descriptor_gate(
+                        self._thread_lock, root_descriptor, timeout_seconds=5.0
+                    ) as acquired:
+                        if not acquired:
+                            raise TimeoutError("data root cleanup lock timed out")
+                        canonical_exists = True
+                        try:
+                            os.stat(
+                                parts[-1],
+                                dir_fd=parent.descriptor,
+                                follow_symlinks=False,
+                            )
+                        except FileNotFoundError:
+                            canonical_exists = False
+                        artifact = _GENERATED_ARTIFACT.fullmatch(object_key)
+                        if artifact is None or not canonical_exists:
+                            try:
+                                _require_named_identity(
+                                    parent, stage_name, _identity(os.fstat(descriptor))
+                                )
+                            except FileNotFoundError:
+                                pass
+                            else:
+                                _unlink_named(parent, stage_name)
+                                _fsync_parent(parent)
+                                if intent is not None:
+                                    _queue_complete(
+                                        root_descriptor, _QUEUE_ROOT, intent
+                                    )
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+            if cleanup_errors:
+                primary.add_note(
+                    "publication cleanup was deferred to durable maintenance"
+                )
+            raise
         finally:
             if descriptor is not None:
-                _best_effort(os.close, descriptor)
-            if staged:
-                _best_effort(_unlink_named, parent, stage_name)
-            _best_effort(parent.close)
+                os.close(descriptor)
+            if parent is not None:
+                parent.close()
 
     def _open_parent(self, parts: tuple[str, ...], *, create: bool) -> _ParentBinding:
         supports_dir_fd = os.open in os.supports_dir_fd
@@ -726,20 +781,32 @@ class RootedLocalStorage:
         if self._root_descriptor is None:
             raise RuntimeError("data root is closed")
         limits = budget or StorageSweepBudget()
+        deadline = self._monotonic() + limits.max_seconds
         with _exclusive_descriptor_gate(
             self._thread_lock,
             self._root_descriptor,
-            timeout_seconds=limits.max_seconds,
+            timeout_seconds=max(0.0, deadline - self._monotonic()),
+            deadline=deadline,
+            monotonic=self._monotonic,
         ) as acquired:
             if not acquired:
-                return StorageSweepStats(budget_exhausted=True)
-            self._load_sweep_state(self._root_descriptor)
+                counts = _queue_counts(self._root_descriptor, _QUEUE_ROOT)
+                return StorageSweepStats(
+                    budget_exhausted=True,
+                    lock_contended=True,
+                    backlog_entries=counts["ready"] + counts["deferred"],
+                    quarantines_held=counts["held"],
+                    queue_record_bytes=counts["recordBytes"],
+                    queue_segments=counts["segments"],
+                    queue_capacity_events=counts["capacityEvents"],
+                )
             return self._sweep_abandoned_locked(
                 cutoff,
                 referenced_artifact_keys,
                 active_execution_ids=active_execution_ids,
                 active_build_executions=active_build_executions,
                 budget=limits,
+                deadline=deadline,
             )
 
     def _sweep_abandoned_locked(
@@ -750,231 +817,584 @@ class RootedLocalStorage:
         active_execution_ids: frozenset[str],
         active_build_executions: frozenset[tuple[str, str]],
         budget: StorageSweepBudget,
+        deadline: float,
     ) -> StorageSweepStats:
-        cutoff_timestamp = cutoff.timestamp()
         root_descriptor = self._duplicate_root()
-        prune_candidates: set[tuple[str, str | None]] = set()
         stats = StorageSweepStats()
-        deadline = self._monotonic() + budget.max_seconds
-        scan_completed = True
         try:
-            for directory, directories, filenames, descriptor in os.fwalk(
-                ".", topdown=True, follow_symlinks=False, dir_fd=root_descriptor
-            ):
-                relative_directory_key = Path(directory).as_posix().removeprefix("./")
-                relative_directory_key = relative_directory_key or "."
-                if (
-                    self._directory_cursor is not None
-                    and relative_directory_key <= self._directory_cursor
-                ):
-                    continue
-                if (
-                    self._monotonic() >= deadline
-                    or stats.directories_scanned >= budget.max_directories
-                ):
-                    stats.budget_exhausted = True
-                    scan_completed = False
-                    break
-                stats.directories_scanned += 1
-                directories.sort()
-                safe_directories: list[str] = []
-                for name in directories:
-                    relative_entry = (
-                        Path(directory) / name
-                    ).as_posix().removeprefix("./")
-                    quarantine_match = _QUARANTINE.fullmatch(name)
-                    entry_cursor = (
-                        self._quarantine_cursor
-                        if quarantine_match is not None
-                        else self._directory_entry_cursor
-                    )
-                    cursor_directory = (
-                        self._quarantine_cursor_directory
-                        if quarantine_match is not None
-                        else self._directory_entry_cursor_directory
-                    )
-                    if (
-                        cursor_directory == relative_directory_key
-                        and
-                        entry_cursor is not None
-                        and relative_entry <= entry_cursor
-                    ):
-                        if quarantine_match is None:
-                            safe_directories.append(name)
-                        continue
-                    if stats.entries_scanned >= budget.max_entries:
+            initial = _queue_counts(root_descriptor, _QUEUE_ROOT)
+            lane_limits = {
+                "deferred": initial["deferred"],
+                "ready": initial["ready"],
+            }
+            for lane in ("ready", "deferred"):
+                for _ in range(lane_limits[lane]):
+                    if not self._data_budget_available(stats, budget, deadline):
                         stats.budget_exhausted = True
-                        scan_completed = False
                         break
-                    stats.entries_scanned += 1
-                    status = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-                    if quarantine_match is not None:
-                        relative_quarantine = relative_entry
-                        if (
-                            self._quarantine_cursor is not None
-                            and relative_quarantine <= self._quarantine_cursor
-                        ):
-                            continue
-                        if (
-                            stats.quarantines_examined >= budget.max_quarantines
-                            or stats.mutations >= budget.max_mutations
-                            or self._monotonic() >= deadline
-                        ):
-                            stats.budget_exhausted = True
-                            scan_completed = False
-                            break
-                        payload_size = _quarantine_payload_size(descriptor, name)
-                        fingerprint = _quarantine_payload_fingerprint(
-                            descriptor, name
+                    if lane == "deferred":
+                        item, inspected = _queue_peek_due(
+                            root_descriptor,
+                            _QUEUE_ROOT,
+                            lane,
+                            self._clock(),
+                            budget.max_entries - stats.entries_scanned,
                         )
-                        cache_key = hashlib.sha256(
-                            relative_quarantine.encode("utf-8")
-                        ).hexdigest()
-                        cached = self._quarantine_cache.get(cache_key)
-                        if cached is not None and cached[0] == fingerprint:
-                            stats.quarantines_examined += 1
-                            if cached[1] == "conflict":
-                                stats.quarantine_conflicts += 1
-                            else:
-                                stats.invalid_quarantines += 1
-                            self._quarantine_cursor = relative_quarantine
-                            self._quarantine_cursor_directory = relative_directory_key
-                            self._persist_sweep_state(root_descriptor)
-                            continue
-                        if stats.bytes_hashed + payload_size > budget.max_bytes:
-                            stats.budget_exhausted = True
-                            scan_completed = False
-                            break
-                        stats.quarantines_examined += 1
-                        conflicts_before = stats.quarantine_conflicts
-                        invalid_before = stats.invalid_quarantines
-                        restored_before = stats.quarantines_restored
-                        empty_before = stats.empty_quarantines_removed
-                        _recover_quarantine(
-                            descriptor,
-                            Path(directory),
-                            name,
-                            quarantine_match.group("id"),
-                            cutoff,
-                            referenced_artifact_keys,
-                            active_execution_ids,
-                            active_build_executions,
-                            stats,
-                            prune_candidates,
-                        )
-                        stats.mutations += (
-                            stats.quarantines_restored
-                            - restored_before
-                            + stats.empty_quarantines_removed
-                            - empty_before
-                        )
-                        outcome = None
-                        if stats.quarantine_conflicts > conflicts_before:
-                            outcome = "conflict"
-                        elif stats.invalid_quarantines > invalid_before:
-                            outcome = "invalid"
-                        if outcome is not None:
-                            self._quarantine_cache[cache_key] = (
-                                _quarantine_payload_fingerprint(descriptor, name),
-                                outcome,
-                            )
-                            while len(self._quarantine_cache) > 128:
-                                self._quarantine_cache.pop(next(iter(self._quarantine_cache)))
-                        self._quarantine_cursor = relative_quarantine
-                        self._quarantine_cursor_directory = relative_directory_key
-                        self._persist_sweep_state(root_descriptor)
-                        continue
-                    if stat.S_ISDIR(status.st_mode) and not stat.S_ISLNK(status.st_mode):
-                        safe_directories.append(name)
-                    self._directory_entry_cursor = relative_entry
-                    self._directory_entry_cursor_directory = relative_directory_key
-                    self._persist_sweep_state(root_descriptor)
-                directories[:] = safe_directories
-                if not scan_completed:
-                    break
-                relative_directory = Path(directory)
-                filenames.sort()
-                for name in filenames:
-                    relative = (relative_directory / name).as_posix()
-                    relative = relative.removeprefix("./")
-                    if (
-                        self._file_cursor_directory == relative_directory_key
-                        and
-                        self._file_cursor is not None
-                        and relative <= self._file_cursor
-                    ):
-                        continue
-                    if (
-                        stats.entries_scanned >= budget.max_entries
-                        or stats.mutations >= budget.max_mutations
-                        or self._monotonic() >= deadline
-                    ):
+                        stats.entries_scanned += inspected
+                    else:
+                        item = _queue_peek(root_descriptor, _QUEUE_ROOT, lane)
+                        if item is not None:
+                            stats.entries_scanned += 1
+                    if item is None:
+                        break
+                    mutation_cost = _data_queue_mutation_cost(item.record)
+                    if stats.mutations + mutation_cost > budget.max_mutations:
                         stats.budget_exhausted = True
-                        scan_completed = False
                         break
-                    stats.entries_scanned += 1
-                    stage_match = _GENERATED_STAGE.fullmatch(name)
-                    artifact_match = _GENERATED_ARTIFACT.fullmatch(relative)
-                    protected_stage = (
-                        stage_match is not None
-                        and stage_match.group("owner") in active_execution_ids
+                    self._process_data_queue_item(
+                        root_descriptor,
+                        item,
+                        cutoff,
+                        referenced_artifact_keys,
+                        active_execution_ids,
+                        active_build_executions,
+                        stats,
+                        budget,
+                        mutation_cost,
                     )
-                    protected_artifact = (
-                        artifact_match is not None
-                        and (
-                            relative in referenced_artifact_keys
-                            or (
-                                artifact_match.group("owner") is not None
-                                and (
-                                    artifact_match.group("task"),
-                                    artifact_match.group("owner"),
-                                )
-                                in active_build_executions
-                            )
-                        )
-                    )
-                    if (
-                        (stage_match is not None or artifact_match is not None)
-                        and not protected_stage
-                        and not protected_artifact
-                    ):
-                        status = os.stat(
-                            name, dir_fd=descriptor, follow_symlinks=False
-                        )
-                        if (
-                            stat.S_ISREG(status.st_mode)
-                            and status.st_mtime <= cutoff_timestamp
-                        ):
-                            os.unlink(name, dir_fd=descriptor)
-                            _fsync_descriptor(descriptor)
-                            stats.mutations += 1
-                            if artifact_match is not None:
-                                prune_candidates.add(
-                                    (
-                                        artifact_match.group("task"),
-                                        artifact_match.group("owner"),
-                                    )
-                                )
-                    self._file_cursor = relative
-                    self._file_cursor_directory = relative_directory_key
-                    self._persist_sweep_state(root_descriptor)
-                if not scan_completed:
+                if stats.budget_exhausted:
                     break
-                self._directory_cursor = relative_directory_key
-                self._persist_sweep_state(root_descriptor)
-            _prune_artifact_directories(root_descriptor, prune_candidates)
+            self._scan_legacy_root_entries(
+                root_descriptor,
+                cutoff,
+                active_execution_ids,
+                stats,
+                budget,
+                deadline,
+            )
         finally:
             os.close(root_descriptor)
-        if scan_completed:
-            self._quarantine_cursor = None
-            self._quarantine_cursor_directory = None
-            self._directory_cursor = None
-            self._directory_entry_cursor = None
-            self._directory_entry_cursor_directory = None
-            self._file_cursor = None
-            self._file_cursor_directory = None
-            self._persist_sweep_state(self._root_descriptor_or_raise())
+        counts = _queue_counts(self._root_descriptor_or_raise(), _QUEUE_ROOT)
+        stats.backlog_entries = counts["ready"] + counts["deferred"]
+        stats.quarantines_held = counts["held"]
+        stats.queue_record_bytes = counts["recordBytes"]
+        stats.queue_segments = counts["segments"]
+        stats.queue_capacity_events = counts["capacityEvents"]
+        if stats.backlog_entries:
+            stats.budget_exhausted = True
         return stats
+
+    def _data_budget_available(
+        self,
+        stats: StorageSweepStats,
+        budget: StorageSweepBudget,
+        deadline: float,
+    ) -> bool:
+        return (
+            self._monotonic() < deadline
+            and stats.entries_scanned < budget.max_entries
+            and stats.quarantines_examined < budget.max_quarantines
+            and stats.mutations < budget.max_mutations
+        )
+
+    def _process_data_queue_item(
+        self,
+        root_descriptor: int,
+        item: _QueueItem,
+        cutoff: datetime,
+        referenced_artifact_keys: frozenset[str],
+        active_execution_ids: frozenset[str],
+        active_build_executions: frozenset[tuple[str, str]],
+        stats: StorageSweepStats,
+        budget: StorageSweepBudget,
+        mutation_cost: int,
+    ) -> None:
+        kind = item.record.get("kind")
+        if kind == "quarantine":
+            stats.quarantines_examined += 1
+            outcome = self._recover_queued_quarantine(
+                root_descriptor,
+                item,
+                cutoff,
+                referenced_artifact_keys,
+                active_execution_ids,
+                active_build_executions,
+                stats,
+                budget,
+            )
+        elif kind in {"artifact", "stage", "publication"}:
+            outcome = self._recover_queued_file(
+                root_descriptor,
+                item,
+                cutoff,
+                referenced_artifact_keys,
+                active_execution_ids,
+                active_build_executions,
+                stats,
+            )
+        else:
+            stats.invalid_quarantines += 1
+            outcome = "held"
+        if outcome == "done":
+            _queue_complete(root_descriptor, _QUEUE_ROOT, item)
+        elif outcome == "deferred":
+            record = dict(item.record)
+            if kind == "quarantine":
+                record["nextAttemptAt"] = (
+                    self._clock() + timedelta(minutes=5)
+                ).isoformat(timespec="microseconds")
+            else:
+                record.pop("nextAttemptAt", None)
+            _queue_move(root_descriptor, _QUEUE_ROOT, item, "deferred", record)
+        else:
+            _queue_move(root_descriptor, _QUEUE_ROOT, item, "held")
+            stats.quarantines_held += 1
+        stats.mutations += mutation_cost
+        stats.progress_made = True
+
+    def _recover_queued_file(
+        self,
+        root_descriptor: int,
+        item: _QueueItem,
+        cutoff: datetime,
+        referenced_artifact_keys: frozenset[str],
+        active_execution_ids: frozenset[str],
+        active_build_executions: frozenset[tuple[str, str]],
+        stats: StorageSweepStats,
+    ) -> str:
+        object_key = item.record.get("objectKey")
+        if not isinstance(object_key, str):
+            return "held"
+        if item.record.get("kind") == "publication":
+            return self._recover_queued_publication(
+                root_descriptor,
+                item,
+                cutoff,
+                referenced_artifact_keys,
+                active_execution_ids,
+                active_build_executions,
+            )
+        try:
+            parts = _object_key_parts(object_key)
+            parent = self._open_parent(parts[:-1], create=False)
+        except (InvalidObjectKey, FileNotFoundError):
+            return "done"
+        try:
+            try:
+                status = os.stat(
+                    parts[-1], dir_fd=parent.descriptor, follow_symlinks=False
+                )
+            except FileNotFoundError:
+                return "done"
+            if not stat.S_ISREG(status.st_mode):
+                return "held"
+            if status.st_mtime > cutoff.timestamp():
+                return "deferred"
+            kind = item.record.get("kind")
+            if kind == "stage":
+                match = _GENERATED_STAGE.fullmatch(parts[-1])
+                if match is None:
+                    return "held"
+                if match.group("owner") in active_execution_ids:
+                    return "deferred"
+            else:
+                match = _GENERATED_ARTIFACT.fullmatch(object_key)
+                if match is None:
+                    return "held"
+                protected = object_key in referenced_artifact_keys
+                if match.group("owner") is not None:
+                    protected = protected or (
+                        match.group("task"), match.group("owner")
+                    ) in active_build_executions
+                if protected:
+                    return "deferred"
+            os.unlink(parts[-1], dir_fd=parent.descriptor)
+            _fsync_parent(parent)
+            if kind == "artifact" and match is not None:
+                _prune_artifact_directories(
+                    root_descriptor,
+                    {(match.group("task"), match.group("owner"))},
+                )
+            return "done"
+        finally:
+            parent.close()
+
+    def _recover_queued_publication(
+        self,
+        root_descriptor: int,
+        item: _QueueItem,
+        cutoff: datetime,
+        referenced_artifact_keys: frozenset[str],
+        active_execution_ids: frozenset[str],
+        active_build_executions: frozenset[tuple[str, str]],
+    ) -> str:
+        object_key = item.record.get("objectKey")
+        stage_key = item.record.get("stageObjectKey")
+        if not isinstance(object_key, str) or not isinstance(stage_key, str):
+            return "held"
+        try:
+            parts = _object_key_parts(object_key)
+            stage_parts = _object_key_parts(stage_key)
+        except InvalidObjectKey:
+            return "held"
+        if parts[:-1] != stage_parts[:-1]:
+            return "held"
+        stage_match = _GENERATED_STAGE.fullmatch(stage_parts[-1])
+        if stage_match is None:
+            return "held"
+        try:
+            parent = self._open_parent(parts[:-1], create=False)
+        except FileNotFoundError:
+            return "done"
+        try:
+            canonical = _optional_named_regular_status(parent, parts[-1])
+            staged = _optional_named_regular_status(parent, stage_parts[-1])
+            if canonical is None and staged is None:
+                return "done"
+            source_dev = item.record.get("sourceDev")
+            source_ino = item.record.get("sourceIno")
+            source_size = item.record.get("sourceSize")
+            source_mtime_ns = item.record.get("sourceMtimeNs")
+            if not all(
+                isinstance(value, int)
+                for value in (
+                    source_dev,
+                    source_ino,
+                    source_size,
+                    source_mtime_ns,
+                )
+            ):
+                return "held"
+            source_identity = (source_dev, source_ino)
+
+            def is_owned(status: os.stat_result | None) -> bool:
+                return (
+                    status is not None
+                    and stat.S_ISREG(status.st_mode)
+                    and _identity(status) == source_identity
+                    and status.st_size == source_size
+                )
+
+            artifact = _GENERATED_ARTIFACT.fullmatch(object_key)
+            if canonical is not None:
+                if not is_owned(canonical):
+                    if is_owned(staged):
+                        os.unlink(stage_parts[-1], dir_fd=parent.descriptor)
+                        _fsync_parent(parent)
+                        if artifact is None:
+                            return "done"
+                    elif staged is None and artifact is None:
+                        return "done"
+                    return "held"
+                if staged is not None and not is_owned(staged):
+                    return "held"
+                if artifact is None:
+                    if is_owned(staged):
+                        os.unlink(stage_parts[-1], dir_fd=parent.descriptor)
+                        _fsync_parent(parent)
+                    return "done"
+                protected = object_key in referenced_artifact_keys
+                owner = artifact.group("owner")
+                if owner is not None:
+                    protected = protected or (
+                        artifact.group("task"), owner
+                    ) in active_build_executions
+                if protected or canonical.st_mtime > cutoff.timestamp():
+                    return "deferred"
+                os.unlink(parts[-1], dir_fd=parent.descriptor)
+                if is_owned(staged):
+                    os.unlink(stage_parts[-1], dir_fd=parent.descriptor)
+                _fsync_parent(parent)
+                _prune_artifact_directories(
+                    root_descriptor,
+                    {(artifact.group("task"), artifact.group("owner"))},
+                )
+                return "done"
+            if staged is None:
+                return "done"
+            if not is_owned(staged):
+                return "held"
+            if (
+                staged.st_mtime > cutoff.timestamp()
+                or stage_match.group("owner") in active_execution_ids
+            ):
+                return "deferred"
+            os.unlink(stage_parts[-1], dir_fd=parent.descriptor)
+            _fsync_parent(parent)
+            return "done"
+        finally:
+            parent.close()
+
+    def _recover_queued_quarantine(
+        self,
+        root_descriptor: int,
+        item: _QueueItem,
+        cutoff: datetime,
+        referenced_artifact_keys: frozenset[str],
+        active_execution_ids: frozenset[str],
+        active_build_executions: frozenset[tuple[str, str]],
+        stats: StorageSweepStats,
+        budget: StorageSweepBudget,
+    ) -> str:
+        object_key = item.record.get("objectKey")
+        quarantine_id = item.record.get("quarantineId")
+        if not isinstance(object_key, str) or not isinstance(quarantine_id, str):
+            stats.invalid_quarantines += 1
+            return "held"
+        try:
+            parts = _object_key_parts(object_key)
+            parent = self._open_parent(parts[:-1], create=False)
+        except (InvalidObjectKey, FileNotFoundError):
+            stats.invalid_quarantines += 1
+            return "held"
+        if parent.descriptor is None:
+            parent.close()
+            raise RuntimeError("safe parent directory handle is unavailable")
+        quarantine_name = f".wf-quarantine-v1-{quarantine_id}"
+        descriptor = -1
+        try:
+            try:
+                descriptor = os.open(
+                    quarantine_name,
+                    os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=parent.descriptor,
+                )
+            except FileNotFoundError:
+                return "done"
+            try:
+                metadata = _read_quarantine_metadata(descriptor, quarantine_id)
+            except (OSError, RuntimeError, ValueError):
+                stats.invalid_quarantines += 1
+                return "held"
+            if metadata is None or metadata.object_key != object_key:
+                stats.invalid_quarantines += 1
+                return "held"
+            if metadata.outcome in {"conflict", "invalid", "held"}:
+                if metadata.outcome == "conflict":
+                    stats.quarantine_conflicts += 1
+                else:
+                    stats.invalid_quarantines += 1
+                return "held"
+            if metadata.created_at > cutoff:
+                return "deferred"
+            artifact = _GENERATED_ARTIFACT.fullmatch(metadata.object_key)
+            active_build = (
+                artifact is not None
+                and artifact.group("owner") is not None
+                and (artifact.group("task"), artifact.group("owner"))
+                in active_build_executions
+            )
+            if (
+                metadata.object_key in referenced_artifact_keys
+                or metadata.owner_execution_id in active_execution_ids
+                or active_build
+            ):
+                stats.quarantines_protected += 1
+                return "deferred"
+            try:
+                _isolate_quarantine_candidate(descriptor, metadata.original_name)
+                candidate = os.stat(
+                    _RECOVERY_CANDIDATE,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                if _descriptor_directory_empty(descriptor):
+                    os.close(descriptor)
+                    descriptor = -1
+                    os.rmdir(quarantine_name, dir_fd=parent.descriptor)
+                    _fsync_parent(parent)
+                    stats.empty_quarantines_removed += 1
+                    candidate_prune = _quarantine_prune_candidate(
+                        Path(*parts[:-1]), metadata
+                    )
+                    if candidate_prune is not None:
+                        _prune_artifact_directories(
+                            root_descriptor, {candidate_prune}
+                        )
+                    return "done"
+                stats.invalid_quarantines += 1
+                return "held"
+            observed_size = (
+                metadata.source_size
+                if metadata.source_size is not None
+                else candidate.st_size
+            )
+            if observed_size > budget.max_bytes:
+                stats.oversized_quarantines += 1
+            if metadata.source_identity is None:
+                _persist_quarantine_outcome(descriptor, metadata, "held")
+                stats.invalid_quarantines += 1
+                return "held"
+            if (
+                not stat.S_ISREG(candidate.st_mode)
+                or _identity(candidate) != metadata.source_identity
+                or candidate.st_size != metadata.source_size
+                or candidate.st_mtime_ns != metadata.source_mtime_ns
+            ):
+                _persist_quarantine_outcome(descriptor, metadata, "conflict")
+                stats.quarantine_conflicts += 1
+                return "held"
+            try:
+                _rename_no_replace(
+                    descriptor,
+                    _RECOVERY_CANDIDATE,
+                    parent.descriptor,
+                    metadata.original_name,
+                )
+            except FileExistsError:
+                _persist_quarantine_outcome(descriptor, metadata, "conflict")
+                stats.quarantine_conflicts += 1
+                return "held"
+            _fsync_descriptor(descriptor)
+            _fsync_parent(parent)
+            os.close(descriptor)
+            descriptor = -1
+            os.rmdir(quarantine_name, dir_fd=parent.descriptor)
+            _fsync_parent(parent)
+            stats.quarantines_restored += 1
+            candidate_prune = _quarantine_prune_candidate(
+                Path(*parts[:-1]), metadata
+            )
+            if candidate_prune is not None:
+                _prune_artifact_directories(root_descriptor, {candidate_prune})
+            return "done"
+        finally:
+            if descriptor != -1:
+                os.close(descriptor)
+            parent.close()
+
+    def _scan_legacy_root_entries(
+        self,
+        root_descriptor: int,
+        cutoff: datetime,
+        active_execution_ids: frozenset[str],
+        stats: StorageSweepStats,
+        budget: StorageSweepBudget,
+        deadline: float,
+    ) -> None:
+        if not self._data_budget_available(stats, budget, deadline):
+            return
+        stats.directories_scanned += 1
+        with os.scandir(root_descriptor) as entries:
+            for entry in entries:
+                if not self._data_budget_available(stats, budget, deadline):
+                    stats.budget_exhausted = True
+                    return
+                stats.entries_scanned += 1
+                match = _GENERATED_STAGE.fullmatch(entry.name)
+                quarantine = _QUARANTINE.fullmatch(entry.name)
+                if match is not None:
+                    status = entry.stat(follow_symlinks=False)
+                    if (
+                        stat.S_ISREG(status.st_mode)
+                        and status.st_mtime <= cutoff.timestamp()
+                        and match.group("owner") not in active_execution_ids
+                    ):
+                        os.unlink(entry.name, dir_fd=root_descriptor)
+                        _fsync_descriptor(root_descriptor)
+                        stats.mutations += 2
+                        stats.progress_made = True
+                elif quarantine is not None:
+                    descriptor = os.open(
+                        entry.name,
+                        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=root_descriptor,
+                    )
+                    try:
+                        try:
+                            metadata = _read_quarantine_metadata(
+                                descriptor, quarantine.group("id")
+                            )
+                        except (OSError, RuntimeError, ValueError):
+                            metadata = None
+                        old_enough = (
+                            metadata is not None and metadata.created_at <= cutoff
+                        ) or os.fstat(descriptor).st_mtime <= cutoff.timestamp()
+                        if (
+                            old_enough
+                            and _descriptor_directory_empty(descriptor)
+                        ):
+                            os.close(descriptor)
+                            descriptor = -1
+                            os.rmdir(entry.name, dir_fd=root_descriptor)
+                            _fsync_descriptor(root_descriptor)
+                            stats.empty_quarantines_removed += 1
+                            stats.mutations += 2
+                            stats.progress_made = True
+                        elif old_enough:
+                            _index_legacy_quarantine(
+                                root_descriptor,
+                                descriptor,
+                                quarantine.group("id"),
+                                metadata,
+                                stats,
+                                budget,
+                            )
+                    finally:
+                        if descriptor != -1:
+                            os.close(descriptor)
+        if not self._data_budget_available(stats, budget, deadline):
+            return
+        try:
+            artifacts = os.open(
+                "artifacts",
+                os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=root_descriptor,
+            )
+        except FileNotFoundError:
+            return
+        try:
+            stats.directories_scanned += 1
+            with os.scandir(artifacts) as entries:
+                for entry in entries:
+                    if not self._data_budget_available(stats, budget, deadline):
+                        stats.budget_exhausted = True
+                        return
+                    stats.entries_scanned += 1
+                    match = _QUARANTINE.fullmatch(entry.name)
+                    if match is None:
+                        continue
+                    descriptor = os.open(
+                        entry.name,
+                        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=artifacts,
+                    )
+                    try:
+                        try:
+                            metadata = _read_quarantine_metadata(
+                                descriptor, match.group("id")
+                            )
+                        except (OSError, RuntimeError, ValueError):
+                            metadata = None
+                        old_enough = (
+                            metadata is not None and metadata.created_at <= cutoff
+                        ) or os.fstat(descriptor).st_mtime <= cutoff.timestamp()
+                        if (
+                            old_enough
+                            and _descriptor_directory_empty(descriptor)
+                        ):
+                            os.close(descriptor)
+                            descriptor = -1
+                            os.rmdir(entry.name, dir_fd=artifacts)
+                            _fsync_descriptor(artifacts)
+                            stats.empty_quarantines_removed += 1
+                            stats.mutations += 2
+                            stats.progress_made = True
+                        elif old_enough:
+                            _index_legacy_quarantine(
+                                root_descriptor,
+                                descriptor,
+                                match.group("id"),
+                                metadata,
+                                stats,
+                                budget,
+                            )
+                    finally:
+                        if descriptor != -1:
+                            os.close(descriptor)
+        finally:
+            os.close(artifacts)
 
 
 @dataclass(slots=True)
@@ -984,44 +1404,56 @@ class OwnedWorkspace:
     _identity: tuple[int, int]
     _thread_lock: Any
     capability: WorkspaceCapability
+    _queue_item: _QueueItem
+    _monotonic: Callable[[], float] = time.monotonic
     _cleaned: bool = False
 
-    def cleanup(self) -> None:
+    def cleanup(
+        self, *, budget: StorageSweepBudget | None = None
+    ) -> WorkspaceSweepStats:
+        stats = WorkspaceSweepStats()
         if self._cleaned:
-            return
+            return stats
         if self._root_descriptor is None:
             raise RuntimeError("workspace root is closed")
+        limits = budget or StorageSweepBudget()
+        deadline = self._monotonic() + limits.max_seconds
         with _exclusive_descriptor_gate(
-            self._thread_lock, self._root_descriptor, timeout_seconds=5.0
+            self._thread_lock,
+            self._root_descriptor,
+            timeout_seconds=max(0.0, deadline - self._monotonic()),
+            deadline=deadline,
+            monotonic=self._monotonic,
         ) as acquired:
             if not acquired:
-                raise TimeoutError("workspace mutation lock timed out")
+                stats.lock_contended = True
+                stats.budget_exhausted = True
+                stats.backlog_entries = 1
+                return stats
             root_descriptor = os.dup(self._root_descriptor)
-            workspace_descriptor = self.capability.duplicate_directory()
             try:
-                _clear_directory_descriptor(workspace_descriptor)
-                current = os.stat(
-                    self.path.name, dir_fd=root_descriptor, follow_symlinks=False
+                completed = _bounded_cleanup_workspace(
+                    root_descriptor,
+                    self.path.name,
+                    self._identity,
+                    stats,
+                    limits,
+                    deadline,
+                    self._monotonic,
                 )
-                if (
-                    not stat.S_ISDIR(current.st_mode)
-                    or stat.S_ISLNK(current.st_mode)
-                    or _is_reparse(current)
-                    or _identity(current) != self._identity
-                ):
-                    raise RuntimeError("workspace identity changed")
-                try:
-                    os.rmdir(self.path.name, dir_fd=root_descriptor)
-                except OSError as error:
-                    raise RuntimeError(
-                        "workspace identity changed during cleanup"
-                    ) from error
-                _fsync_descriptor(root_descriptor)
-                self._cleaned = True
+                if completed:
+                    _queue_complete(
+                        root_descriptor,
+                        _WORKSPACE_QUEUE_ROOT,
+                        self._queue_item,
+                    )
             finally:
-                os.close(workspace_descriptor)
                 os.close(root_descriptor)
+        stats.backlog_entries = 0 if completed else 1
+        stats.budget_exhausted = not completed
+        self._cleaned = True
         self.close()
+        return stats
 
     def close(self) -> None:
         self.capability.close()
@@ -1041,6 +1473,8 @@ class WorkspaceManager:
         root: Path,
         *,
         uuid_factory: Callable[[], UUID] = uuid4,
+        monotonic: Callable[[], float] = time.monotonic,
+        clock: Callable[[], datetime] = _utc_now,
     ) -> None:
         _require_supported_host()
         self._root_descriptor: int | None
@@ -1048,7 +1482,21 @@ class WorkspaceManager:
         self._root_descriptor = descriptor
         self._root_identity = _identity(os.fstat(self._root_descriptor))
         self._uuid_factory = uuid_factory
+        self._monotonic = monotonic
+        self._clock = clock
         self._thread_lock = threading.RLock()
+        try:
+            with _exclusive_descriptor_gate(
+                self._thread_lock, descriptor, timeout_seconds=1.0
+            ) as acquired:
+                if not acquired:
+                    raise RuntimeError("workspace root mutation lock is unavailable")
+                _probe_workspace_capabilities(descriptor)
+                _ensure_segmented_queue(descriptor, _WORKSPACE_QUEUE_ROOT)
+            _probe_lock_reacquire(descriptor)
+        except BaseException as error:
+            self.close()
+            raise RuntimeError("workspace root capability probe failed") from error
 
     def close(self) -> None:
         if self._root_descriptor is not None:
@@ -1091,9 +1539,27 @@ class WorkspaceManager:
                 )
                 name = f"wf-execution-{identifier}"
                 path = self.root / name
+                intent = _queue_enqueue(
+                    root_descriptor,
+                    _WORKSPACE_QUEUE_ROOT,
+                    "ready",
+                    {
+                        "version": 2,
+                        "recordId": str(identifier),
+                        "kind": "workspace",
+                        "workspaceName": name,
+                        "executionId": str(identifier),
+                        "createdAt": self._clock().isoformat(
+                            timespec="microseconds"
+                        ),
+                    },
+                )
                 try:
                     os.mkdir(name, 0o700, dir_fd=root_descriptor)
                 except FileExistsError:
+                    _queue_complete(
+                        root_descriptor, _WORKSPACE_QUEUE_ROOT, intent
+                    )
                     continue
                 child_descriptor: int | None = None
                 owned_root_descriptor: int | None = None
@@ -1111,6 +1577,18 @@ class WorkspaceManager:
                             "allocated workspace is not a plain directory"
                         )
                     self._require_path_binding(path, _identity(status))
+                    bound_record = dict(intent.record)
+                    bound_record.update(
+                        sourceDev=status.st_dev,
+                        sourceIno=status.st_ino,
+                    )
+                    intent = _queue_move(
+                        root_descriptor,
+                        _WORKSPACE_QUEUE_ROOT,
+                        intent,
+                        "ready",
+                        bound_record,
+                    )
                     child_descriptor = os.open(
                         name,
                         os.O_RDONLY
@@ -1129,6 +1607,8 @@ class WorkspaceManager:
                         _identity(status),
                         self._thread_lock,
                         capability,
+                        intent,
+                        self._monotonic,
                     )
                     owned_root_descriptor = None
                     capability = None
@@ -1162,64 +1642,178 @@ class WorkspaceManager:
         active_execution_ids: frozenset[str],
         *,
         budget: StorageSweepBudget | None = None,
-    ) -> None:
+    ) -> WorkspaceSweepStats:
         if self._root_descriptor is None:
             raise RuntimeError("workspace root is closed")
         limits = budget or StorageSweepBudget()
+        deadline = self._monotonic() + limits.max_seconds
         with _exclusive_descriptor_gate(
             self._thread_lock,
             self._root_descriptor,
-            timeout_seconds=limits.max_seconds,
+            timeout_seconds=max(0.0, deadline - self._monotonic()),
+            deadline=deadline,
+            monotonic=self._monotonic,
         ) as acquired:
             if not acquired:
-                return
-            self._sweep_abandoned_locked(cutoff, active_execution_ids, limits)
+                counts = _queue_counts(
+                    self._root_descriptor, _WORKSPACE_QUEUE_ROOT
+                )
+                return WorkspaceSweepStats(
+                    lock_contended=True,
+                    budget_exhausted=True,
+                    backlog_entries=counts["ready"] + counts["deferred"],
+                    workspaces_held=counts["held"],
+                    queue_record_bytes=counts["recordBytes"],
+                    queue_segments=counts["segments"],
+                    queue_capacity_events=counts["capacityEvents"],
+                )
+            return self._sweep_abandoned_locked(
+                cutoff, active_execution_ids, limits, deadline
+            )
 
     def _sweep_abandoned_locked(
         self,
         cutoff: datetime,
         active_execution_ids: frozenset[str],
         budget: StorageSweepBudget,
-    ) -> None:
-        cutoff_timestamp = cutoff.timestamp()
+        deadline: float,
+    ) -> WorkspaceSweepStats:
         root_descriptor = self._duplicate_root()
-        deadline = time.monotonic() + budget.max_seconds
-        entries_seen = 0
-        mutations = 0
+        stats = WorkspaceSweepStats()
         try:
-            with os.scandir(root_descriptor) as entries:
-                for entry in entries:
+            initial = _queue_counts(root_descriptor, _WORKSPACE_QUEUE_ROOT)
+            for lane in ("ready", "deferred"):
+                for _ in range(initial[lane]):
                     if (
-                        time.monotonic() >= deadline
-                        or entries_seen >= budget.max_entries
-                        or mutations >= budget.max_mutations
+                        self._monotonic() >= deadline
+                        or stats.workspaces_examined >= budget.max_entries
+                        or stats.mutations + 10 > budget.max_mutations
                     ):
+                        stats.budget_exhausted = True
                         break
-                    entries_seen += 1
-                    match = _GENERATED_WORKSPACE.fullmatch(entry.name)
-                    if match is None or match.group(1) in active_execution_ids:
-                        continue
-                    status = entry.stat(follow_symlinks=False)
+                    if lane == "deferred":
+                        item, inspected = _queue_peek_due(
+                            root_descriptor,
+                            _WORKSPACE_QUEUE_ROOT,
+                            lane,
+                            self._clock(),
+                            budget.max_entries - stats.workspaces_examined,
+                        )
+                        stats.workspaces_examined += inspected
+                    else:
+                        item = _queue_peek(
+                            root_descriptor, _WORKSPACE_QUEUE_ROOT, lane
+                        )
+                        if item is not None:
+                            stats.workspaces_examined += 1
+                    if item is None:
+                        break
+                    record = item.record
+                    execution_id = record.get("executionId")
+                    name = record.get("workspaceName")
+                    source_dev = record.get("sourceDev")
+                    source_ino = record.get("sourceIno")
                     if (
-                        not stat.S_ISDIR(status.st_mode)
-                        or entry.is_symlink()
-                        or status.st_mtime > cutoff_timestamp
+                        record.get("kind") != "workspace"
+                        or not isinstance(execution_id, str)
+                        or not isinstance(name, str)
+                        or not _workspace_record_name_matches(
+                            name, execution_id
+                        )
+                        or (source_dev is not None and not isinstance(source_dev, int))
+                        or (source_ino is not None and not isinstance(source_ino, int))
+                        or ((source_dev is None) != (source_ino is None))
                     ):
+                        stats.invalid_workspaces += 1
+                        _queue_move(
+                            root_descriptor,
+                            _WORKSPACE_QUEUE_ROOT,
+                            item,
+                            "held",
+                        )
+                        stats.workspaces_held += 1
+                        stats.mutations += 10
+                        stats.progress_made = True
                         continue
-                    current = os.stat(
-                        entry.name,
-                        dir_fd=root_descriptor,
-                        follow_symlinks=False,
-                    )
-                    if _identity(current) != _identity(status):
+                    if execution_id in active_execution_ids:
+                        stats.workspaces_protected += 1
+                        _queue_move(
+                            root_descriptor,
+                            _WORKSPACE_QUEUE_ROOT,
+                            item,
+                            "deferred",
+                            _deferred_queue_record(item.record, self._clock()),
+                        )
+                        stats.mutations += 10
+                        stats.progress_made = True
                         continue
-                    _remove_workspace_name(
-                        root_descriptor, entry.name, _identity(status)
+                    expected_identity = (
+                        (source_dev, source_ino)
+                        if source_dev is not None and source_ino is not None
+                        else None
                     )
-                    mutations += 1
-            _fsync_descriptor(root_descriptor)
+                    observed = _workspace_status(
+                        root_descriptor, name, expected_identity
+                    )
+                    if observed is None:
+                        _queue_complete(
+                            root_descriptor, _WORKSPACE_QUEUE_ROOT, item
+                        )
+                        stats.mutations += 5
+                        stats.progress_made = True
+                        continue
+                    if observed.st_mtime > _datetime_timestamp(cutoff):
+                        _queue_move(
+                            root_descriptor,
+                            _WORKSPACE_QUEUE_ROOT,
+                            item,
+                            "deferred",
+                            _immediate_queue_record(item.record),
+                        )
+                        stats.mutations += 10
+                        stats.progress_made = True
+                        continue
+                    completed = _bounded_cleanup_workspace(
+                        root_descriptor,
+                        name,
+                        _identity(observed),
+                        stats,
+                        _reserved_workspace_budget(budget, reserve=10),
+                        deadline,
+                        self._monotonic,
+                    )
+                    if completed:
+                        _queue_complete(
+                            root_descriptor, _WORKSPACE_QUEUE_ROOT, item
+                        )
+                        stats.workspaces_removed += 1
+                        stats.mutations += 5
+                    else:
+                        _queue_move(
+                            root_descriptor,
+                            _WORKSPACE_QUEUE_ROOT,
+                            item,
+                            "deferred",
+                            _immediate_queue_record(item.record),
+                        )
+                        stats.mutations += 10
+                    stats.progress_made = True
+                if stats.budget_exhausted:
+                    break
         finally:
             os.close(root_descriptor)
+        counts = _queue_counts(
+            self._root_descriptor if self._root_descriptor is not None else -1,
+            _WORKSPACE_QUEUE_ROOT,
+        )
+        stats.backlog_entries = counts["ready"] + counts["deferred"]
+        stats.workspaces_held = counts["held"]
+        stats.queue_record_bytes = counts["recordBytes"]
+        stats.queue_segments = counts["segments"]
+        stats.queue_capacity_events = counts["capacityEvents"]
+        if stats.backlog_entries:
+            stats.budget_exhausted = True
+        return stats
 
 
 def _object_key_parts(object_key: str) -> tuple[str, ...]:
@@ -1282,6 +1876,239 @@ def _rmdir_if_empty(parent_descriptor: int, name: str) -> None:
     _fsync_descriptor(parent_descriptor)
 
 
+
+_QueueItem = _segmented_queue.QueueItem
+
+
+def _queue_io() -> _segmented_queue.QueueIO:
+    return _segmented_queue.QueueIO(
+        get_xattr=lambda descriptor, name, max_bytes: _get_descriptor_xattr(
+            descriptor, name, max_bytes=max_bytes
+        ),
+        set_xattr=_set_descriptor_xattr,
+        put_xattr=_put_descriptor_xattr,
+        fsync=_fsync_descriptor,
+    )
+
+
+def _queue_limits() -> _segmented_queue.QueueLimits:
+    return _segmented_queue.QueueLimits(
+        segment_size=_QUEUE_SEGMENT_SIZE,
+        max_segments=_QUEUE_MAX_SEGMENTS,
+        max_records=_QUEUE_MAX_RECORDS,
+        max_record_bytes=_QUEUE_MAX_RECORD_BYTES,
+        record_max_bytes=_QUEUE_RECORD_MAX_BYTES,
+        state_max_bytes=_MAX_SWEEP_STATE_BYTES,
+        reconcile_max_mutations=_QUEUE_RECONCILE_MAX_MUTATIONS,
+    )
+
+
+def _queue_initial_state() -> dict[str, Any]:
+    return _segmented_queue.initial_state()
+
+
+def _queue_record_is_due(record: dict[str, Any], now: datetime) -> bool:
+    value = record.get("nextAttemptAt")
+    if value is None:
+        return True
+    if not isinstance(value, str) or len(value) > 64:
+        return True
+    try:
+        next_attempt = datetime.fromisoformat(value)
+    except ValueError:
+        return True
+    return next_attempt <= now
+
+
+def _deferred_queue_record(
+    record: dict[str, Any], now: datetime
+) -> dict[str, Any]:
+    deferred = dict(record)
+    deferred["nextAttemptAt"] = (now + timedelta(minutes=5)).isoformat(
+        timespec="microseconds"
+    )
+    return deferred
+
+
+def _immediate_queue_record(record: dict[str, Any]) -> dict[str, Any]:
+    immediate = dict(record)
+    immediate.pop("nextAttemptAt", None)
+    return immediate
+
+
+def _data_queue_mutation_cost(record: dict[str, Any]) -> int:
+    kind = record.get("kind")
+    if kind == "quarantine":
+        return 16
+    if kind in {"artifact", "publication"}:
+        return 12
+    if kind == "stage":
+        return 8
+    return 5
+
+
+def _ensure_segmented_queue(root_descriptor: int, name: str) -> None:
+    _segmented_queue.ensure(
+        root_descriptor,
+        name,
+        io=_queue_io(),
+        limits=_queue_limits(),
+        state_xattr=_QUEUE_STATE_XATTR,
+        write_state=_write_queue_state,
+    )
+
+
+def _encode_queue_state(state: dict[str, Any]) -> bytes:
+    return _segmented_queue.encode_state(state, _MAX_SWEEP_STATE_BYTES)
+
+
+def _read_queue_state(queue_descriptor: int) -> dict[str, Any]:
+    return _segmented_queue.read_state(
+        queue_descriptor,
+        io=_queue_io(),
+        limits=_queue_limits(),
+        state_xattr=_QUEUE_STATE_XATTR,
+    )
+
+
+def _write_queue_state(queue_descriptor: int, state: dict[str, Any]) -> None:
+    _segmented_queue.write_state(
+        queue_descriptor,
+        state,
+        io=_queue_io(),
+        state_xattr=_QUEUE_STATE_XATTR,
+        state_max_bytes=_MAX_SWEEP_STATE_BYTES,
+    )
+
+
+def _open_queue(root_descriptor: int, name: str) -> int:
+    return _segmented_queue.open_queue(root_descriptor, name)
+
+
+def _open_queue_lane(queue_descriptor: int, lane: str) -> int:
+    return _segmented_queue.open_lane(queue_descriptor, lane)
+
+
+def _queue_capacity() -> int:
+    return _queue_limits().capacity
+
+
+def _reconcile_queue_descriptor(queue_descriptor: int) -> None:
+    _segmented_queue.reconcile(
+        queue_descriptor,
+        io=_queue_io(),
+        limits=_queue_limits(),
+        state_xattr=_QUEUE_STATE_XATTR,
+        write_state=_write_queue_state,
+    )
+
+
+def _queue_enqueue(
+    root_descriptor: int,
+    queue_name: str,
+    lane_name: str,
+    record: dict[str, Any],
+    *,
+    deduplicate: bool = True,
+    deduplicate_generation: bool = False,
+) -> _QueueItem:
+    return _segmented_queue.enqueue(
+        root_descriptor,
+        queue_name,
+        lane_name,
+        record,
+        io=_queue_io(),
+        limits=_queue_limits(),
+        state_xattr=_QUEUE_STATE_XATTR,
+        write_state_callback=_write_queue_state,
+        deduplicate=deduplicate,
+        deduplicate_generation=deduplicate_generation,
+    )
+
+
+def _queue_peek(
+    root_descriptor: int, queue_name: str, lane_name: str
+) -> _QueueItem | None:
+    return _segmented_queue.peek(
+        root_descriptor,
+        queue_name,
+        lane_name,
+        io=_queue_io(),
+        limits=_queue_limits(),
+        state_xattr=_QUEUE_STATE_XATTR,
+        reconcile_callback=_reconcile_queue_descriptor,
+    )
+
+
+def _queue_peek_due(
+    root_descriptor: int,
+    queue_name: str,
+    lane_name: str,
+    now: datetime,
+    max_records: int,
+) -> tuple[_QueueItem | None, int]:
+    return _segmented_queue.peek_due(
+        root_descriptor,
+        queue_name,
+        lane_name,
+        now,
+        max_records,
+        io=_queue_io(),
+        limits=_queue_limits(),
+        state_xattr=_QUEUE_STATE_XATTR,
+        is_due=_queue_record_is_due,
+        reconcile_callback=_reconcile_queue_descriptor,
+    )
+
+
+def _queue_complete(
+    root_descriptor: int, queue_name: str, item: _QueueItem
+) -> None:
+    _segmented_queue.complete(
+        root_descriptor,
+        queue_name,
+        item,
+        io=_queue_io(),
+        limits=_queue_limits(),
+        state_xattr=_QUEUE_STATE_XATTR,
+        write_state_callback=_write_queue_state,
+        reconcile_callback=_reconcile_queue_descriptor,
+    )
+
+
+def _queue_move(
+    root_descriptor: int,
+    queue_name: str,
+    item: _QueueItem,
+    destination: str,
+    record: dict[str, Any] | None = None,
+) -> _QueueItem:
+    moved = dict(record or item.record)
+    moved["recordId"] = item.record["recordId"]
+    moved["generation"] = int(item.record["generation"]) + 1
+    moved.pop("sequence", None)
+    destination_item = _queue_enqueue(
+        root_descriptor,
+        queue_name,
+        destination,
+        moved,
+        deduplicate=False,
+        deduplicate_generation=True,
+    )
+    _queue_complete(root_descriptor, queue_name, item)
+    return destination_item
+
+
+def _queue_counts(root_descriptor: int, queue_name: str) -> dict[str, int]:
+    return _segmented_queue.counts(
+        root_descriptor,
+        queue_name,
+        io=_queue_io(),
+        limits=_queue_limits(),
+        state_xattr=_QUEUE_STATE_XATTR,
+    )
+
+
 def _require_supported_host() -> None:
     if os.name == "nt":
         raise RuntimeError(
@@ -1306,9 +2133,19 @@ def _exclusive_descriptor_gate(
     descriptor: int,
     *,
     timeout_seconds: float,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> Any:
-    deadline = time.monotonic() + timeout_seconds
-    acquired_thread = thread_lock.acquire(timeout=timeout_seconds)
+    absolute_deadline = (
+        monotonic() + timeout_seconds if deadline is None else deadline
+    )
+    remaining = absolute_deadline - monotonic()
+    if remaining <= 0:
+        yield False
+        return
+    acquired_thread = thread_lock.acquire(
+        timeout=remaining
+    )
     if not acquired_thread:
         yield False
         return
@@ -1320,7 +2157,7 @@ def _exclusive_descriptor_gate(
                 acquired_file = True
                 break
             except BlockingIOError:
-                remaining = deadline - time.monotonic()
+                remaining = absolute_deadline - monotonic()
                 if remaining <= 0:
                     yield False
                     return
@@ -1430,6 +2267,20 @@ def _link_no_replace(parent: _ParentBinding, source: str, target: str) -> None:
         os.link(parent.path / source, parent.path / target, follow_symlinks=False)
 
 
+def _optional_named_regular_status(
+    parent: _ParentBinding, name: str
+) -> os.stat_result | None:
+    if parent.descriptor is None:
+        raise RuntimeError("safe parent directory handle is unavailable")
+    try:
+        status = os.stat(name, dir_fd=parent.descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(status.st_mode):
+        raise RuntimeError("maintenance queue target is not a regular file")
+    return status
+
+
 def _unlink_named(parent: _ParentBinding, name: str) -> None:
     if parent.descriptor is not None and os.unlink in os.supports_dir_fd:
         os.unlink(name, dir_fd=parent.descriptor)
@@ -1445,7 +2296,34 @@ def _quarantine_named(
     if parent.descriptor is None:
         raise RuntimeError("safe parent directory handle is unavailable")
     quarantine_name = f".wf-quarantine-v1-{metadata.quarantine_id}"
-    os.mkdir(quarantine_name, 0o700, dir_fd=parent.descriptor)
+    queue_item: _QueueItem | None = None
+    if metadata.queue_descriptor is not None:
+        queue_item = _queue_enqueue(
+            metadata.queue_descriptor,
+            _QUEUE_ROOT,
+            "ready",
+            {
+                "version": 2,
+                "recordId": metadata.quarantine_id,
+                "kind": "quarantine",
+                "objectKey": metadata.object_key,
+                "quarantineId": metadata.quarantine_id,
+                "createdAt": metadata.created_at.isoformat(
+                    timespec="microseconds"
+                ),
+            },
+        )
+    try:
+        os.mkdir(quarantine_name, 0o700, dir_fd=parent.descriptor)
+    except BaseException:
+        if metadata.queue_descriptor is not None and queue_item is not None:
+            _best_effort(
+                _queue_complete,
+                metadata.queue_descriptor,
+                _QUEUE_ROOT,
+                queue_item,
+            )
+        raise
     quarantine_descriptor = -1
     moved = False
     try:
@@ -1468,11 +2346,20 @@ def _quarantine_named(
             os.close(quarantine_descriptor)
             quarantine_descriptor = -1
             _remove_empty_quarantine_directory(parent, quarantine_name)
+            if metadata.queue_descriptor is not None and queue_item is not None:
+                _queue_complete(
+                    metadata.queue_descriptor, _QUEUE_ROOT, queue_item
+                )
             return None
         moved = True
         _fsync_parent(parent)
         _fsync_descriptor(quarantine_descriptor)
-        return _QuarantineBinding(quarantine_name, quarantine_descriptor)
+        return _QuarantineBinding(
+            quarantine_name,
+            quarantine_descriptor,
+            metadata.queue_descriptor,
+            queue_item,
+        )
     except BaseException:
         if quarantine_descriptor != -1:
             os.close(quarantine_descriptor)
@@ -1480,6 +2367,13 @@ def _quarantine_named(
             _best_effort(
                 _remove_empty_quarantine_directory, parent, quarantine_name
             )
+            if metadata.queue_descriptor is not None and queue_item is not None:
+                _best_effort(
+                    _queue_complete,
+                    metadata.queue_descriptor,
+                    _QUEUE_ROOT,
+                    queue_item,
+                )
         raise
 
 
@@ -1559,6 +2453,8 @@ def _require_atomic_no_replace() -> None:
 def _probe_root_capabilities(root_descriptor: int) -> None:
     name = f".wf-capability-probe-{uuid4()}"
     directory = -1
+    source_directory = -1
+    destination_directory = -1
     created = False
     failure: BaseException | None = None
     try:
@@ -1576,68 +2472,156 @@ def _probe_root_capabilities(root_descriptor: int) -> None:
             os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
             dir_fd=root_descriptor,
         )
+        os.mkdir("source-dir", 0o700, dir_fd=directory)
+        os.mkdir("destination-dir", 0o700, dir_fd=directory)
+        source_directory = os.open(
+            "source-dir",
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory,
+        )
+        destination_directory = os.open(
+            "destination-dir",
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory,
+        )
         for leaf, content in (
             ("source", b"source"),
             ("second", b"second"),
-            ("occupied", b"occupied"),
         ):
             descriptor = os.open(
                 leaf,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
                 0o600,
-                dir_fd=directory,
+                dir_fd=source_directory,
             )
             try:
                 os.write(descriptor, content)
                 os.fsync(descriptor)
             finally:
                 os.close(descriptor)
-        source_status = os.stat("source", dir_fd=directory, follow_symlinks=False)
-        second_status = os.stat("second", dir_fd=directory, follow_symlinks=False)
-        occupied_status = os.stat("occupied", dir_fd=directory, follow_symlinks=False)
-        _rename_no_replace(directory, "source", directory, "moved")
-        moved_status = os.stat("moved", dir_fd=directory, follow_symlinks=False)
+        occupied = os.open(
+            "occupied",
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=destination_directory,
+        )
+        try:
+            os.write(occupied, b"occupied")
+            os.fsync(occupied)
+        finally:
+            os.close(occupied)
+        source_status = os.stat(
+            "source", dir_fd=source_directory, follow_symlinks=False
+        )
+        second_status = os.stat(
+            "second", dir_fd=source_directory, follow_symlinks=False
+        )
+        occupied_status = os.stat(
+            "occupied", dir_fd=destination_directory, follow_symlinks=False
+        )
+        _rename_no_replace(
+            source_directory, "source", destination_directory, "moved"
+        )
+        moved_status = os.stat(
+            "moved", dir_fd=destination_directory, follow_symlinks=False
+        )
         if _identity(moved_status) != _identity(source_status):
             raise RuntimeError("no-replace rename changed source identity")
-        moved = os.open("moved", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+        moved = os.open(
+            "moved", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=destination_directory
+        )
         try:
             if os.read(moved, 16) != b"source":
                 raise RuntimeError("no-replace rename changed source content")
         finally:
             os.close(moved)
         try:
-            _rename_no_replace(directory, "second", directory, "occupied")
+            _rename_no_replace(
+                source_directory, "second", destination_directory, "occupied"
+            )
         except FileExistsError:
             pass
         else:
             raise RuntimeError("no-replace rename replaced an occupied destination")
-        if _identity(os.stat("second", dir_fd=directory)) != _identity(second_status):
+        if _identity(os.stat("second", dir_fd=source_directory)) != _identity(
+            second_status
+        ):
             raise RuntimeError("EEXIST changed the source")
-        if _identity(os.stat("occupied", dir_fd=directory)) != _identity(
+        if _identity(os.stat("occupied", dir_fd=destination_directory)) != _identity(
             occupied_status
         ):
             raise RuntimeError("EEXIST changed the destination")
-        marker = b"wheelforge-capability-v1"
-        _set_descriptor_xattr(directory, _QUARANTINE_XATTR, marker)
         try:
-            _set_descriptor_xattr(directory, _QUARANTINE_XATTR, marker)
+            _rename_no_replace(
+                source_directory, "missing", destination_directory, "absent"
+            )
+        except FileNotFoundError as error:
+            if error.errno != errno.ENOENT:
+                raise RuntimeError("missing source returned the wrong errno") from error
+        else:
+            raise RuntimeError("missing source did not preserve ENOENT semantics")
+        marker = b"wheelforge-capability-v1"
+        _set_descriptor_xattr(source_directory, _QUARANTINE_XATTR, marker)
+        try:
+            _set_descriptor_xattr(source_directory, _QUARANTINE_XATTR, marker)
         except OSError as error:
             if error.errno != errno.EEXIST:
                 raise
         else:
             raise RuntimeError("xattr create did not preserve EEXIST semantics")
-        if _get_descriptor_xattr(directory, _QUARANTINE_XATTR) != marker:
+        os.close(source_directory)
+        source_directory = os.open(
+            "source-dir",
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory,
+        )
+        if _get_descriptor_xattr(source_directory, _QUARANTINE_XATTR) != marker:
             raise RuntimeError("descriptor xattr round trip failed")
+        replacement_marker = b"wheelforge-capability-v2"
+        _put_descriptor_xattr(
+            source_directory, _QUARANTINE_XATTR, replacement_marker
+        )
+        if (
+            _get_descriptor_xattr(source_directory, _QUARANTINE_XATTR)
+            != replacement_marker
+        ):
+            raise RuntimeError("descriptor xattr replacement failed")
+        _fsync_descriptor(source_directory)
+        _fsync_descriptor(destination_directory)
         os.fsync(directory)
         os.fsync(root_descriptor)
     except BaseException as error:
         failure = error
     finally:
         cleanup_errors: list[BaseException] = []
-        if directory != -1:
-            for leaf in ("source", "second", "occupied", "moved"):
+        if source_directory != -1:
+            for leaf in ("source", "second"):
                 try:
-                    os.unlink(leaf, dir_fd=directory)
+                    os.unlink(leaf, dir_fd=source_directory)
+                except FileNotFoundError:
+                    pass
+                except BaseException as error:
+                    cleanup_errors.append(error)
+            try:
+                os.close(source_directory)
+            except BaseException as error:
+                cleanup_errors.append(error)
+        if destination_directory != -1:
+            for leaf in ("occupied", "moved", "absent"):
+                try:
+                    os.unlink(leaf, dir_fd=destination_directory)
+                except FileNotFoundError:
+                    pass
+                except BaseException as error:
+                    cleanup_errors.append(error)
+            try:
+                os.close(destination_directory)
+            except BaseException as error:
+                cleanup_errors.append(error)
+        if directory != -1:
+            for leaf in ("source-dir", "destination-dir"):
+                try:
+                    os.rmdir(leaf, dir_fd=directory)
                 except FileNotFoundError:
                     pass
                 except BaseException as error:
@@ -1660,6 +2644,93 @@ def _probe_root_capabilities(root_descriptor: int) -> None:
             raise BaseExceptionGroup("capability probe cleanup failed", cleanup_errors)
 
 
+def _probe_workspace_capabilities(root_descriptor: int) -> None:
+    name = f".wf-workspace-probe-{uuid4()}"
+    directory = -1
+    created = False
+    failure: BaseException | None = None
+    try:
+        contender = os.open(
+            ".", os.O_RDONLY | os.O_DIRECTORY, dir_fd=root_descriptor
+        )
+        try:
+            _require_lock_contention(contender)
+        finally:
+            os.close(contender)
+        os.mkdir(name, 0o700, dir_fd=root_descriptor)
+        created = True
+        directory = os.open(
+            name,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=root_descriptor,
+        )
+        if not stat.S_ISDIR(os.fstat(directory).st_mode):
+            raise RuntimeError("workspace descriptor traversal is unavailable")
+        child = os.open(
+            "probe.bin",
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=directory,
+        )
+        try:
+            os.write(child, b"workspace")
+            os.fsync(child)
+        finally:
+            os.close(child)
+        reopened = os.open(
+            "probe.bin",
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory,
+        )
+        try:
+            if os.read(reopened, 32) != b"workspace":
+                raise RuntimeError("workspace descriptor traversal changed content")
+        finally:
+            os.close(reopened)
+        os.unlink("probe.bin", dir_fd=directory)
+        _fsync_descriptor(directory)
+        os.close(directory)
+        directory = -1
+        os.rmdir(name, dir_fd=root_descriptor)
+        created = False
+        _fsync_descriptor(root_descriptor)
+    except BaseException as error:
+        failure = error
+    finally:
+        cleanup_errors: list[BaseException] = []
+        if directory != -1:
+            try:
+                os.unlink("probe.bin", dir_fd=directory)
+            except FileNotFoundError:
+                pass
+            except BaseException as error:
+                cleanup_errors.append(error)
+            try:
+                os.close(directory)
+            except BaseException as error:
+                cleanup_errors.append(error)
+        if created:
+            try:
+                os.rmdir(name, dir_fd=root_descriptor)
+                _fsync_descriptor(root_descriptor)
+            except BaseException as error:
+                cleanup_errors.append(error)
+        if failure is not None and cleanup_errors:
+            raise BaseExceptionGroup(
+                "workspace capability probe and cleanup failed",
+                [failure, *cleanup_errors],
+            )
+        if failure is not None:
+            raise failure
+        if cleanup_errors:
+            raise BaseExceptionGroup(
+                "workspace capability probe cleanup failed", cleanup_errors
+            )
+
+
 def _require_lock_contention(descriptor: int) -> None:
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1669,54 +2740,10 @@ def _require_lock_contention(descriptor: int) -> None:
     raise RuntimeError("data root lock contention semantics are unavailable")
 
 
-def _quarantine_payload_size(parent_descriptor: int, quarantine_name: str) -> int:
-    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(quarantine_name, flags, dir_fd=parent_descriptor)
-    except OSError:
-        return 0
-    try:
-        for name in (_RECOVERY_CANDIDATE,):
-            try:
-                status = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-            except FileNotFoundError:
-                continue
-            return status.st_size if stat.S_ISREG(status.st_mode) else 0
-        with os.scandir(descriptor) as entries:
-            for entry in entries:
-                status = entry.stat(follow_symlinks=False)
-                if stat.S_ISREG(status.st_mode):
-                    return status.st_size
-        return 0
-    finally:
-        os.close(descriptor)
-
-
-def _quarantine_payload_fingerprint(
-    parent_descriptor: int, quarantine_name: str
-) -> tuple[int, int, int, int]:
-    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(quarantine_name, flags, dir_fd=parent_descriptor)
-    except OSError:
-        return (0, 0, 0, 0)
-    try:
-        names = (_RECOVERY_CANDIDATE,)
-        for name in names:
-            try:
-                status = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-            except FileNotFoundError:
-                continue
-            return (*_identity(status), status.st_size, status.st_mtime_ns)
-        with os.scandir(descriptor) as entries:
-            for entry in entries:
-                status = entry.stat(follow_symlinks=False)
-                if stat.S_ISREG(status.st_mode):
-                    return (*_identity(status), status.st_size, status.st_mtime_ns)
-        status = os.fstat(descriptor)
-        return (*_identity(status), 0, status.st_mtime_ns)
-    finally:
-        os.close(descriptor)
+def _probe_lock_reacquire(descriptor: int) -> None:
+    for _ in range(2):
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
 
 
 def _atomic_rename_configuration() -> tuple[str, int]:
@@ -1766,13 +2793,24 @@ def _write_quarantine_metadata(
 ) -> None:
     payload = json.dumps(
         {
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "quarantineId": metadata.quarantine_id,
             "objectKey": metadata.object_key,
             "originalName": metadata.original_name,
             "expectedSha256": metadata.expected_sha256,
             "ownerExecutionId": metadata.owner_execution_id,
             "createdAt": metadata.created_at.isoformat(timespec="microseconds"),
+            "sourceDev": metadata.source_dev,
+            "sourceIno": metadata.source_ino,
+            "sourceSize": metadata.source_size,
+            "sourceMtimeNs": metadata.source_mtime_ns,
+            "outcome": metadata.outcome,
+            "attemptCount": metadata.attempt_count,
+            "nextAttemptAt": (
+                metadata.next_attempt_at.isoformat(timespec="microseconds")
+                if metadata.next_attempt_at is not None
+                else None
+            ),
         },
         ensure_ascii=True,
         separators=(",", ":"),
@@ -1780,7 +2818,216 @@ def _write_quarantine_metadata(
     ).encode("utf-8")
     if len(payload) > _MAX_QUARANTINE_METADATA_BYTES:
         raise ValueError("quarantine metadata exceeds its byte limit")
-    _set_descriptor_xattr(descriptor, _QUARANTINE_XATTR, payload)
+    if _get_descriptor_xattr(descriptor, _QUARANTINE_XATTR) is None:
+        _set_descriptor_xattr(descriptor, _QUARANTINE_XATTR, payload)
+    else:
+        _put_descriptor_xattr(descriptor, _QUARANTINE_XATTR, payload)
+
+
+def _persist_quarantine_outcome(
+    descriptor: int, metadata: _QuarantineMetadata, outcome: str
+) -> None:
+    _write_quarantine_metadata(
+        descriptor,
+        _QuarantineMetadata(
+            quarantine_id=metadata.quarantine_id,
+            object_key=metadata.object_key,
+            original_name=metadata.original_name,
+            expected_sha256=metadata.expected_sha256,
+            owner_execution_id=metadata.owner_execution_id,
+            created_at=metadata.created_at,
+            source_dev=metadata.source_dev,
+            source_ino=metadata.source_ino,
+            source_size=metadata.source_size,
+            source_mtime_ns=metadata.source_mtime_ns,
+            outcome=outcome,
+            attempt_count=min(metadata.attempt_count + 1, 1_000_000),
+            next_attempt_at=metadata.next_attempt_at,
+        ),
+    )
+    _fsync_descriptor(descriptor)
+
+
+def _index_legacy_quarantine(
+    root_descriptor: int,
+    descriptor: int,
+    quarantine_id: str,
+    metadata: _QuarantineMetadata | None,
+    stats: StorageSweepStats,
+    budget: StorageSweepBudget,
+) -> None:
+    # A complete V2 source snapshot is written only by the registered path,
+    # before the canonical name is moved into quarantine.
+    if metadata is not None and metadata.source_identity is not None:
+        return
+    if _get_descriptor_xattr(
+        descriptor, _LEGACY_QUARANTINE_STATE_XATTR, max_bytes=32
+    ) is not None:
+        return
+    if stats.mutations + 16 > budget.max_mutations:
+        stats.budget_exhausted = True
+        return
+    if metadata is None:
+        _queue_enqueue(
+            root_descriptor,
+            _QUEUE_ROOT,
+            "held",
+            {
+                "version": 2,
+                "recordId": quarantine_id,
+                "kind": "legacyHeld",
+            },
+        )
+        _set_descriptor_xattr(
+            descriptor, _LEGACY_QUARANTINE_STATE_XATTR, b"held"
+        )
+        _fsync_descriptor(descriptor)
+        stats.invalid_quarantines += 1
+    else:
+        lane = "ready" if metadata.source_identity is not None else "held"
+        outcome = "deferred" if lane == "ready" else "held"
+        _queue_enqueue(
+            root_descriptor,
+            _QUEUE_ROOT,
+            lane,
+            {
+                "version": 2,
+                "recordId": quarantine_id,
+                "kind": "quarantine",
+                "objectKey": metadata.object_key,
+                "quarantineId": quarantine_id,
+                "createdAt": metadata.created_at.isoformat(
+                    timespec="microseconds"
+                ),
+            },
+        )
+        _persist_quarantine_outcome(descriptor, metadata, outcome)
+        _set_descriptor_xattr(
+            descriptor, _LEGACY_QUARANTINE_STATE_XATTR, lane.encode("ascii")
+        )
+        _fsync_descriptor(descriptor)
+        if lane == "held":
+            stats.invalid_quarantines += 1
+    stats.mutations += 16
+    stats.progress_made = True
+
+
+def _migrate_nested_legacy_quarantines(root_descriptor: int) -> None:
+    migration_state = _get_descriptor_xattr(
+        root_descriptor, _LEGACY_MIGRATION_STATE_XATTR, max_bytes=32
+    )
+    if migration_state == _LEGACY_MIGRATION_COMPLETE:
+        return
+    if migration_state == _LEGACY_MIGRATION_HELD_LIMIT:
+        raise RuntimeError("legacy quarantine migration is held at its scan limit")
+    if migration_state is not None:
+        raise RuntimeError("legacy quarantine migration state is invalid")
+    try:
+        artifacts = os.open(
+            "artifacts",
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=root_descriptor,
+        )
+    except FileNotFoundError:
+        _set_descriptor_xattr(
+            root_descriptor,
+            _LEGACY_MIGRATION_STATE_XATTR,
+            _LEGACY_MIGRATION_COMPLETE,
+        )
+        _fsync_descriptor(root_descriptor)
+        return
+    stats = StorageSweepStats()
+    budget = StorageSweepBudget(
+        max_quarantines=_QUEUE_MAX_RECORDS,
+        max_bytes=_QUEUE_MAX_RECORD_BYTES,
+        max_seconds=60.0,
+        max_directories=_LEGACY_MIGRATION_MAX_DIRECTORIES,
+        max_entries=_LEGACY_MIGRATION_MAX_ENTRIES,
+        max_mutations=_QUEUE_MAX_RECORDS * 16,
+    )
+    directories = 0
+    entries = 0
+
+    def scan(parent: int, depth: int) -> None:
+        nonlocal directories, entries
+        directories += 1
+        if directories > _LEGACY_MIGRATION_MAX_DIRECTORIES:
+            raise _LegacyMigrationLimitExceeded(
+                "legacy quarantine migration directory limit exceeded"
+            )
+        with os.scandir(parent) as children:
+            for child in children:
+                entries += 1
+                if entries > _LEGACY_MIGRATION_MAX_ENTRIES:
+                    raise _LegacyMigrationLimitExceeded(
+                        "legacy quarantine migration entry limit exceeded"
+                    )
+                match = _QUARANTINE.fullmatch(child.name)
+                if match is not None:
+                    if not child.is_dir(follow_symlinks=False):
+                        raise RuntimeError("legacy quarantine entry is invalid")
+                    descriptor = os.open(
+                        child.name,
+                        os.O_RDONLY
+                        | os.O_DIRECTORY
+                        | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=parent,
+                    )
+                    try:
+                        try:
+                            metadata = _read_quarantine_metadata(
+                                descriptor, match.group("id")
+                            )
+                        except (OSError, RuntimeError, ValueError):
+                            metadata = None
+                        _index_legacy_quarantine(
+                            root_descriptor,
+                            descriptor,
+                            match.group("id"),
+                            metadata,
+                            stats,
+                            budget,
+                        )
+                    finally:
+                        os.close(descriptor)
+                    continue
+                if depth >= 2 or not child.is_dir(follow_symlinks=False):
+                    continue
+                try:
+                    UUID(child.name)
+                except ValueError:
+                    continue
+                descriptor = os.open(
+                    child.name,
+                    os.O_RDONLY
+                    | os.O_DIRECTORY
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=parent,
+                )
+                try:
+                    scan(descriptor, depth + 1)
+                finally:
+                    os.close(descriptor)
+
+    try:
+        try:
+            scan(artifacts, 0)
+        finally:
+            os.close(artifacts)
+    except _LegacyMigrationLimitExceeded:
+        _set_descriptor_xattr(
+            root_descriptor,
+            _LEGACY_MIGRATION_STATE_XATTR,
+            _LEGACY_MIGRATION_HELD_LIMIT,
+        )
+        _fsync_descriptor(root_descriptor)
+        raise
+    _set_descriptor_xattr(
+        root_descriptor,
+        _LEGACY_MIGRATION_STATE_XATTR,
+        _LEGACY_MIGRATION_COMPLETE,
+    )
+    _fsync_descriptor(root_descriptor)
 
 
 def _read_quarantine_metadata(
@@ -1795,7 +3042,7 @@ def _read_quarantine_metadata(
         parsed = json.loads(payload)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("quarantine metadata is malformed") from error
-    expected_keys = {
+    legacy_keys = {
         "schemaVersion",
         "quarantineId",
         "objectKey",
@@ -1804,10 +3051,26 @@ def _read_quarantine_metadata(
         "ownerExecutionId",
         "createdAt",
     }
-    if not isinstance(parsed, dict) or set(parsed) != expected_keys:
+    current_keys = legacy_keys | {
+        "sourceDev",
+        "sourceIno",
+        "sourceSize",
+        "sourceMtimeNs",
+        "outcome",
+        "attemptCount",
+        "nextAttemptAt",
+    }
+    if not isinstance(parsed, dict) or (
+        set(parsed) != legacy_keys and set(parsed) != current_keys
+    ):
         raise ValueError("quarantine metadata shape is invalid")
-    if parsed["schemaVersion"] != 1 or parsed["quarantineId"] != expected_id:
+    schema_version = parsed["schemaVersion"]
+    if schema_version not in {1, 2} or parsed["quarantineId"] != expected_id:
         raise ValueError("quarantine metadata identity is invalid")
+    if schema_version == 1 and set(parsed) != legacy_keys:
+        raise ValueError("quarantine metadata shape is invalid")
+    if schema_version == 2 and set(parsed) != current_keys:
+        raise ValueError("quarantine metadata shape is invalid")
     object_key = parsed["objectKey"]
     original_name = parsed["originalName"]
     expected_sha256 = parsed["expectedSha256"]
@@ -1832,6 +3095,31 @@ def _read_quarantine_metadata(
         created_at = datetime.fromisoformat(created)
     except ValueError as error:
         raise ValueError("quarantine creation time is invalid") from error
+    source_values = (
+        parsed.get("sourceDev"),
+        parsed.get("sourceIno"),
+        parsed.get("sourceSize"),
+        parsed.get("sourceMtimeNs"),
+    )
+    if any(value is not None for value in source_values) and not all(
+        isinstance(value, int) and value >= 0 for value in source_values
+    ):
+        raise ValueError("quarantine source snapshot is invalid")
+    outcome = parsed.get("outcome")
+    if outcome not in {None, "conflict", "invalid", "held", "deferred"}:
+        raise ValueError("quarantine outcome is invalid")
+    attempt_count = parsed.get("attemptCount", 0)
+    if not isinstance(attempt_count, int) or not 0 <= attempt_count <= 1_000_000:
+        raise ValueError("quarantine attempt count is invalid")
+    next_attempt = parsed.get("nextAttemptAt")
+    if next_attempt is not None and not isinstance(next_attempt, str):
+        raise ValueError("quarantine next attempt is invalid")
+    try:
+        next_attempt_at = (
+            datetime.fromisoformat(next_attempt) if next_attempt is not None else None
+        )
+    except ValueError as error:
+        raise ValueError("quarantine next attempt is invalid") from error
     return _QuarantineMetadata(
         quarantine_id=expected_id,
         object_key=object_key,
@@ -1839,6 +3127,13 @@ def _read_quarantine_metadata(
         expected_sha256=expected_sha256,
         owner_execution_id=owner,
         created_at=created_at,
+        source_dev=source_values[0],
+        source_ino=source_values[1],
+        source_size=source_values[2],
+        source_mtime_ns=source_values[3],
+        outcome=outcome,
+        attempt_count=attempt_count,
+        next_attempt_at=next_attempt_at,
     )
 
 
@@ -1958,133 +3253,6 @@ def _put_descriptor_xattr(descriptor: int, name: bytes, value: bytes) -> None:
         raise OSError(number, os.strerror(number))
 
 
-def _recover_quarantine(
-    parent_descriptor: int,
-    relative_directory: Path,
-    quarantine_name: str,
-    quarantine_id: str,
-    cutoff: datetime,
-    referenced_artifact_keys: frozenset[str],
-    active_execution_ids: frozenset[str],
-    active_build_executions: frozenset[tuple[str, str]],
-    stats: StorageSweepStats,
-    prune_candidates: set[tuple[str, str | None]],
-) -> None:
-    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(quarantine_name, flags, dir_fd=parent_descriptor)
-    except OSError:
-        stats.invalid_quarantines += 1
-        return None
-    remove_empty = False
-    metadata: _QuarantineMetadata | None = None
-    restored = False
-    try:
-        try:
-            metadata = _read_quarantine_metadata(descriptor, quarantine_id)
-        except (OSError, RuntimeError, ValueError):
-            stats.invalid_quarantines += 1
-            metadata = None
-        status = os.fstat(descriptor)
-        if metadata is None:
-            if status.st_mtime <= cutoff.timestamp() and _descriptor_directory_empty(
-                descriptor
-            ):
-                remove_empty = True
-            return None
-        expected_parent = Path(*_object_key_parts(metadata.object_key)[:-1])
-        observed_parent = Path(
-            relative_directory.as_posix().removeprefix("./") or "."
-        )
-        if expected_parent != observed_parent:
-            stats.invalid_quarantines += 1
-            return None
-        if metadata.created_at.timestamp() > cutoff.timestamp():
-            return None
-        artifact = _GENERATED_ARTIFACT.fullmatch(metadata.object_key)
-        active_build = (
-            artifact is not None
-            and artifact.group("owner") is not None
-            and (artifact.group("task"), artifact.group("owner"))
-            in active_build_executions
-        )
-        if (
-            metadata.object_key in referenced_artifact_keys
-            or metadata.owner_execution_id in active_execution_ids
-            or active_build
-        ):
-            stats.quarantines_protected += 1
-            return None
-        try:
-            _isolate_quarantine_candidate(descriptor, metadata.original_name)
-            payload_descriptor = os.open(
-                _RECOVERY_CANDIDATE,
-                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-                dir_fd=descriptor,
-            )
-        except FileNotFoundError:
-            if _descriptor_directory_empty(descriptor):
-                remove_empty = True
-            else:
-                stats.invalid_quarantines += 1
-            return None
-        try:
-            before = os.fstat(payload_descriptor)
-            stats.bytes_hashed += before.st_size
-            digest = _hash_descriptor(payload_descriptor)
-            after = os.fstat(payload_descriptor)
-            _require_same_regular(before, after)
-            named = os.stat(
-                _RECOVERY_CANDIDATE,
-                dir_fd=descriptor,
-                follow_symlinks=False,
-            )
-            if (
-                not stat.S_ISREG(named.st_mode)
-                or _identity(named) != _identity(after)
-                or digest != metadata.expected_sha256
-            ):
-                stats.quarantine_conflicts += 1
-                return None
-        finally:
-            os.close(payload_descriptor)
-        try:
-            _rename_no_replace(
-                descriptor,
-                _RECOVERY_CANDIDATE,
-                parent_descriptor,
-                metadata.original_name,
-            )
-        except FileExistsError:
-            stats.quarantine_conflicts += 1
-            return None
-        _fsync_descriptor(descriptor)
-        _fsync_descriptor(parent_descriptor)
-        restored = True
-        remove_empty = True
-        stats.quarantines_restored += 1
-        return None
-    finally:
-        os.close(descriptor)
-        if remove_empty:
-            try:
-                os.rmdir(quarantine_name, dir_fd=parent_descriptor)
-            except OSError as error:
-                if error.errno in {errno.ENOTEMPTY, errno.EEXIST}:
-                    stats.quarantine_conflicts += 1
-                elif error.errno != errno.ENOENT:
-                    stats.invalid_quarantines += 1
-            else:
-                _fsync_descriptor(parent_descriptor)
-                if not restored:
-                    stats.empty_quarantines_removed += 1
-                    candidate = _quarantine_prune_candidate(
-                        relative_directory, metadata
-                    )
-                    if candidate is not None:
-                        prune_candidates.add(candidate)
-
-
 def _quarantine_prune_candidate(
     relative_directory: Path, metadata: _QuarantineMetadata | None
 ) -> tuple[str, str] | None:
@@ -2157,6 +3325,262 @@ def _remove_workspace_name(
         _fsync_descriptor(root_descriptor)
     finally:
         os.close(descriptor)
+
+
+def _retired_workspace_name(name: str) -> str:
+    match = _GENERATED_WORKSPACE.fullmatch(name)
+    if match is None:
+        raise RuntimeError("workspace name is not generated")
+    return f".wf-retired-v1-{match.group(1)}"
+
+
+def _workspace_status(
+    root_descriptor: int,
+    name: str,
+    expected_identity: tuple[int, int] | None,
+) -> os.stat_result | None:
+    retired = _retired_workspace_name(name)
+    for candidate in (retired, name):
+        try:
+            status = os.stat(
+                candidate, dir_fd=root_descriptor, follow_symlinks=False
+            )
+        except FileNotFoundError:
+            continue
+        if (
+            not stat.S_ISDIR(status.st_mode)
+            or stat.S_ISLNK(status.st_mode)
+            or _is_reparse(status)
+        ):
+            raise RuntimeError("workspace identity changed")
+        if expected_identity is None or _identity(status) == expected_identity:
+            return status
+        if candidate == retired:
+            raise RuntimeError("workspace retired namespace is occupied")
+    return None
+
+
+def _workspace_record_name_matches(name: str, execution_id: str) -> bool:
+    try:
+        canonical = str(UUID(execution_id))
+    except ValueError:
+        return False
+    return name == f"wf-execution-{canonical}"
+
+
+def _bounded_cleanup_workspace(
+    root_descriptor: int,
+    name: str,
+    expected_identity: tuple[int, int],
+    stats: WorkspaceSweepStats,
+    budget: StorageSweepBudget,
+    deadline: float,
+    monotonic: Callable[[], float],
+) -> bool:
+    retired = _retired_workspace_name(name)
+    try:
+        retired_status = os.stat(
+            retired, dir_fd=root_descriptor, follow_symlinks=False
+        )
+    except FileNotFoundError:
+        try:
+            current = os.stat(name, dir_fd=root_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return True
+        if _identity(current) != expected_identity or not stat.S_ISDIR(
+            current.st_mode
+        ):
+            raise RuntimeError("workspace identity changed")
+        if not _workspace_mutation_available(stats, budget, deadline, monotonic, 2):
+            return False
+        _rename_no_replace(root_descriptor, name, root_descriptor, retired)
+        stats.mutations += 1
+        _fsync_descriptor(root_descriptor)
+        stats.mutations += 1
+        stats.progress_made = True
+        retired_status = os.stat(
+            retired, dir_fd=root_descriptor, follow_symlinks=False
+        )
+    if _identity(retired_status) != expected_identity:
+        raise RuntimeError("workspace identity changed")
+    workspace = os.open(
+        retired,
+        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=root_descriptor,
+    )
+    try:
+        if _identity(os.fstat(workspace)) != expected_identity:
+            raise RuntimeError("workspace identity changed")
+        complete = _bounded_clear_workspace(
+            workspace, stats, budget, deadline, monotonic
+        )
+    finally:
+        os.close(workspace)
+    if not complete:
+        return False
+    if not _workspace_mutation_available(stats, budget, deadline, monotonic, 2):
+        return False
+    current = os.stat(retired, dir_fd=root_descriptor, follow_symlinks=False)
+    if _identity(current) != expected_identity:
+        raise RuntimeError("workspace identity changed")
+    os.rmdir(retired, dir_fd=root_descriptor)
+    stats.mutations += 1
+    _fsync_descriptor(root_descriptor)
+    stats.mutations += 1
+    stats.progress_made = True
+    return True
+
+
+def _workspace_mutation_available(
+    stats: WorkspaceSweepStats,
+    budget: StorageSweepBudget,
+    deadline: float,
+    monotonic: Callable[[], float],
+    needed: int,
+) -> bool:
+    return (
+        monotonic() < deadline
+        and stats.mutations + needed <= budget.max_mutations
+    )
+
+
+def _reserved_workspace_budget(
+    budget: StorageSweepBudget, *, reserve: int
+) -> StorageSweepBudget:
+    return StorageSweepBudget(
+        max_quarantines=budget.max_quarantines,
+        max_bytes=budget.max_bytes,
+        max_seconds=budget.max_seconds,
+        max_directories=budget.max_directories,
+        max_entries=budget.max_entries,
+        max_mutations=max(1, budget.max_mutations - reserve),
+    )
+
+
+def _read_workspace_progress(descriptor: int) -> list[str]:
+    payload = _get_descriptor_xattr(
+        descriptor, _WORKSPACE_SWEEP_XATTR, max_bytes=_MAX_SWEEP_STATE_BYTES
+    )
+    if payload is None:
+        return []
+    try:
+        value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError("workspace cleanup state is invalid") from error
+    if (
+        not isinstance(value, dict)
+        or value.get("version") != 1
+        or not isinstance(value.get("stack"), list)
+        or len(value["stack"]) > 256
+        or not all(
+            isinstance(part, str)
+            and part not in {"", ".", ".."}
+            and "/" not in part
+            and "\\" not in part
+            and len(part.encode("utf-8")) <= 255
+            for part in value["stack"]
+        )
+    ):
+        raise RuntimeError("workspace cleanup state is invalid")
+    return value["stack"]
+
+
+def _write_workspace_progress(descriptor: int, stack: list[str]) -> None:
+    payload = json.dumps(
+        {"version": 1, "stack": stack},
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(payload) > _MAX_SWEEP_STATE_BYTES:
+        raise RuntimeError("workspace cleanup state exceeds its byte limit")
+    _put_descriptor_xattr(descriptor, _WORKSPACE_SWEEP_XATTR, payload)
+    _fsync_descriptor(descriptor)
+
+
+def _open_workspace_stack(root: int, stack: list[str]) -> int:
+    descriptor = os.dup(root)
+    try:
+        for part in stack:
+            child = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _bounded_clear_workspace(
+    workspace: int,
+    stats: WorkspaceSweepStats,
+    budget: StorageSweepBudget,
+    deadline: float,
+    monotonic: Callable[[], float],
+) -> bool:
+    stack = _read_workspace_progress(workspace)
+    while True:
+        if (
+            monotonic() >= deadline
+            or stats.entries_scanned >= budget.max_entries
+            or stats.directories_scanned >= budget.max_directories
+        ):
+            return False
+        current = _open_workspace_stack(workspace, stack)
+        stats.directories_scanned += 1
+        try:
+            with os.scandir(current) as entries:
+                entry = next(entries, None)
+            if entry is None:
+                if not stack:
+                    return True
+                if not _workspace_mutation_available(
+                    stats, budget, deadline, monotonic, 4
+                ):
+                    return False
+                child_name = stack[-1]
+                os.close(current)
+                current = -1
+                parent = _open_workspace_stack(workspace, stack[:-1])
+                try:
+                    os.rmdir(child_name, dir_fd=parent)
+                    stats.mutations += 1
+                    _fsync_descriptor(parent)
+                    stats.mutations += 1
+                finally:
+                    os.close(parent)
+                stack.pop()
+                _write_workspace_progress(workspace, stack)
+                stats.mutations += 2
+                stats.progress_made = True
+                continue
+            stats.entries_scanned += 1
+            status = entry.stat(follow_symlinks=False)
+            if stat.S_ISDIR(status.st_mode) and not entry.is_symlink():
+                if not _workspace_mutation_available(
+                    stats, budget, deadline, monotonic, 2
+                ):
+                    return False
+                stack.append(entry.name)
+                _write_workspace_progress(workspace, stack)
+                stats.mutations += 2
+                stats.progress_made = True
+                continue
+            if not _workspace_mutation_available(
+                stats, budget, deadline, monotonic, 2
+            ):
+                return False
+            os.unlink(entry.name, dir_fd=current)
+            stats.mutations += 1
+            _fsync_descriptor(current)
+            stats.mutations += 1
+            stats.progress_made = True
+        finally:
+            if current != -1:
+                os.close(current)
 
 
 def _fsync_parent(parent: _ParentBinding) -> None:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from wheelforge_worker.contracts import BuildStatus
 from wheelforge_worker.jobs.consumer import JobConsumer
@@ -196,6 +196,46 @@ def test_periodic_maintenance_failure_is_sanitized_backed_off_and_does_not_stop_
     assert len(errors[0]) <= 2048
     assert "secret" not in errors[0]
     assert "hidden" not in errors[0]
+
+
+def test_maintenance_failure_after_processed_job_does_not_sleep_before_next_claim() -> None:
+    second = replace(LEASE, id="00000000-0000-4000-8000-000000000099")
+    leases = [LEASE, second]
+
+    class QueueRepository:
+        def claim_next(self, worker_id: str) -> JobLease | None:
+            assert worker_id == "worker-a"
+            return leases.pop(0) if leases else None
+
+        def retry_or_fail(
+            self, lease: JobLease, error: str, *, retryable: bool
+        ) -> bool:
+            raise AssertionError((lease, error, retryable))
+
+    repository = QueueRepository()
+    pipeline = RecordingPipeline()
+    maintenance_calls = 0
+    waits: list[float] = []
+
+    def maintenance() -> None:
+        nonlocal maintenance_calls
+        maintenance_calls += 1
+        if maintenance_calls == 1:
+            raise OSError("temporary maintenance failure")
+
+    consumer = JobConsumer(
+        repository,
+        pipeline,
+        "worker-a",
+        poll_seconds=3,
+        wait=lambda seconds: waits.append(seconds) or True,
+        maintenance=maintenance,
+    )
+
+    consumer.run_forever()
+
+    assert pipeline.leases == [LEASE, second]
+    assert waits == [3]
 
 
 def test_consumer_close_releases_owned_resources_once() -> None:
