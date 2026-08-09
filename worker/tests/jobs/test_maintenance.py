@@ -8,6 +8,7 @@ import pytest
 
 from wheelforge_worker.jobs.maintenance import MaintenanceService, MaintenanceSnapshot
 from wheelforge_worker.jobs.storage import RootedLocalStorage, WorkspaceManager
+from wheelforge_worker.jobs.storage import StorageSweepStats
 
 
 NOW = datetime(2026, 8, 1, 8, 0, 0)
@@ -213,3 +214,46 @@ def test_failed_periodic_maintenance_is_backed_off_before_retry(
     clock[0] = NOW + timedelta(minutes=10)
     assert service.run_if_due() is True
     assert calls == 2
+
+
+def test_maintenance_publishes_bounded_stats_and_rate_limits_operational_signal(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "data"
+    workspace_root = tmp_path / "workspace"
+    data_root.mkdir()
+    workspace_root.mkdir()
+    storage = RootedLocalStorage(data_root)
+    summaries: list[object] = []
+    signals: list[object] = []
+    clock = [NOW]
+
+    def sweep(*_args: object, **_kwargs: object) -> StorageSweepStats:
+        return StorageSweepStats(
+            quarantine_conflicts=2,
+            invalid_quarantines=3,
+            quarantines_examined=5,
+            bytes_hashed=128,
+            budget_exhausted=True,
+        )
+
+    storage.sweep_abandoned = sweep  # type: ignore[method-assign]
+    service = MaintenanceService(
+        SnapshotRepository(), storage, WorkspaceManager(workspace_root),
+        minimum_age=timedelta(hours=1), interval=timedelta(minutes=1),
+        failure_backoff=timedelta(seconds=30),
+        clock=lambda: clock[0], observer=summaries.append,
+        operational_signal=signals.append,
+        signal_interval=timedelta(hours=1),
+    )
+    service.run()
+    clock[0] += timedelta(minutes=2)
+    service.run_if_due()
+
+    assert len(summaries) == 2
+    assert len(signals) == 1
+    summary = summaries[0]
+    assert vars(summary) if not hasattr(summary, "__slots__") else True
+    assert summary.quarantine_conflicts == 2  # type: ignore[attr-defined]
+    assert summary.invalid_quarantines == 3  # type: ignore[attr-defined]
+    assert len(repr(summary)) <= 512

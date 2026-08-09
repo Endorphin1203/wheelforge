@@ -76,6 +76,7 @@ class JobConsumer:
 
     def run_forever(self) -> None:
         while True:
+            processed = self.run_once()
             try:
                 self._maintenance()
             except (KeyboardInterrupt, SystemExit):
@@ -89,7 +90,7 @@ class JobConsumer:
                 if self._wait(float(self._poll_seconds)):
                     return
                 continue
-            if self.run_once():
+            if processed:
                 continue
             if self._wait(float(self._poll_seconds)):
                 return

@@ -3,12 +3,15 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import errno
+import fcntl
 import json
 import os
 import re
-import shutil
 import stat
 import sys
+import time
+import threading
+from contextlib import contextmanager
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -30,7 +33,10 @@ _GENERATED_ARTIFACT = re.compile(
 )
 _QUARANTINE = re.compile(rf"\.wf-quarantine-v1-(?P<id>{_UUID_PATTERN})\Z")
 _QUARANTINE_XATTR = b"user.wheelforge.quarantine-v1"
+_SWEEP_XATTR = b"user.wheelforge.sweep-v1"
 _MAX_QUARANTINE_METADATA_BYTES = 8192
+_MAX_SWEEP_STATE_BYTES = 32768
+_RECOVERY_CANDIDATE = ".wf-recovery-candidate"
 
 
 def _utc_now() -> datetime:
@@ -55,6 +61,36 @@ class StorageSweepStats:
     quarantine_conflicts: int = 0
     invalid_quarantines: int = 0
     empty_quarantines_removed: int = 0
+    quarantines_examined: int = 0
+    bytes_hashed: int = 0
+    budget_exhausted: bool = False
+    directories_scanned: int = 0
+    entries_scanned: int = 0
+    mutations: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class StorageSweepBudget:
+    max_quarantines: int = 32
+    max_bytes: int = 16 * 1024 * 1024
+    max_seconds: float = 1.0
+    max_directories: int = 128
+    max_entries: int = 1024
+    max_mutations: int = 64
+
+    def __post_init__(self) -> None:
+        if any(
+            value <= 0
+            for value in (
+                self.max_quarantines,
+                self.max_bytes,
+                self.max_seconds,
+                self.max_directories,
+                self.max_entries,
+                self.max_mutations,
+            )
+        ):
+            raise ValueError("storage sweep budgets must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,6 +275,7 @@ class RootedLocalStorage:
         *,
         uuid_factory: Callable[[], UUID] = uuid4,
         clock: Callable[[], datetime] = _utc_now,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         _require_supported_host()
         _require_atomic_no_replace()
@@ -248,6 +285,27 @@ class RootedLocalStorage:
         self._root_identity = _identity(os.fstat(self._root_descriptor))
         self._uuid_factory = uuid_factory
         self._clock = clock
+        self._monotonic = monotonic
+        self._thread_lock = threading.RLock()
+        self._quarantine_cache: dict[str, tuple[tuple[int, int, int, int], str]] = {}
+        self._quarantine_cursor: str | None = None
+        self._quarantine_cursor_directory: str | None = None
+        self._directory_cursor: str | None = None
+        self._directory_entry_cursor: str | None = None
+        self._directory_entry_cursor_directory: str | None = None
+        self._file_cursor: str | None = None
+        self._file_cursor_directory: str | None = None
+        try:
+            with _exclusive_descriptor_gate(
+                self._thread_lock, descriptor, timeout_seconds=1.0
+            ) as acquired:
+                if not acquired:
+                    raise RuntimeError("data root mutation lock is unavailable")
+                _probe_root_capabilities(descriptor)
+                self._load_sweep_state(descriptor)
+        except BaseException as error:
+            self.close()
+            raise RuntimeError("data root capability probe failed") from error
 
     def close(self) -> None:
         if self._root_descriptor is not None:
@@ -263,6 +321,111 @@ class RootedLocalStorage:
         if self._root_descriptor is None:
             raise RuntimeError("data root is closed")
         return os.dup(self._root_descriptor)
+
+    def _root_descriptor_or_raise(self) -> int:
+        if self._root_descriptor is None:
+            raise RuntimeError("data root is closed")
+        return self._root_descriptor
+
+    def _load_sweep_state(self, descriptor: int) -> None:
+        payload = _get_descriptor_xattr(
+            descriptor, _SWEEP_XATTR, max_bytes=_MAX_SWEEP_STATE_BYTES
+        )
+        if payload is None:
+            return
+        try:
+            parsed = json.loads(payload)
+            if (
+                not isinstance(parsed, dict)
+                or parsed.get("version") != 1
+                or not isinstance(parsed.get("cache"), dict)
+            ):
+                raise ValueError
+            cursor = parsed.get("cursor")
+            quarantine_cursor_directory = parsed.get("cursorDirectory")
+            directory_cursor = parsed.get("directoryCursor")
+            directory_entry_cursor = parsed.get("directoryEntryCursor")
+            directory_entry_cursor_directory = parsed.get(
+                "directoryEntryCursorDirectory"
+            )
+            file_cursor = parsed.get("fileCursor")
+            file_cursor_directory = parsed.get("fileCursorDirectory")
+            if cursor is not None and not isinstance(cursor, str):
+                raise ValueError
+            if quarantine_cursor_directory is not None and not isinstance(
+                quarantine_cursor_directory, str
+            ):
+                raise ValueError
+            if directory_cursor is not None and not isinstance(
+                directory_cursor, str
+            ):
+                raise ValueError
+            if directory_entry_cursor is not None and not isinstance(
+                directory_entry_cursor, str
+            ):
+                raise ValueError
+            if directory_entry_cursor_directory is not None and not isinstance(
+                directory_entry_cursor_directory, str
+            ):
+                raise ValueError
+            if file_cursor is not None and not isinstance(file_cursor, str):
+                raise ValueError
+            if file_cursor_directory is not None and not isinstance(
+                file_cursor_directory, str
+            ):
+                raise ValueError
+            cache: dict[str, tuple[tuple[int, int, int, int], str]] = {}
+            for key, value in list(parsed["cache"].items())[:128]:
+                if (
+                    not isinstance(key, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", key) is None
+                    or not isinstance(value, list)
+                    or len(value) != 5
+                    or not all(isinstance(item, int) for item in value[:4])
+                    or value[4] not in {"conflict", "invalid"}
+                ):
+                    raise ValueError
+                cache[key] = (
+                    (value[0], value[1], value[2], value[3]),
+                    value[4],
+                )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            raise RuntimeError("persistent sweep state is invalid") from error
+        self._quarantine_cursor = cursor
+        self._quarantine_cursor_directory = quarantine_cursor_directory
+        self._directory_cursor = directory_cursor
+        self._directory_entry_cursor = directory_entry_cursor
+        self._directory_entry_cursor_directory = directory_entry_cursor_directory
+        self._file_cursor = file_cursor
+        self._file_cursor_directory = file_cursor_directory
+        self._quarantine_cache = cache
+
+    def _persist_sweep_state(self, descriptor: int) -> None:
+        payload = json.dumps(
+            {
+                "version": 1,
+                "cursor": self._quarantine_cursor,
+                "cursorDirectory": self._quarantine_cursor_directory,
+                "directoryCursor": self._directory_cursor,
+                "directoryEntryCursor": self._directory_entry_cursor,
+                "directoryEntryCursorDirectory": (
+                    self._directory_entry_cursor_directory
+                ),
+                "fileCursor": self._file_cursor,
+                "fileCursorDirectory": self._file_cursor_directory,
+                "cache": {
+                    key: [*fingerprint, outcome]
+                    for key, (fingerprint, outcome) in self._quarantine_cache.items()
+                },
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        if len(payload) > _MAX_SWEEP_STATE_BYTES:
+            raise RuntimeError("persistent sweep state exceeds its byte limit")
+        _put_descriptor_xattr(descriptor, _SWEEP_XATTR, payload)
+        os.fsync(descriptor)
 
     @property
     def root_identity(self) -> tuple[int, int]:
@@ -381,6 +544,18 @@ class RootedLocalStorage:
     def delete_if_owned(self, object_key: str, expected_sha256: str) -> bool:
         if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
             return False
+        if self._root_descriptor is None:
+            raise RuntimeError("data root is closed")
+        with _exclusive_descriptor_gate(
+            self._thread_lock, self._root_descriptor, timeout_seconds=5.0
+        ) as acquired:
+            if not acquired:
+                raise TimeoutError("data root mutation lock timed out")
+            return self._delete_if_owned_locked(object_key, expected_sha256)
+
+    def _delete_if_owned_locked(
+        self, object_key: str, expected_sha256: str
+    ) -> bool:
         parts = _object_key_parts(object_key)
         deleted = False
         try:
@@ -422,20 +597,38 @@ class RootedLocalStorage:
                     return False
                 restored = False
                 try:
+                    _isolate_quarantine_candidate(
+                        quarantine.descriptor, parts[-1]
+                    )
                     isolated = os.stat(
-                        parts[-1],
+                        _RECOVERY_CANDIDATE,
                         dir_fd=quarantine.descriptor,
                         follow_symlinks=False,
                     )
-                    if stat.S_ISREG(isolated.st_mode) and _identity(isolated) == identity:
-                        os.unlink(parts[-1], dir_fd=quarantine.descriptor)
+                    isolated_descriptor = os.open(
+                        _RECOVERY_CANDIDATE,
+                        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=quarantine.descriptor,
+                    )
+                    try:
+                        isolated_digest = _hash_descriptor(isolated_descriptor)
+                        isolated_after = os.fstat(isolated_descriptor)
+                    finally:
+                        os.close(isolated_descriptor)
+                    if (
+                        stat.S_ISREG(isolated.st_mode)
+                        and _identity(isolated) == identity
+                        and _identity(isolated_after) == identity
+                        and isolated_digest == expected_sha256
+                    ):
+                        os.unlink(
+                            _RECOVERY_CANDIDATE,
+                            dir_fd=quarantine.descriptor,
+                        )
                         _fsync_descriptor(quarantine.descriptor)
                         deleted = True
                     else:
-                        _restore_quarantined_no_replace(
-                            parent, quarantine, parts[-1]
-                        )
-                        restored = True
+                        return False
                 finally:
                     os.close(quarantine.descriptor)
                 if deleted or restored:
@@ -528,20 +721,135 @@ class RootedLocalStorage:
         *,
         active_execution_ids: frozenset[str],
         active_build_executions: frozenset[tuple[str, str]],
+        budget: StorageSweepBudget | None = None,
+    ) -> StorageSweepStats:
+        if self._root_descriptor is None:
+            raise RuntimeError("data root is closed")
+        limits = budget or StorageSweepBudget()
+        with _exclusive_descriptor_gate(
+            self._thread_lock,
+            self._root_descriptor,
+            timeout_seconds=limits.max_seconds,
+        ) as acquired:
+            if not acquired:
+                return StorageSweepStats(budget_exhausted=True)
+            self._load_sweep_state(self._root_descriptor)
+            return self._sweep_abandoned_locked(
+                cutoff,
+                referenced_artifact_keys,
+                active_execution_ids=active_execution_ids,
+                active_build_executions=active_build_executions,
+                budget=limits,
+            )
+
+    def _sweep_abandoned_locked(
+        self,
+        cutoff: datetime,
+        referenced_artifact_keys: frozenset[str],
+        *,
+        active_execution_ids: frozenset[str],
+        active_build_executions: frozenset[tuple[str, str]],
+        budget: StorageSweepBudget,
     ) -> StorageSweepStats:
         cutoff_timestamp = cutoff.timestamp()
         root_descriptor = self._duplicate_root()
         prune_candidates: set[tuple[str, str | None]] = set()
         stats = StorageSweepStats()
+        deadline = self._monotonic() + budget.max_seconds
+        scan_completed = True
         try:
             for directory, directories, filenames, descriptor in os.fwalk(
                 ".", topdown=True, follow_symlinks=False, dir_fd=root_descriptor
             ):
+                relative_directory_key = Path(directory).as_posix().removeprefix("./")
+                relative_directory_key = relative_directory_key or "."
+                if (
+                    self._directory_cursor is not None
+                    and relative_directory_key <= self._directory_cursor
+                ):
+                    continue
+                if (
+                    self._monotonic() >= deadline
+                    or stats.directories_scanned >= budget.max_directories
+                ):
+                    stats.budget_exhausted = True
+                    scan_completed = False
+                    break
+                stats.directories_scanned += 1
+                directories.sort()
                 safe_directories: list[str] = []
                 for name in directories:
-                    status = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                    relative_entry = (
+                        Path(directory) / name
+                    ).as_posix().removeprefix("./")
                     quarantine_match = _QUARANTINE.fullmatch(name)
+                    entry_cursor = (
+                        self._quarantine_cursor
+                        if quarantine_match is not None
+                        else self._directory_entry_cursor
+                    )
+                    cursor_directory = (
+                        self._quarantine_cursor_directory
+                        if quarantine_match is not None
+                        else self._directory_entry_cursor_directory
+                    )
+                    if (
+                        cursor_directory == relative_directory_key
+                        and
+                        entry_cursor is not None
+                        and relative_entry <= entry_cursor
+                    ):
+                        if quarantine_match is None:
+                            safe_directories.append(name)
+                        continue
+                    if stats.entries_scanned >= budget.max_entries:
+                        stats.budget_exhausted = True
+                        scan_completed = False
+                        break
+                    stats.entries_scanned += 1
+                    status = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
                     if quarantine_match is not None:
+                        relative_quarantine = relative_entry
+                        if (
+                            self._quarantine_cursor is not None
+                            and relative_quarantine <= self._quarantine_cursor
+                        ):
+                            continue
+                        if (
+                            stats.quarantines_examined >= budget.max_quarantines
+                            or stats.mutations >= budget.max_mutations
+                            or self._monotonic() >= deadline
+                        ):
+                            stats.budget_exhausted = True
+                            scan_completed = False
+                            break
+                        payload_size = _quarantine_payload_size(descriptor, name)
+                        fingerprint = _quarantine_payload_fingerprint(
+                            descriptor, name
+                        )
+                        cache_key = hashlib.sha256(
+                            relative_quarantine.encode("utf-8")
+                        ).hexdigest()
+                        cached = self._quarantine_cache.get(cache_key)
+                        if cached is not None and cached[0] == fingerprint:
+                            stats.quarantines_examined += 1
+                            if cached[1] == "conflict":
+                                stats.quarantine_conflicts += 1
+                            else:
+                                stats.invalid_quarantines += 1
+                            self._quarantine_cursor = relative_quarantine
+                            self._quarantine_cursor_directory = relative_directory_key
+                            self._persist_sweep_state(root_descriptor)
+                            continue
+                        if stats.bytes_hashed + payload_size > budget.max_bytes:
+                            stats.budget_exhausted = True
+                            scan_completed = False
+                            break
+                        stats.quarantines_examined += 1
+                        conflicts_before = stats.quarantine_conflicts
+                        invalid_before = stats.invalid_quarantines
+                        restored_before = stats.quarantines_restored
+                        empty_before = stats.empty_quarantines_removed
                         _recover_quarantine(
                             descriptor,
                             Path(directory),
@@ -554,53 +862,118 @@ class RootedLocalStorage:
                             stats,
                             prune_candidates,
                         )
+                        stats.mutations += (
+                            stats.quarantines_restored
+                            - restored_before
+                            + stats.empty_quarantines_removed
+                            - empty_before
+                        )
+                        outcome = None
+                        if stats.quarantine_conflicts > conflicts_before:
+                            outcome = "conflict"
+                        elif stats.invalid_quarantines > invalid_before:
+                            outcome = "invalid"
+                        if outcome is not None:
+                            self._quarantine_cache[cache_key] = (
+                                _quarantine_payload_fingerprint(descriptor, name),
+                                outcome,
+                            )
+                            while len(self._quarantine_cache) > 128:
+                                self._quarantine_cache.pop(next(iter(self._quarantine_cache)))
+                        self._quarantine_cursor = relative_quarantine
+                        self._quarantine_cursor_directory = relative_directory_key
+                        self._persist_sweep_state(root_descriptor)
                         continue
                     if stat.S_ISDIR(status.st_mode) and not stat.S_ISLNK(status.st_mode):
                         safe_directories.append(name)
+                    self._directory_entry_cursor = relative_entry
+                    self._directory_entry_cursor_directory = relative_directory_key
+                    self._persist_sweep_state(root_descriptor)
                 directories[:] = safe_directories
+                if not scan_completed:
+                    break
                 relative_directory = Path(directory)
+                filenames.sort()
                 for name in filenames:
                     relative = (relative_directory / name).as_posix()
                     relative = relative.removeprefix("./")
+                    if (
+                        self._file_cursor_directory == relative_directory_key
+                        and
+                        self._file_cursor is not None
+                        and relative <= self._file_cursor
+                    ):
+                        continue
+                    if (
+                        stats.entries_scanned >= budget.max_entries
+                        or stats.mutations >= budget.max_mutations
+                        or self._monotonic() >= deadline
+                    ):
+                        stats.budget_exhausted = True
+                        scan_completed = False
+                        break
+                    stats.entries_scanned += 1
                     stage_match = _GENERATED_STAGE.fullmatch(name)
                     artifact_match = _GENERATED_ARTIFACT.fullmatch(relative)
-                    if stage_match is None and artifact_match is None:
-                        continue
-                    if (
+                    protected_stage = (
                         stage_match is not None
                         and stage_match.group("owner") in active_execution_ids
-                    ):
-                        continue
-                    if artifact_match is not None and (
-                        relative in referenced_artifact_keys
-                        or (
-                            artifact_match.group("owner") is not None
-                            and (
-                                artifact_match.group("task"),
-                                artifact_match.group("owner"),
+                    )
+                    protected_artifact = (
+                        artifact_match is not None
+                        and (
+                            relative in referenced_artifact_keys
+                            or (
+                                artifact_match.group("owner") is not None
+                                and (
+                                    artifact_match.group("task"),
+                                    artifact_match.group("owner"),
+                                )
+                                in active_build_executions
                             )
-                            in active_build_executions
                         )
-                    ):
-                        continue
-                    status = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                    )
                     if (
-                        not stat.S_ISREG(status.st_mode)
-                        or status.st_mtime > cutoff_timestamp
+                        (stage_match is not None or artifact_match is not None)
+                        and not protected_stage
+                        and not protected_artifact
                     ):
-                        continue
-                    os.unlink(name, dir_fd=descriptor)
-                    _fsync_descriptor(descriptor)
-                    if artifact_match is not None:
-                        prune_candidates.add(
-                            (
-                                artifact_match.group("task"),
-                                artifact_match.group("owner"),
-                            )
+                        status = os.stat(
+                            name, dir_fd=descriptor, follow_symlinks=False
                         )
+                        if (
+                            stat.S_ISREG(status.st_mode)
+                            and status.st_mtime <= cutoff_timestamp
+                        ):
+                            os.unlink(name, dir_fd=descriptor)
+                            _fsync_descriptor(descriptor)
+                            stats.mutations += 1
+                            if artifact_match is not None:
+                                prune_candidates.add(
+                                    (
+                                        artifact_match.group("task"),
+                                        artifact_match.group("owner"),
+                                    )
+                                )
+                    self._file_cursor = relative
+                    self._file_cursor_directory = relative_directory_key
+                    self._persist_sweep_state(root_descriptor)
+                if not scan_completed:
+                    break
+                self._directory_cursor = relative_directory_key
+                self._persist_sweep_state(root_descriptor)
             _prune_artifact_directories(root_descriptor, prune_candidates)
         finally:
             os.close(root_descriptor)
+        if scan_completed:
+            self._quarantine_cursor = None
+            self._quarantine_cursor_directory = None
+            self._directory_cursor = None
+            self._directory_entry_cursor = None
+            self._directory_entry_cursor_directory = None
+            self._file_cursor = None
+            self._file_cursor_directory = None
+            self._persist_sweep_state(self._root_descriptor_or_raise())
         return stats
 
 
@@ -609,6 +982,7 @@ class OwnedWorkspace:
     path: Path
     _root_descriptor: int | None
     _identity: tuple[int, int]
+    _thread_lock: Any
     capability: WorkspaceCapability
     _cleaned: bool = False
 
@@ -617,26 +991,37 @@ class OwnedWorkspace:
             return
         if self._root_descriptor is None:
             raise RuntimeError("workspace root is closed")
-        if not shutil.rmtree.avoids_symlink_attacks:
-            raise RuntimeError("safe descriptor-relative cleanup is unavailable")
-        root_descriptor = os.dup(self._root_descriptor)
-        try:
-            current = os.stat(
-                self.path.name, dir_fd=root_descriptor, follow_symlinks=False
-            )
-            if (
-                not stat.S_ISDIR(current.st_mode)
-                or stat.S_ISLNK(current.st_mode)
-                or _is_reparse(current)
-                or _identity(current) != self._identity
-            ):
-                raise RuntimeError("workspace identity changed")
-            shutil.rmtree(self.path.name, dir_fd=root_descriptor)
-            _fsync_descriptor(root_descriptor)
-            self._cleaned = True
-            self.close()
-        finally:
-            os.close(root_descriptor)
+        with _exclusive_descriptor_gate(
+            self._thread_lock, self._root_descriptor, timeout_seconds=5.0
+        ) as acquired:
+            if not acquired:
+                raise TimeoutError("workspace mutation lock timed out")
+            root_descriptor = os.dup(self._root_descriptor)
+            workspace_descriptor = self.capability.duplicate_directory()
+            try:
+                _clear_directory_descriptor(workspace_descriptor)
+                current = os.stat(
+                    self.path.name, dir_fd=root_descriptor, follow_symlinks=False
+                )
+                if (
+                    not stat.S_ISDIR(current.st_mode)
+                    or stat.S_ISLNK(current.st_mode)
+                    or _is_reparse(current)
+                    or _identity(current) != self._identity
+                ):
+                    raise RuntimeError("workspace identity changed")
+                try:
+                    os.rmdir(self.path.name, dir_fd=root_descriptor)
+                except OSError as error:
+                    raise RuntimeError(
+                        "workspace identity changed during cleanup"
+                    ) from error
+                _fsync_descriptor(root_descriptor)
+                self._cleaned = True
+            finally:
+                os.close(workspace_descriptor)
+                os.close(root_descriptor)
+        self.close()
 
     def close(self) -> None:
         self.capability.close()
@@ -663,6 +1048,7 @@ class WorkspaceManager:
         self._root_descriptor = descriptor
         self._root_identity = _identity(os.fstat(self._root_descriptor))
         self._uuid_factory = uuid_factory
+        self._thread_lock = threading.RLock()
 
     def close(self) -> None:
         if self._root_descriptor is not None:
@@ -684,6 +1070,16 @@ class WorkspaceManager:
         return self._root_identity
 
     def allocate(self, execution_id: str | None = None) -> OwnedWorkspace:
+        if self._root_descriptor is None:
+            raise RuntimeError("workspace root is closed")
+        with _exclusive_descriptor_gate(
+            self._thread_lock, self._root_descriptor, timeout_seconds=5.0
+        ) as acquired:
+            if not acquired:
+                raise TimeoutError("workspace mutation lock timed out")
+            return self._allocate_locked(execution_id)
+
+    def _allocate_locked(self, execution_id: str | None = None) -> OwnedWorkspace:
         attempts = 1 if execution_id is not None else 128
         root_descriptor = self._duplicate_root()
         try:
@@ -731,6 +1127,7 @@ class WorkspaceManager:
                         path,
                         owned_root_descriptor,
                         _identity(status),
+                        self._thread_lock,
                         capability,
                     )
                     owned_root_descriptor = None
@@ -743,7 +1140,7 @@ class WorkspaceManager:
                         _best_effort(capability.close)
                     if owned_root_descriptor is not None:
                         _best_effort(os.close, owned_root_descriptor)
-                    _best_effort(shutil.rmtree, name, dir_fd=root_descriptor)
+                    _best_effort(_remove_workspace_name, root_descriptor, name, None)
                     raise
             raise RuntimeError("could not allocate a unique workspace")
         finally:
@@ -760,13 +1157,45 @@ class WorkspaceManager:
             raise RuntimeError("workspace root identity changed")
 
     def sweep_abandoned(
-        self, cutoff: datetime, active_execution_ids: frozenset[str]
+        self,
+        cutoff: datetime,
+        active_execution_ids: frozenset[str],
+        *,
+        budget: StorageSweepBudget | None = None,
+    ) -> None:
+        if self._root_descriptor is None:
+            raise RuntimeError("workspace root is closed")
+        limits = budget or StorageSweepBudget()
+        with _exclusive_descriptor_gate(
+            self._thread_lock,
+            self._root_descriptor,
+            timeout_seconds=limits.max_seconds,
+        ) as acquired:
+            if not acquired:
+                return
+            self._sweep_abandoned_locked(cutoff, active_execution_ids, limits)
+
+    def _sweep_abandoned_locked(
+        self,
+        cutoff: datetime,
+        active_execution_ids: frozenset[str],
+        budget: StorageSweepBudget,
     ) -> None:
         cutoff_timestamp = cutoff.timestamp()
         root_descriptor = self._duplicate_root()
+        deadline = time.monotonic() + budget.max_seconds
+        entries_seen = 0
+        mutations = 0
         try:
             with os.scandir(root_descriptor) as entries:
                 for entry in entries:
+                    if (
+                        time.monotonic() >= deadline
+                        or entries_seen >= budget.max_entries
+                        or mutations >= budget.max_mutations
+                    ):
+                        break
+                    entries_seen += 1
                     match = _GENERATED_WORKSPACE.fullmatch(entry.name)
                     if match is None or match.group(1) in active_execution_ids:
                         continue
@@ -784,7 +1213,10 @@ class WorkspaceManager:
                     )
                     if _identity(current) != _identity(status):
                         continue
-                    shutil.rmtree(entry.name, dir_fd=root_descriptor)
+                    _remove_workspace_name(
+                        root_descriptor, entry.name, _identity(status)
+                    )
+                    mutations += 1
             _fsync_descriptor(root_descriptor)
         finally:
             os.close(root_descriptor)
@@ -866,6 +1298,38 @@ def _require_supported_host() -> None:
     )
     if any(operation not in os.supports_dir_fd for operation in required):
         raise RuntimeError("safe descriptor-relative filesystem operations are unavailable")
+
+
+@contextmanager
+def _exclusive_descriptor_gate(
+    thread_lock: threading.RLock,
+    descriptor: int,
+    *,
+    timeout_seconds: float,
+) -> Any:
+    deadline = time.monotonic() + timeout_seconds
+    acquired_thread = thread_lock.acquire(timeout=timeout_seconds)
+    if not acquired_thread:
+        yield False
+        return
+    acquired_file = False
+    try:
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired_file = True
+                break
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    yield False
+                    return
+                time.sleep(min(0.01, remaining))
+        yield True
+    finally:
+        if acquired_file:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        thread_lock.release()
 
 
 def require_external_workspace_support() -> None:
@@ -1026,10 +1490,36 @@ def _restore_quarantined_no_replace(
 ) -> None:
     if parent.descriptor is None:
         raise RuntimeError("safe parent directory handle is unavailable")
+    metadata = _read_quarantine_metadata(
+        quarantine.descriptor,
+        quarantine.name.removeprefix(".wf-quarantine-v1-"),
+    )
+    if metadata is None:
+        raise OSError("quarantine metadata is unavailable")
+    _isolate_quarantine_candidate(quarantine.descriptor, object_name)
+    descriptor = os.open(
+        _RECOVERY_CANDIDATE,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=quarantine.descriptor,
+    )
+    try:
+        before = os.fstat(descriptor)
+        digest = _hash_descriptor(descriptor)
+        after = os.fstat(descriptor)
+        _require_same_regular(before, after)
+        named = os.stat(
+            _RECOVERY_CANDIDATE,
+            dir_fd=quarantine.descriptor,
+            follow_symlinks=False,
+        )
+        if _identity(named) != _identity(after) or digest != metadata.expected_sha256:
+            raise OSError("quarantine candidate failed ownership validation")
+    finally:
+        os.close(descriptor)
     try:
         _rename_no_replace(
             quarantine.descriptor,
-            object_name,
+            _RECOVERY_CANDIDATE,
             parent.descriptor,
             object_name,
         )
@@ -1039,6 +1529,18 @@ def _restore_quarantined_no_replace(
         ) from error
     _fsync_descriptor(quarantine.descriptor)
     _fsync_parent(parent)
+
+
+def _isolate_quarantine_candidate(descriptor: int, object_name: str) -> None:
+    try:
+        os.stat(_RECOVERY_CANDIDATE, dir_fd=descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        _rename_no_replace(
+            descriptor,
+            object_name,
+            descriptor,
+            _RECOVERY_CANDIDATE,
+        )
 
 
 def _remove_empty_quarantine_directory(parent: _ParentBinding, name: str) -> None:
@@ -1052,6 +1554,169 @@ def _require_atomic_no_replace() -> None:
     symbol, _flag = _atomic_rename_configuration()
     if getattr(ctypes.CDLL(None), symbol, None) is None:
         raise RuntimeError("atomic descriptor-relative no-replace rename is unavailable")
+
+
+def _probe_root_capabilities(root_descriptor: int) -> None:
+    name = f".wf-capability-probe-{uuid4()}"
+    directory = -1
+    created = False
+    failure: BaseException | None = None
+    try:
+        contender = os.open(
+            ".", os.O_RDONLY | os.O_DIRECTORY, dir_fd=root_descriptor
+        )
+        try:
+            _require_lock_contention(contender)
+        finally:
+            os.close(contender)
+        os.mkdir(name, 0o700, dir_fd=root_descriptor)
+        created = True
+        directory = os.open(
+            name,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=root_descriptor,
+        )
+        for leaf, content in (
+            ("source", b"source"),
+            ("second", b"second"),
+            ("occupied", b"occupied"),
+        ):
+            descriptor = os.open(
+                leaf,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=directory,
+            )
+            try:
+                os.write(descriptor, content)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        source_status = os.stat("source", dir_fd=directory, follow_symlinks=False)
+        second_status = os.stat("second", dir_fd=directory, follow_symlinks=False)
+        occupied_status = os.stat("occupied", dir_fd=directory, follow_symlinks=False)
+        _rename_no_replace(directory, "source", directory, "moved")
+        moved_status = os.stat("moved", dir_fd=directory, follow_symlinks=False)
+        if _identity(moved_status) != _identity(source_status):
+            raise RuntimeError("no-replace rename changed source identity")
+        moved = os.open("moved", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+        try:
+            if os.read(moved, 16) != b"source":
+                raise RuntimeError("no-replace rename changed source content")
+        finally:
+            os.close(moved)
+        try:
+            _rename_no_replace(directory, "second", directory, "occupied")
+        except FileExistsError:
+            pass
+        else:
+            raise RuntimeError("no-replace rename replaced an occupied destination")
+        if _identity(os.stat("second", dir_fd=directory)) != _identity(second_status):
+            raise RuntimeError("EEXIST changed the source")
+        if _identity(os.stat("occupied", dir_fd=directory)) != _identity(
+            occupied_status
+        ):
+            raise RuntimeError("EEXIST changed the destination")
+        marker = b"wheelforge-capability-v1"
+        _set_descriptor_xattr(directory, _QUARANTINE_XATTR, marker)
+        try:
+            _set_descriptor_xattr(directory, _QUARANTINE_XATTR, marker)
+        except OSError as error:
+            if error.errno != errno.EEXIST:
+                raise
+        else:
+            raise RuntimeError("xattr create did not preserve EEXIST semantics")
+        if _get_descriptor_xattr(directory, _QUARANTINE_XATTR) != marker:
+            raise RuntimeError("descriptor xattr round trip failed")
+        os.fsync(directory)
+        os.fsync(root_descriptor)
+    except BaseException as error:
+        failure = error
+    finally:
+        cleanup_errors: list[BaseException] = []
+        if directory != -1:
+            for leaf in ("source", "second", "occupied", "moved"):
+                try:
+                    os.unlink(leaf, dir_fd=directory)
+                except FileNotFoundError:
+                    pass
+                except BaseException as error:
+                    cleanup_errors.append(error)
+            try:
+                os.close(directory)
+            except BaseException as error:
+                cleanup_errors.append(error)
+        if created:
+            try:
+                os.rmdir(name, dir_fd=root_descriptor)
+                os.fsync(root_descriptor)
+            except BaseException as error:
+                cleanup_errors.append(error)
+        if failure is not None and cleanup_errors:
+            raise BaseExceptionGroup("capability probe and cleanup failed", [failure, *cleanup_errors])
+        if failure is not None:
+            raise failure
+        if cleanup_errors:
+            raise BaseExceptionGroup("capability probe cleanup failed", cleanup_errors)
+
+
+def _require_lock_contention(descriptor: int) -> None:
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return
+    fcntl.flock(descriptor, fcntl.LOCK_UN)
+    raise RuntimeError("data root lock contention semantics are unavailable")
+
+
+def _quarantine_payload_size(parent_descriptor: int, quarantine_name: str) -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(quarantine_name, flags, dir_fd=parent_descriptor)
+    except OSError:
+        return 0
+    try:
+        for name in (_RECOVERY_CANDIDATE,):
+            try:
+                status = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            return status.st_size if stat.S_ISREG(status.st_mode) else 0
+        with os.scandir(descriptor) as entries:
+            for entry in entries:
+                status = entry.stat(follow_symlinks=False)
+                if stat.S_ISREG(status.st_mode):
+                    return status.st_size
+        return 0
+    finally:
+        os.close(descriptor)
+
+
+def _quarantine_payload_fingerprint(
+    parent_descriptor: int, quarantine_name: str
+) -> tuple[int, int, int, int]:
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(quarantine_name, flags, dir_fd=parent_descriptor)
+    except OSError:
+        return (0, 0, 0, 0)
+    try:
+        names = (_RECOVERY_CANDIDATE,)
+        for name in names:
+            try:
+                status = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            return (*_identity(status), status.st_size, status.st_mtime_ns)
+        with os.scandir(descriptor) as entries:
+            for entry in entries:
+                status = entry.stat(follow_symlinks=False)
+                if stat.S_ISREG(status.st_mode):
+                    return (*_identity(status), status.st_size, status.st_mtime_ns)
+        status = os.fstat(descriptor)
+        return (*_identity(status), 0, status.st_mtime_ns)
+    finally:
+        os.close(descriptor)
 
 
 def _atomic_rename_configuration() -> tuple[str, int]:
@@ -1217,7 +1882,12 @@ def _set_descriptor_xattr(descriptor: int, name: bytes, value: bytes) -> None:
         raise OSError(number, os.strerror(number))
 
 
-def _get_descriptor_xattr(descriptor: int, name: bytes) -> bytes | None:
+def _get_descriptor_xattr(
+    descriptor: int,
+    name: bytes,
+    *,
+    max_bytes: int = _MAX_QUARANTINE_METADATA_BYTES,
+) -> bytes | None:
     library = ctypes.CDLL(None, use_errno=True)
     function = getattr(library, "fgetxattr", None)
     if function is None:
@@ -1249,7 +1919,7 @@ def _get_descriptor_xattr(descriptor: int, name: bytes) -> bytes | None:
         if number in missing:
             return None
         raise OSError(number, os.strerror(number))
-    if size > _MAX_QUARANTINE_METADATA_BYTES:
+    if size > max_bytes:
         raise ValueError("quarantine metadata exceeds its byte limit")
     buffer = ctypes.create_string_buffer(size)
     ctypes.set_errno(0)
@@ -1258,6 +1928,34 @@ def _get_descriptor_xattr(descriptor: int, name: bytes) -> bytes | None:
         number = ctypes.get_errno()
         raise OSError(number, os.strerror(number))
     return bytes(buffer.raw[:observed])
+
+
+def _put_descriptor_xattr(descriptor: int, name: bytes, value: bytes) -> None:
+    library = ctypes.CDLL(None, use_errno=True)
+    function = getattr(library, "fsetxattr", None)
+    if function is None:
+        raise RuntimeError("durable storage metadata is unavailable")
+    buffer = ctypes.create_string_buffer(value)
+    pointer = ctypes.cast(buffer, ctypes.c_void_p)
+    if sys.platform == "darwin":
+        function.argtypes = [
+            ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t,
+            ctypes.c_uint32, ctypes.c_int,
+        ]
+        arguments: tuple[Any, ...] = (
+            descriptor, name, pointer, len(value), 0, 0,
+        )
+    else:
+        function.argtypes = [
+            ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t,
+            ctypes.c_int,
+        ]
+        arguments = (descriptor, name, pointer, len(value), 0)
+    function.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    if function(*arguments) != 0:
+        number = ctypes.get_errno()
+        raise OSError(number, os.strerror(number))
 
 
 def _recover_quarantine(
@@ -1318,8 +2016,9 @@ def _recover_quarantine(
             stats.quarantines_protected += 1
             return None
         try:
+            _isolate_quarantine_candidate(descriptor, metadata.original_name)
             payload_descriptor = os.open(
-                metadata.original_name,
+                _RECOVERY_CANDIDATE,
                 os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
                 dir_fd=descriptor,
             )
@@ -1331,11 +2030,12 @@ def _recover_quarantine(
             return None
         try:
             before = os.fstat(payload_descriptor)
+            stats.bytes_hashed += before.st_size
             digest = _hash_descriptor(payload_descriptor)
             after = os.fstat(payload_descriptor)
             _require_same_regular(before, after)
             named = os.stat(
-                metadata.original_name,
+                _RECOVERY_CANDIDATE,
                 dir_fd=descriptor,
                 follow_symlinks=False,
             )
@@ -1351,7 +2051,7 @@ def _recover_quarantine(
         try:
             _rename_no_replace(
                 descriptor,
-                metadata.original_name,
+                _RECOVERY_CANDIDATE,
                 parent_descriptor,
                 metadata.original_name,
             )
@@ -1409,6 +2109,54 @@ def _quarantine_prune_candidate(
 def _descriptor_directory_empty(descriptor: int) -> bool:
     with os.scandir(descriptor) as entries:
         return next(entries, None) is None
+
+
+def _clear_directory_descriptor(descriptor: int) -> None:
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    with os.scandir(descriptor) as entries:
+        names = [entry.name for entry in entries]
+    for name in names:
+        status = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        if stat.S_ISDIR(status.st_mode) and not stat.S_ISLNK(status.st_mode):
+            child = os.open(name, flags, dir_fd=descriptor)
+            try:
+                child_identity = _identity(os.fstat(child))
+                _clear_directory_descriptor(child)
+                current = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                if _identity(current) != child_identity:
+                    raise RuntimeError("workspace descendant identity changed")
+                os.rmdir(name, dir_fd=descriptor)
+            finally:
+                os.close(child)
+        else:
+            os.unlink(name, dir_fd=descriptor)
+    _fsync_descriptor(descriptor)
+
+
+def _remove_workspace_name(
+    root_descriptor: int,
+    name: str,
+    expected_identity: tuple[int, int] | None,
+) -> None:
+    if _GENERATED_WORKSPACE.fullmatch(name) is None:
+        raise RuntimeError("workspace name is not generated")
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=root_descriptor,
+    )
+    try:
+        identity = _identity(os.fstat(descriptor))
+        if expected_identity is not None and identity != expected_identity:
+            raise RuntimeError("workspace identity changed")
+        _clear_directory_descriptor(descriptor)
+        current = os.stat(name, dir_fd=root_descriptor, follow_symlinks=False)
+        if _identity(current) != identity:
+            raise RuntimeError("workspace identity changed")
+        os.rmdir(name, dir_fd=root_descriptor)
+        _fsync_descriptor(root_descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _fsync_parent(parent: _ParentBinding) -> None:
