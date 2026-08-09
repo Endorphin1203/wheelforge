@@ -1665,6 +1665,15 @@ def test_unbound_publication_stage_is_cleaned_after_create_crash(
     parent.mkdir(parents=True)
     stage = parent / f".wf-stage-{execution}-{stage_id}"
     stage.write_bytes(b"partial")
+    stage_descriptor = os.open(stage, os.O_RDONLY)
+    try:
+        storage_module._set_descriptor_xattr(
+            stage_descriptor,
+            storage_module._PUBLICATION_XATTR,
+            stage_id.encode("ascii"),
+        )
+    finally:
+        os.close(stage_descriptor)
     os.utime(stage, (1_000_000_000, 1_000_000_000))
     storage_module._queue_enqueue(
         storage._root_descriptor_or_raise(),
@@ -1675,6 +1684,7 @@ def test_unbound_publication_stage_is_cleaned_after_create_crash(
             "kind": "publication",
             "objectKey": f"artifacts/{task}/{execution}/{artifact}.zip",
             "stageObjectKey": stage.relative_to(root).as_posix(),
+            "stageOwnershipToken": stage_id,
             "ownerExecutionId": execution,
             "createdAt": datetime(2001, 1, 1).isoformat(),
         },
@@ -1692,6 +1702,50 @@ def test_unbound_publication_stage_is_cleaned_after_create_crash(
     )
     assert not stage.exists()
     assert counts["ready"] + counts["deferred"] + counts["held"] == 0
+
+
+def test_unbound_publication_intent_preserves_unmarked_stage_collision(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "data"
+    root.mkdir()
+    storage = RootedLocalStorage(root)
+    task = "20000000-0000-4000-8000-000000000625"
+    execution = "10000000-0000-4000-8000-000000000625"
+    artifact = "30000000-0000-4000-8000-000000000625"
+    stage_id = "40000000-0000-4000-8000-000000000625"
+    parent = root / "artifacts" / task / execution
+    parent.mkdir(parents=True)
+    stage = parent / f".wf-stage-{execution}-{stage_id}"
+    stage.write_bytes(b"foreign")
+    os.utime(stage, (1_000_000_000, 1_000_000_000))
+    storage_module._queue_enqueue(
+        storage._root_descriptor_or_raise(),
+        storage_module._QUEUE_ROOT,
+        "ready",
+        {
+            "version": 2,
+            "kind": "publication",
+            "objectKey": f"artifacts/{task}/{execution}/{artifact}.zip",
+            "stageObjectKey": stage.relative_to(root).as_posix(),
+            "stageOwnershipToken": stage_id,
+            "ownerExecutionId": execution,
+            "createdAt": datetime(2001, 1, 1).isoformat(),
+        },
+    )
+
+    storage.sweep_abandoned(
+        datetime.fromtimestamp(1_000_000_001),
+        frozenset(),
+        active_execution_ids=frozenset(),
+        active_build_executions=frozenset(),
+    )
+
+    counts = storage_module._queue_counts(
+        storage._root_descriptor_or_raise(), storage_module._QUEUE_ROOT
+    )
+    assert stage.read_bytes() == b"foreign"
+    assert counts["held"] == 1
 
 
 def test_preexisting_stage_collision_preserves_file_and_releases_intent(

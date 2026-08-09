@@ -40,6 +40,7 @@ _LEGACY_QUARANTINE_STATE_XATTR = b"user.wheelforge.legacy-quarantine-v1"
 _LEGACY_MIGRATION_STATE_XATTR = b"user.wheelforge.legacy-migration-v1"
 _LEGACY_MIGRATION_COMPLETE = b"complete"
 _LEGACY_MIGRATION_HELD_LIMIT = b"held-limit"
+_PUBLICATION_XATTR = b"user.wheelforge.publication-v1"
 _WORKSPACE_SWEEP_XATTR = b"user.wheelforge.workspace-sweep-v1"
 _QUEUE_ROOT = ".wf-maintenance-v2"
 _WORKSPACE_QUEUE_ROOT = ".wf-workspace-maint-v2"
@@ -631,8 +632,9 @@ class RootedLocalStorage:
     ) -> PublishedObject:
         parts = _object_key_parts(object_key)
         owner = str(UUID(owner_execution_id)) if owner_execution_id else None
+        stage_identifier = str(self._uuid_factory())
         stage_name = ".wf-stage-{}{}".format(
-            f"{owner}-" if owner else "", self._uuid_factory()
+            f"{owner}-" if owner else "", stage_identifier
         )
         stage_key = "/".join((*parts[:-1], stage_name))
         root_descriptor = self._root_descriptor_or_raise()
@@ -654,6 +656,7 @@ class RootedLocalStorage:
                         "kind": "publication",
                         "objectKey": object_key,
                         "stageObjectKey": stage_key,
+                        "stageOwnershipToken": stage_identifier,
                         "ownerExecutionId": owner,
                         "createdAt": self._clock().isoformat(
                             timespec="microseconds"
@@ -662,6 +665,11 @@ class RootedLocalStorage:
                 )
                 parent = self._open_parent(parts[:-1], create=True)
                 descriptor = _create_exclusive(parent, stage_name)
+                _set_descriptor_xattr(
+                    descriptor, _PUBLICATION_XATTR, stage_identifier.encode("ascii")
+                )
+                os.fsync(descriptor)
+                _fsync_parent(parent)
             assert parent is not None
             assert intent is not None
             with os.fdopen(os.dup(descriptor), "wb") as handle:
@@ -1077,6 +1085,14 @@ class RootedLocalStorage:
                 )
             ):
                 if canonical is not None:
+                    return "held"
+                ownership_token = item.record.get("stageOwnershipToken")
+                if (
+                    not isinstance(ownership_token, str)
+                    or not _publication_marker_matches(
+                        parent, stage_parts[-1], ownership_token
+                    )
+                ):
                     return "held"
                 if (
                     staged is not None
@@ -2316,6 +2332,28 @@ def _optional_named_regular_status(
     if not stat.S_ISREG(status.st_mode):
         raise RuntimeError("maintenance queue target is not a regular file")
     return status
+
+
+def _publication_marker_matches(
+    parent: _ParentBinding, name: str, token: str
+) -> bool:
+    try:
+        canonical_token = str(UUID(token))
+    except ValueError:
+        return False
+    if canonical_token != token:
+        return False
+    try:
+        descriptor = _open_regular(parent, name, os.O_RDONLY)
+    except FileNotFoundError:
+        return False
+    try:
+        marker = _get_descriptor_xattr(
+            descriptor, _PUBLICATION_XATTR, max_bytes=64
+        )
+    finally:
+        os.close(descriptor)
+    return marker == token.encode("ascii")
 
 
 def _unlink_named(parent: _ParentBinding, name: str) -> None:
