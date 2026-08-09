@@ -49,7 +49,7 @@ _QUEUE_SEGMENT_SIZE = 128
 _QUEUE_MAX_SEGMENTS = 32
 _QUEUE_MAX_RECORDS = _QUEUE_SEGMENT_SIZE * _QUEUE_MAX_SEGMENTS
 _QUEUE_MAX_RECORD_BYTES = 16 * 1024 * 1024
-_QUEUE_RECONCILE_MAX_MUTATIONS = _QUEUE_MAX_RECORDS * 3
+_QUEUE_RECONCILE_MAX_MUTATIONS = _QUEUE_MAX_RECORDS * 4
 _LEGACY_MIGRATION_MAX_DIRECTORIES = 4096
 _LEGACY_MIGRATION_MAX_ENTRIES = 32768
 _MAX_QUARANTINE_METADATA_BYTES = 8192
@@ -368,7 +368,9 @@ class RootedLocalStorage:
                     raise RuntimeError("data root mutation lock is unavailable")
                 _probe_root_capabilities(descriptor)
                 _ensure_segmented_queue(descriptor, _QUEUE_ROOT)
-                _migrate_nested_legacy_quarantines(descriptor)
+                _migrate_nested_legacy_quarantines(
+                    descriptor, monotonic=self._monotonic
+                )
             _probe_lock_reacquire(descriptor)
         except BaseException as error:
             self.close()
@@ -698,7 +700,17 @@ class RootedLocalStorage:
             return PublishedObject(object_key, size, digest)
         except BaseException as primary:
             cleanup_errors: list[BaseException] = []
-            if descriptor is not None and parent is not None:
+            if intent is not None and descriptor is None:
+                try:
+                    with _exclusive_descriptor_gate(
+                        self._thread_lock, root_descriptor, timeout_seconds=5.0
+                    ) as acquired:
+                        if not acquired:
+                            raise TimeoutError("data root cleanup lock timed out")
+                        _queue_complete(root_descriptor, _QUEUE_ROOT, intent)
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+            elif descriptor is not None and parent is not None:
                 try:
                     with _exclusive_descriptor_gate(
                         self._thread_lock, root_descriptor, timeout_seconds=5.0
@@ -1064,7 +1076,20 @@ class RootedLocalStorage:
                     source_mtime_ns,
                 )
             ):
-                return "held"
+                if canonical is not None:
+                    return "held"
+                if (
+                    staged is not None
+                    and (
+                        staged.st_mtime > cutoff.timestamp()
+                        or stage_match.group("owner") in active_execution_ids
+                    )
+                ):
+                    return "deferred"
+                if staged is not None:
+                    os.unlink(stage_parts[-1], dir_fd=parent.descriptor)
+                    _fsync_parent(parent)
+                return "done"
             source_identity = (source_dev, source_ino)
 
             def is_owned(status: os.stat_result | None) -> bool:
@@ -1760,6 +1785,18 @@ class WorkspaceManager:
                             root_descriptor, _WORKSPACE_QUEUE_ROOT, item
                         )
                         stats.mutations += 5
+                        stats.progress_made = True
+                        continue
+                    if expected_identity is None:
+                        stats.invalid_workspaces += 1
+                        _queue_move(
+                            root_descriptor,
+                            _WORKSPACE_QUEUE_ROOT,
+                            item,
+                            "held",
+                        )
+                        stats.workspaces_held += 1
+                        stats.mutations += 10
                         stats.progress_made = True
                         continue
                     if observed.st_mtime > _datetime_timestamp(cutoff):
@@ -2855,7 +2892,11 @@ def _index_legacy_quarantine(
     metadata: _QuarantineMetadata | None,
     stats: StorageSweepStats,
     budget: StorageSweepBudget,
+    *,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> None:
+    _require_legacy_migration_time(deadline, monotonic)
     # A complete V2 source snapshot is written only by the registered path,
     # before the canonical name is moved into quarantine.
     if metadata is not None and metadata.source_identity is not None:
@@ -2866,7 +2907,12 @@ def _index_legacy_quarantine(
         return
     if stats.mutations + 16 > budget.max_mutations:
         stats.budget_exhausted = True
+        if deadline is not None:
+            raise _LegacyMigrationLimitExceeded(
+                "legacy quarantine migration mutation limit exceeded"
+            )
         return
+    _require_legacy_migration_time(deadline, monotonic)
     if metadata is None:
         _queue_enqueue(
             root_descriptor,
@@ -2878,6 +2924,7 @@ def _index_legacy_quarantine(
                 "kind": "legacyHeld",
             },
         )
+        _require_legacy_migration_time(deadline, monotonic)
         _set_descriptor_xattr(
             descriptor, _LEGACY_QUARANTINE_STATE_XATTR, b"held"
         )
@@ -2901,7 +2948,9 @@ def _index_legacy_quarantine(
                 ),
             },
         )
+        _require_legacy_migration_time(deadline, monotonic)
         _persist_quarantine_outcome(descriptor, metadata, outcome)
+        _require_legacy_migration_time(deadline, monotonic)
         _set_descriptor_xattr(
             descriptor, _LEGACY_QUARANTINE_STATE_XATTR, lane.encode("ascii")
         )
@@ -2912,7 +2961,11 @@ def _index_legacy_quarantine(
     stats.progress_made = True
 
 
-def _migrate_nested_legacy_quarantines(root_descriptor: int) -> None:
+def _migrate_nested_legacy_quarantines(
+    root_descriptor: int,
+    *,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> None:
     migration_state = _get_descriptor_xattr(
         root_descriptor, _LEGACY_MIGRATION_STATE_XATTR, max_bytes=32
     )
@@ -2936,6 +2989,7 @@ def _migrate_nested_legacy_quarantines(root_descriptor: int) -> None:
         )
         _fsync_descriptor(root_descriptor)
         return
+    deadline = monotonic() + 60.0
     stats = StorageSweepStats()
     budget = StorageSweepBudget(
         max_quarantines=_QUEUE_MAX_RECORDS,
@@ -2950,6 +3004,7 @@ def _migrate_nested_legacy_quarantines(root_descriptor: int) -> None:
 
     def scan(parent: int, depth: int) -> None:
         nonlocal directories, entries
+        _require_legacy_migration_time(deadline, monotonic)
         directories += 1
         if directories > _LEGACY_MIGRATION_MAX_DIRECTORIES:
             raise _LegacyMigrationLimitExceeded(
@@ -2957,6 +3012,7 @@ def _migrate_nested_legacy_quarantines(root_descriptor: int) -> None:
             )
         with os.scandir(parent) as children:
             for child in children:
+                _require_legacy_migration_time(deadline, monotonic)
                 entries += 1
                 if entries > _LEGACY_MIGRATION_MAX_ENTRIES:
                     raise _LegacyMigrationLimitExceeded(
@@ -2987,6 +3043,8 @@ def _migrate_nested_legacy_quarantines(root_descriptor: int) -> None:
                             metadata,
                             stats,
                             budget,
+                            deadline=deadline,
+                            monotonic=monotonic,
                         )
                     finally:
                         os.close(descriptor)
@@ -3014,6 +3072,7 @@ def _migrate_nested_legacy_quarantines(root_descriptor: int) -> None:
             scan(artifacts, 0)
         finally:
             os.close(artifacts)
+        _require_legacy_migration_time(deadline, monotonic)
     except _LegacyMigrationLimitExceeded:
         _set_descriptor_xattr(
             root_descriptor,
@@ -3028,6 +3087,15 @@ def _migrate_nested_legacy_quarantines(root_descriptor: int) -> None:
         _LEGACY_MIGRATION_COMPLETE,
     )
     _fsync_descriptor(root_descriptor)
+
+
+def _require_legacy_migration_time(
+    deadline: float | None, monotonic: Callable[[], float]
+) -> None:
+    if deadline is not None and monotonic() >= deadline:
+        raise _LegacyMigrationLimitExceeded(
+            "legacy quarantine migration time limit exceeded"
+        )
 
 
 def _read_quarantine_metadata(

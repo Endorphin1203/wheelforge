@@ -1267,6 +1267,77 @@ def test_queue_reconcile_adopts_slot_fsynced_before_state_update(
     assert item.record["recordId"] == "00000000-0000-4000-8000-000000000501"
 
 
+def test_queue_crash_before_final_link_discards_only_deterministic_temp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "data"
+    root.mkdir(mode=0o700)
+    storage = RootedLocalStorage(root)
+    real_link = storage_module._segmented_queue.os.link
+
+    def crash_before_link(*_args: object, **_kwargs: object) -> None:
+        raise OSError("crash before final slot link")
+
+    monkeypatch.setattr(storage_module._segmented_queue.os, "link", crash_before_link)
+    with pytest.raises(OSError, match="crash before final slot link"):
+        storage_module._queue_enqueue(
+            storage._root_descriptor_or_raise(),
+            storage_module._QUEUE_ROOT,
+            "ready",
+            _queue_record("00000000-0000-4000-8000-000000000617"),
+        )
+    temp_entries = list((root / storage_module._QUEUE_ROOT / "ready").rglob("*.tmp"))
+    assert [path.name for path in temp_entries] == ["000.json.tmp"]
+    storage.close()
+    monkeypatch.setattr(storage_module._segmented_queue.os, "link", real_link)
+
+    restarted = RootedLocalStorage(root)
+    counts = storage_module._queue_counts(
+        restarted._root_descriptor_or_raise(), storage_module._QUEUE_ROOT
+    )
+
+    assert counts["ready"] == 0
+    assert not list((root / storage_module._QUEUE_ROOT).rglob("*.tmp"))
+
+
+def test_queue_crash_after_final_link_adopts_final_and_removes_temp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "data"
+    root.mkdir(mode=0o700)
+    storage = RootedLocalStorage(root)
+    real_unlink = storage_module._segmented_queue.os.unlink
+
+    def crash_before_temp_unlink(
+        name: object, *args: object, **kwargs: object
+    ) -> None:
+        if name == "000.json.tmp":
+            raise OSError("crash after final slot link")
+        real_unlink(name, *args, **kwargs)
+
+    monkeypatch.setattr(
+        storage_module._segmented_queue.os, "unlink", crash_before_temp_unlink
+    )
+    with pytest.raises(OSError, match="crash after final slot link"):
+        storage_module._queue_enqueue(
+            storage._root_descriptor_or_raise(),
+            storage_module._QUEUE_ROOT,
+            "ready",
+            _queue_record("00000000-0000-4000-8000-000000000618"),
+        )
+    storage.close()
+    monkeypatch.setattr(storage_module._segmented_queue.os, "unlink", real_unlink)
+
+    restarted = RootedLocalStorage(root)
+    item = storage_module._queue_peek(
+        restarted._root_descriptor_or_raise(), storage_module._QUEUE_ROOT, "ready"
+    )
+
+    assert item is not None
+    assert item.record["recordId"] == "00000000-0000-4000-8000-000000000618"
+    assert not list((root / storage_module._QUEUE_ROOT).rglob("*.tmp"))
+
+
 def test_queue_reconcile_finishes_unlink_before_head_state_crash(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1577,6 +1648,71 @@ def test_planned_publication_with_no_paths_is_completed_not_held(
     counts = storage_module._queue_counts(
         storage._root_descriptor_or_raise(), storage_module._QUEUE_ROOT
     )
+    assert counts["ready"] + counts["deferred"] + counts["held"] == 0
+
+
+def test_unbound_publication_stage_is_cleaned_after_create_crash(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "data"
+    root.mkdir()
+    storage = RootedLocalStorage(root)
+    task = "20000000-0000-4000-8000-000000000620"
+    execution = "10000000-0000-4000-8000-000000000620"
+    artifact = "30000000-0000-4000-8000-000000000620"
+    stage_id = "40000000-0000-4000-8000-000000000620"
+    parent = root / "artifacts" / task / execution
+    parent.mkdir(parents=True)
+    stage = parent / f".wf-stage-{execution}-{stage_id}"
+    stage.write_bytes(b"partial")
+    os.utime(stage, (1_000_000_000, 1_000_000_000))
+    storage_module._queue_enqueue(
+        storage._root_descriptor_or_raise(),
+        storage_module._QUEUE_ROOT,
+        "ready",
+        {
+            "version": 2,
+            "kind": "publication",
+            "objectKey": f"artifacts/{task}/{execution}/{artifact}.zip",
+            "stageObjectKey": stage.relative_to(root).as_posix(),
+            "ownerExecutionId": execution,
+            "createdAt": datetime(2001, 1, 1).isoformat(),
+        },
+    )
+
+    storage.sweep_abandoned(
+        datetime.fromtimestamp(1_000_000_001),
+        frozenset(),
+        active_execution_ids=frozenset(),
+        active_build_executions=frozenset(),
+    )
+
+    counts = storage_module._queue_counts(
+        storage._root_descriptor_or_raise(), storage_module._QUEUE_ROOT
+    )
+    assert not stage.exists()
+    assert counts["ready"] + counts["deferred"] + counts["held"] == 0
+
+
+def test_preexisting_stage_collision_preserves_file_and_releases_intent(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "data"
+    root.mkdir()
+    stage_id = UUID("40000000-0000-4000-8000-000000000621")
+    storage = RootedLocalStorage(root, uuid_factory=lambda: stage_id)
+    parent = root / "objects"
+    parent.mkdir()
+    stage = parent / f".wf-stage-{stage_id}"
+    stage.write_bytes(b"foreign")
+
+    with pytest.raises(FileExistsError):
+        storage.publish_bytes("objects/result.bin", b"ours")
+
+    counts = storage_module._queue_counts(
+        storage._root_descriptor_or_raise(), storage_module._QUEUE_ROOT
+    )
+    assert stage.read_bytes() == b"foreign"
     assert counts["ready"] + counts["deferred"] + counts["held"] == 0
 
 
@@ -1970,7 +2106,7 @@ def test_workspace_intent_precedes_allocated_directory_creation(
     owned.cleanup()
 
 
-def test_workspace_mkdir_crash_is_recovered_from_planned_intent(
+def test_workspace_mkdir_crash_is_held_without_unbound_deletion(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "workspace"
@@ -1998,9 +2134,44 @@ def test_workspace_mkdir_crash_is_recovered_from_planned_intent(
         datetime(2100, 1, 1), active_execution_ids=frozenset()
     )
 
-    assert result.workspaces_removed == 1
-    assert not (root / f"wf-execution-{identifier}").exists()
+    assert result.workspaces_removed == 0
+    assert result.workspaces_held == 1
+    assert (root / f"wf-execution-{identifier}").is_dir()
     assert result.backlog_entries == 0
+
+
+def test_workspace_planned_intent_never_deletes_foreign_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    identifier = UUID("10000000-0000-4000-8000-000000000619")
+    manager = WorkspaceManager(root, uuid_factory=lambda: identifier)
+    real_mkdir = storage_module.os.mkdir
+
+    def crash_before_workspace_mkdir(
+        name: object, *args: object, **kwargs: object
+    ) -> object:
+        if isinstance(name, str) and name.startswith("wf-execution-"):
+            raise SystemExit("injected crash before mkdir")
+        return real_mkdir(name, *args, **kwargs)
+
+    monkeypatch.setattr(storage_module.os, "mkdir", crash_before_workspace_mkdir)
+    with pytest.raises(SystemExit, match="before mkdir"):
+        manager.allocate()
+    monkeypatch.setattr(storage_module.os, "mkdir", real_mkdir)
+    manager.close()
+    foreign = root / f"wf-execution-{identifier}"
+    foreign.mkdir()
+    (foreign / "foreign.txt").write_text("preserve")
+
+    restarted = WorkspaceManager(root)
+    result = restarted.sweep_abandoned(
+        datetime(2100, 1, 1), active_execution_ids=frozenset()
+    )
+
+    assert result.workspaces_held == 1
+    assert (foreign / "foreign.txt").read_text() == "preserve"
 
 
 def test_startup_migrates_nested_legacy_quarantine_once_and_marks_complete(
@@ -2114,6 +2285,71 @@ def test_legacy_migration_limit_is_persistently_held_without_rescan(
         RootedLocalStorage(root)
     assert isinstance(error.value.__cause__, RuntimeError)
     assert "held" in str(error.value.__cause__)
+
+
+def test_legacy_migration_never_marks_complete_after_record_budget_exhaustion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "data"
+    nested = (
+        root
+        / "artifacts"
+        / "20000000-0000-4000-8000-000000000622"
+        / "10000000-0000-4000-8000-000000000622"
+    )
+    for suffix in ("622", "623"):
+        quarantine = nested / (
+            ".wf-quarantine-v1-40000000-0000-4000-8000-000000000" + suffix
+        )
+        quarantine.mkdir(parents=True)
+        (quarantine / "legacy.zip").write_bytes(b"legacy")
+    monkeypatch.setattr(storage_module, "_QUEUE_MAX_RECORDS", 1)
+
+    with pytest.raises(RuntimeError, match="data root capability probe failed"):
+        RootedLocalStorage(root)
+
+    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        marker = storage_module._get_descriptor_xattr(
+            descriptor,
+            storage_module._LEGACY_MIGRATION_STATE_XATTR,
+            max_bytes=32,
+        )
+    finally:
+        os.close(descriptor)
+    assert marker == storage_module._LEGACY_MIGRATION_HELD_LIMIT
+
+
+def test_legacy_migration_enforces_absolute_time_budget(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "data"
+    nested = (
+        root
+        / "artifacts"
+        / "20000000-0000-4000-8000-000000000624"
+        / "10000000-0000-4000-8000-000000000624"
+    )
+    quarantine = (
+        nested / ".wf-quarantine-v1-40000000-0000-4000-8000-000000000624"
+    )
+    quarantine.mkdir(parents=True)
+    (quarantine / "legacy.zip").write_bytes(b"legacy")
+    moments = iter((0.0, 61.0, 61.0, 61.0))
+
+    with pytest.raises(RuntimeError, match="data root capability probe failed"):
+        RootedLocalStorage(root, monotonic=lambda: next(moments, 61.0))
+
+    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        marker = storage_module._get_descriptor_xattr(
+            descriptor,
+            storage_module._LEGACY_MIGRATION_STATE_XATTR,
+            max_bytes=32,
+        )
+    finally:
+        os.close(descriptor)
+    assert marker == storage_module._LEGACY_MIGRATION_HELD_LIMIT
 
 
 def test_quarantine_queue_order_covers_dfs_lexical_counterexample(

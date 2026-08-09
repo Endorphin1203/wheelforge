@@ -253,6 +253,8 @@ def enqueue(
         for _ in range(limits.capacity):
             segment_number, slot_number = divmod(cursor, limits.segment_size)
             segment_name = f"{segment_number:016x}"
+            slot_name = f"{slot_number:03d}.json"
+            temp_name = f"{slot_name}.tmp"
             segment_created = False
             try:
                 os.mkdir(segment_name, 0o700, dir_fd=lane)
@@ -268,7 +270,7 @@ def enqueue(
             )
             try:
                 descriptor = os.open(
-                    f"{slot_number:03d}.json",
+                    temp_name,
                     os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
                     0o600,
                     dir_fd=segment,
@@ -283,6 +285,23 @@ def enqueue(
                 os.fsync(descriptor)
             finally:
                 os.close(descriptor)
+            try:
+                os.link(
+                    temp_name,
+                    slot_name,
+                    src_dir_fd=segment,
+                    dst_dir_fd=segment,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                os.unlink(temp_name, dir_fd=segment)
+                io.fsync(segment)
+                os.close(segment)
+                segment = -1
+                cursor = (cursor + 1) % limits.capacity
+                continue
+            io.fsync(segment)
+            os.unlink(temp_name, dir_fd=segment)
             io.fsync(segment)
             lane_state["count"] += 1
             lane_state["bytes"] += len(payload)
@@ -488,7 +507,17 @@ def reconcile(
                     dir_fd=lane,
                 )
                 try:
+                    removed_temp = False
                     for slot_number in range(limits.segment_size):
+                        try:
+                            os.unlink(
+                                f"{slot_number:03d}.json.tmp", dir_fd=segment
+                            )
+                        except FileNotFoundError:
+                            pass
+                        else:
+                            removed_temp = True
+                            mutations += 1
                         slot_value = _read_slot(
                             segment, slot_number, limits.record_max_bytes
                         )
@@ -505,6 +534,10 @@ def reconcile(
                         )
                         if len(observed) > limits.max_records:
                             raise QueueCapacityError("maintenance queue record limit is exhausted")
+                    if removed_temp:
+                        io.fsync(segment)
+                        mutations += 1
+                        _check_reconcile_budget(mutations, limits)
                 finally:
                     os.close(segment)
 
