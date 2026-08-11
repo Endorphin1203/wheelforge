@@ -54,6 +54,14 @@ public class SecurityConfig {
                 authorization
                     .requestMatchers(HttpMethod.POST, "/api/auth/login")
                     .permitAll()
+                    .requestMatchers(
+                        HttpMethod.GET,
+                        "/",
+                        "/index.html",
+                        "/favicon.svg",
+                        "/manifest.webmanifest",
+                        "/assets/**")
+                    .permitAll()
                     .requestMatchers("/actuator/health/**")
                     .permitAll()
                     .anyRequest()

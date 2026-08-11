@@ -1,18 +1,29 @@
-.PHONY: test lint verify verify-mysql verify-worker-mysql
+.PHONY: test lint frontend-test frontend-verify verify verify-mysql verify-worker-mysql
 
 test:
 	./mvnw -q -pl backend test
 	cd worker && .venv/bin/python -m pytest -q
+	cd frontend && npm run test:run
 
 lint:
 	cd worker && .venv/bin/ruff check src tests
 	cd worker && .venv/bin/mypy src
+	cd frontend && npm run typecheck
+
+frontend-test:
+	cd frontend && npm run test:run
+
+frontend-verify:
+	cd frontend && npm run typecheck
+	cd frontend && npm run test:run
+	cd frontend && npm run build
 
 verify:
 	./mvnw -q -pl backend test
 	cd worker && .venv/bin/ruff check src tests
 	cd worker && .venv/bin/mypy src
 	cd worker && .venv/bin/pytest -q
+	$(MAKE) frontend-verify
 
 verify-mysql: verify-worker-mysql
 	@test -n "$(WF_TEST_JDBC_URL)" || { echo "make verify-mysql: WF_TEST_JDBC_URL is required"; exit 1; }

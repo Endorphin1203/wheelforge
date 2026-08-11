@@ -18,6 +18,11 @@ spring:
     multipart:
       max-file-size: 512KB
       max-request-size: 1MB
+  web:
+    resources:
+      static-locations:
+        - classpath:/static/
+        - file:${WF_FRONTEND_ROOT:/opt/wheelforge/frontend/dist/}
 
 wheelforge:
   auth:
