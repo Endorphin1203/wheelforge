@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterable
@@ -36,6 +37,7 @@ from wheelforge_worker.contracts import (
     RequirementParsePayload,
 )
 from wheelforge_worker.download import (
+    DownloadLimits,
     DownloadCancelledError,
     DownloadedWheel,
     WheelDownloadError,
@@ -68,7 +70,7 @@ from wheelforge_worker.validation import (
 
 from .errors import contains_exception, sanitize_error
 from .repository import (
-    MAX_RESOLVED_PACKAGES,
+    BuildResourceLimits,
     JobLease,
     JobRepository,
     LostLeaseError,
@@ -238,9 +240,18 @@ class DefaultBuildStages:
         candidate_provider: BuiltinCandidateProvider | None = None,
         *,
         downloader_factory: Callable[[Path], _Downloader] | None = None,
+        limits: BuildResourceLimits = BuildResourceLimits(),
     ) -> None:
         self._candidate_provider = candidate_provider or BuiltinCandidateProvider()
         self._downloader_factory = downloader_factory
+        self._limits = limits
+
+    def with_limits(self, limits: BuildResourceLimits) -> DefaultBuildStages:
+        return DefaultBuildStages(
+            self._candidate_provider,
+            downloader_factory=self._downloader_factory,
+            limits=limits,
+        )
 
     def resolve(
         self,
@@ -249,11 +260,22 @@ class DefaultBuildStages:
         workspace: WorkspaceCapability,
     ) -> ResolutionResult:
         external = workspace.external()
-        strict = StrictResolver(
-            external.path, inherited_fds=external.inherited_fds
-        )
+        strict = StrictResolver(external.path, inherited_fds=external.inherited_fds)
         resolver = CompatibleResolver(strict, self._candidate_provider)
-        return resolver.resolve(parsed, target, SOURCE_ORDER, ResolveLimits())
+        return resolver.resolve(
+            parsed,
+            target,
+            SOURCE_ORDER,
+            ResolveLimits(
+                max_candidates_per_requirement=(
+                    self._limits.max_candidates_per_requirement
+                ),
+                max_resolution_attempts=self._limits.max_resolution_attempts,
+                timeout=timedelta(
+                    seconds=min(self._limits.task_timeout_seconds, 10 * 60)
+                ),
+            ),
+        )
 
     def download(
         self,
@@ -265,11 +287,20 @@ class DefaultBuildStages:
         workspace.mkdir("download-work")
         external = workspace.external("download-work")
         download_root = external.path
-        if len(resolution.packages) > 500:
+        if len(resolution.packages) > self._limits.max_packages:
             raise ValueError("resolved package count exceeds the limit")
+        download_limits = DownloadLimits(
+            max_packages=self._limits.max_packages,
+            max_wheel_bytes=self._limits.max_wheel_bytes,
+            max_total_bytes=self._limits.max_total_bytes,
+        )
         downloader = (
             WheelDownloader(
                 download_root,
+                timeout=timedelta(
+                    seconds=min(self._limits.task_timeout_seconds, 10 * 60)
+                ),
+                limits=download_limits,
                 inherited_fds=external.inherited_fds,
                 trusted_fd_bound=True,
             )
@@ -293,7 +324,9 @@ class DefaultBuildStages:
                 failures.append(PackageFailure(package.name, str(error)[:2000]))
                 continue
             total_bytes += wheel.byte_size
-            if total_bytes > 2 * 1024 * 1024 * 1024:
+            if wheel.byte_size > self._limits.max_wheel_bytes:
+                raise ValueError("downloaded Wheel byte limit exceeded")
+            if total_bytes > self._limits.max_total_bytes:
                 raise ValueError("total downloaded Wheel byte limit exceeded")
             wheels.append(wheel)
         return BuildDownload(tuple(wheels), tuple(failures))
@@ -325,7 +358,14 @@ class DefaultBuildStages:
                     report = validate_wheel_archive_descriptor(
                         descriptor,
                         wheel,
-                        ArchiveLimits(),
+                        ArchiveLimits(
+                            max_entries=self._limits.max_archive_entries,
+                            max_total_uncompressed_bytes=self._limits.max_total_bytes,
+                            max_entry_uncompressed_bytes=self._limits.max_wheel_bytes,
+                            max_compression_ratio=(
+                                self._limits.max_archive_expansion_ratio
+                            ),
+                        ),
                         snapshot_parent,
                     )
                 finally:
@@ -361,6 +401,7 @@ class DefaultBuildStages:
         external = workspace.external("artifact")
         built = ArtifactBuilder().build(context, external.path)
         return replace(built, path=Path("artifact") / built.path.name)
+
 
 class JobPipeline:
     def __init__(
@@ -485,6 +526,13 @@ class JobPipeline:
         published = None
         validation_snapshots: tuple[object, ...] = ()
         try:
+            limits = self._repository.resource_limits()
+            deadline = time.monotonic() + limits.task_timeout_seconds
+            stages = (
+                self._stages.with_limits(limits)
+                if isinstance(self._stages, DefaultBuildStages)
+                else self._stages
+            )
             payload_target = payload.target_snapshot.model_dump(by_alias=True)
             if (
                 payload.requirement_file_id != subject.requirement_file_id
@@ -509,8 +557,11 @@ class JobPipeline:
             original_parsed = parse_requirements(original)
             normalized = self._storage.read_bytes(subject.normalized_object_key)
             if normalized != original_parsed.normalized_text.encode("utf-8"):
-                raise ValueError("normalized requirements content is not database-bound")
+                raise ValueError(
+                    "normalized requirements content is not database-bound"
+                )
             parsed = parse_requirements(normalized)
+            _require_before_deadline(deadline)
             original_text = _decode_requirements(original)
             cancelled = self._cancel_if_requested(lease)
             if cancelled is not None:
@@ -521,11 +572,10 @@ class JobPipeline:
             )
             resolution = self._during_lease(
                 lease,
-                lambda: self._stages.resolve(
-                    parsed, target, owned_workspace.capability
-                ),
+                lambda: stages.resolve(parsed, target, owned_workspace.capability),
             )
-            if len(resolution.packages) > MAX_RESOLVED_PACKAGES:
+            _require_before_deadline(deadline)
+            if len(resolution.packages) > limits.max_packages:
                 raise ValueError("resolved package count exceeds the limit")
             self._during_lease(
                 lease,
@@ -540,7 +590,7 @@ class JobPipeline:
             )
             download = self._during_lease(
                 lease,
-                lambda: self._stages.download(
+                lambda: stages.download(
                     resolution,
                     target,
                     owned_workspace.capability,
@@ -548,6 +598,8 @@ class JobPipeline:
                 ),
             )
             downloaded = download.wheels
+            _require_download_limits(downloaded, limits)
+            _require_before_deadline(deadline)
             cancelled = self._cancel_if_requested(lease)
             if cancelled is not None:
                 return cancelled
@@ -557,13 +609,14 @@ class JobPipeline:
             )
             validation = self._during_lease(
                 lease,
-                lambda: self._stages.validate(
+                lambda: stages.validate(
                     resolution,
                     downloaded,
                     target,
                     owned_workspace.capability,
                 ),
             )
+            _require_before_deadline(deadline)
             validation_snapshots = _validation_snapshots(validation.wheels)
             validation = BuildValidation(
                 validation.wheels,
@@ -608,10 +661,9 @@ class JobPipeline:
             )
             built = self._during_lease(
                 lease,
-                lambda: self._stages.package(
-                    context, owned_workspace.capability
-                ),
+                lambda: stages.package(context, owned_workspace.capability),
             )
+            _require_before_deadline(deadline)
             cancelled = self._cancel_if_requested(lease)
             if cancelled is not None:
                 return cancelled
@@ -622,6 +674,8 @@ class JobPipeline:
             )
             source_descriptor = owned_workspace.capability.open_regular(built.path)
             try:
+                if os.fstat(source_descriptor).st_size > limits.max_total_bytes:
+                    raise ValueError("Artifact byte limit exceeded")
                 published = self._during_lease(
                     lease,
                     lambda: self._storage.publish_descriptor(
@@ -651,7 +705,8 @@ class JobPipeline:
                 published,
                 built.path.name,
                 terminal.value,
-                self._repository._clock() + self._artifact_ttl,
+                self._repository._clock()
+                + timedelta(days=limits.artifact_retention_days),
             )
             if artifact is None:
                 raise LostLeaseError("artifact metadata was not published")
@@ -711,6 +766,26 @@ class JobPipeline:
             heartbeat.check()
             return result
 
+
+def _require_download_limits(
+    wheels: tuple[DownloadedWheel, ...], limits: BuildResourceLimits
+) -> None:
+    if len(wheels) > limits.max_packages:
+        raise ValueError("downloaded Wheel count exceeds the limit")
+    total = 0
+    for wheel in wheels:
+        if wheel.byte_size > limits.max_wheel_bytes:
+            raise ValueError("downloaded Wheel byte limit exceeded")
+        total += wheel.byte_size
+        if total > limits.max_total_bytes:
+            raise ValueError("total downloaded Wheel byte limit exceeded")
+
+
+def _require_before_deadline(deadline: float) -> None:
+    if time.monotonic() > deadline:
+        raise TimeoutError("build task exceeded the configured time limit")
+
+
 def _decode_requirements(raw: bytes) -> str:
     for encoding in ("utf-8-sig", "utf-8", "gbk"):
         try:
@@ -723,10 +798,11 @@ def _decode_requirements(raw: bytes) -> str:
 def _require_file_observation(
     content: bytes, expected_size: int, expected_sha256: str, label: str
 ) -> None:
-    if len(content) != expected_size or hashlib.sha256(content).hexdigest() != expected_sha256:
-        raise SubjectIntegrityError(
-            f"{label} does not match its database observation"
-        )
+    if (
+        len(content) != expected_size
+        or hashlib.sha256(content).hexdigest() != expected_sha256
+    ):
+        raise SubjectIntegrityError(f"{label} does not match its database observation")
 
 
 def _retryable(error: BaseException) -> bool:

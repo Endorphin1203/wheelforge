@@ -56,7 +56,11 @@ class ApiClient:
         return response
 
     def upload_requirements(self, path: Path) -> str:
-        content = Path(path).read_bytes()
+        return self.upload_text(Path(path).read_bytes())
+
+    def upload_text(self, content: str | bytes) -> str:
+        if isinstance(content, str):
+            content = content.encode("utf-8")
         boundary = f"wheelforge-{secrets.token_hex(16)}"
         body = (
             (
@@ -74,6 +78,19 @@ class ApiClient:
             f"multipart/form-data; boundary={boundary}",
         )
         return _required_string(response, "id")
+
+    def create_user(self, username: str, password: str) -> JsonObject:
+        return self._json(
+            "POST",
+            "/api/admin/users",
+            {"username": username, "role": "USER", "initialPassword": password},
+        )
+
+    def package_sources(self) -> list[JsonObject]:
+        return _object_list(self._json_value("GET", "/api/admin/package-sources"))
+
+    def update_package_source(self, source_id: str, **changes: Any) -> JsonObject:
+        return self._json("PUT", f"/api/admin/package-sources/{source_id}", changes)
 
     def requirement_file(self, file_id: str) -> JsonObject:
         return self._json("GET", f"/api/requirement-files/{file_id}")
@@ -122,6 +139,9 @@ class ApiClient:
     def build_task(self, task_id: str) -> JsonObject:
         return self._json("GET", f"/api/build-tasks/{task_id}")
 
+    def build_tasks(self) -> list[JsonObject]:
+        return _object_list(self._json_value("GET", "/api/build-tasks"))
+
     def cancel_build(self, task_id: str) -> JsonObject:
         return self._json("POST", f"/api/build-tasks/{task_id}/cancel")
 
@@ -160,6 +180,9 @@ class ApiClient:
 
     def artifacts(self) -> list[JsonObject]:
         return _object_list(self._json_value("GET", "/api/artifacts?limit=100"))
+
+    def artifact(self, artifact_id: str) -> JsonObject:
+        return self._json("GET", f"/api/artifacts/{artifact_id}")
 
     def artifact_for_task(self, task_id: str) -> JsonObject:
         matches = [

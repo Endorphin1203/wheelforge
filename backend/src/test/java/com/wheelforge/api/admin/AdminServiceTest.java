@@ -234,6 +234,34 @@ class AdminServiceTest {
         "INVALID_CONFIG_VALUE");
   }
 
+  @Test
+  void systemConfigCannotExceedExecutableSafetyCeilings() throws Exception {
+    Map<String, Long> unsafeValues =
+        Map.of(
+            "maxUploadSizeBytes", 524289L,
+            "maxRequirementLines", 2001L,
+            "maxPackageCount", 501L,
+            "maxPackageSizeBytes", 536870913L,
+            "maxArtifactSizeBytes", 2147483649L,
+            "maxCandidatesPerRequirement", 21L,
+            "maxResolutionAttempts", 101L,
+            "maxArchiveEntries", 20001L,
+            "maxArchiveExpansionRatio", 201L);
+
+    for (var entry : unsafeValues.entrySet()) {
+      assertApiError(
+          () ->
+              service.updateSystemConfig(
+                  ADMIN_ID,
+                  Map.of(
+                      entry.getKey(),
+                      new AdminService.ConfigUpdate(
+                          objectMapper.valueToTree(entry.getValue()), 0L))),
+          400,
+          "INVALID_CONFIG_VALUE");
+    }
+  }
+
   private UserAccount user(UUID id, String username, String role, String status) {
     return new UserAccount(
         id.toString(), username, "$argon2id$encoded", role, status, LocalDateTime.now());

@@ -292,19 +292,19 @@ public class AdminService {
 
   private static Map<String, ConfigRule> configRules() {
     Map<String, ConfigRule> rules = new LinkedHashMap<>();
-    rules.put("maxUploadSizeBytes", ConfigRule.integer(1, 10L * 1024 * 1024));
-    rules.put("maxRequirementLines", ConfigRule.integer(1, 10000));
-    rules.put("maxPackageCount", ConfigRule.integer(1, 5000));
-    rules.put("maxPackageSizeBytes", ConfigRule.integer(1, 2L * 1024 * 1024 * 1024));
-    rules.put("maxArtifactSizeBytes", ConfigRule.integer(1, 10L * 1024 * 1024 * 1024));
+    rules.put("maxUploadSizeBytes", ConfigRule.integer(1, 512L * 1024));
+    rules.put("maxRequirementLines", ConfigRule.integer(1, 2000));
+    rules.put("maxPackageCount", ConfigRule.integer(1, 500));
+    rules.put("maxPackageSizeBytes", ConfigRule.integer(1, 512L * 1024 * 1024));
+    rules.put("maxArtifactSizeBytes", ConfigRule.integer(1, 2L * 1024 * 1024 * 1024));
     rules.put("minFreeDiskBytes", ConfigRule.integer(0, 1024L * 1024 * 1024 * 1024));
     rules.put("taskTimeoutSeconds", ConfigRule.integer(60, 86400));
     rules.put("maxConcurrentBuilds", ConfigRule.integer(1, 64));
     rules.put("maxRetryAttempts", ConfigRule.integer(0, 20));
-    rules.put("maxCandidatesPerRequirement", ConfigRule.integer(1, 100));
-    rules.put("maxResolutionAttempts", ConfigRule.integer(1, 1000));
-    rules.put("maxArchiveEntries", ConfigRule.integer(1, 100000));
-    rules.put("maxArchiveExpansionRatio", ConfigRule.integer(1, 1000));
+    rules.put("maxCandidatesPerRequirement", ConfigRule.integer(1, 20));
+    rules.put("maxResolutionAttempts", ConfigRule.integer(1, 100));
+    rules.put("maxArchiveEntries", ConfigRule.integer(1, 20000));
+    rules.put("maxArchiveExpansionRatio", ConfigRule.integer(1, 200));
     rules.put("artifactRetentionDays", ConfigRule.integer(1, 3650));
     rules.put("retentionEnabled", ConfigRule.bool());
     return Map.copyOf(rules);

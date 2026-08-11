@@ -16,10 +16,18 @@ import pytest
 from packaging.tags import Tag
 from packaging.version import Version
 from sqlalchemy import create_engine, func, insert, select, update
-from sqlalchemy.exc import IntegrityError, OperationalError, TimeoutError as SATimeoutError
+from sqlalchemy.exc import (
+    IntegrityError,
+    OperationalError,
+    TimeoutError as SATimeoutError,
+)
 from sqlalchemy.pool import StaticPool
 
-from wheelforge_worker.artifact import ArtifactBuildContext, BuiltArtifact, ValidatedWheel
+from wheelforge_worker.artifact import (
+    ArtifactBuildContext,
+    BuiltArtifact,
+    ValidatedWheel,
+)
 from wheelforge_worker.contracts import BuildStatus
 from wheelforge_worker.resolver import ResolvedPackage, ResolutionResult
 from wheelforge_worker.sources import PackageSource
@@ -46,6 +54,7 @@ from wheelforge_worker.jobs.repository import (
     requirement_files,
     requirement_items,
     resolved_packages,
+    system_config,
 )
 from wheelforge_worker.jobs.storage import RootedLocalStorage, WorkspaceManager
 from wheelforge_worker.target import TargetProfile
@@ -269,9 +278,7 @@ class SnapshotStages(RecordingStages):
         self.calls.append("validate")
         report = cast(Any, SnapshotReport(cast(Any, self.snapshot)))
         validated = ValidatedWheel(self.wheel, report)
-        return BuildValidation(
-            (validated,), StaticValidationReport((), True)
-        )
+        return BuildValidation((validated,), StaticValidationReport((), True))
 
 
 def _assert_descriptors_are_closed(snapshot: DescriptorSnapshot) -> None:
@@ -326,9 +333,7 @@ def test_default_download_retains_successes_when_later_package_is_missing(
 
     work = tmp_path / "work"
     work.mkdir()
-    stages = DefaultBuildStages(
-        downloader_factory=lambda _root: PartialDownloader()
-    )
+    stages = DefaultBuildStages(downloader_factory=lambda _root: PartialDownloader())
 
     result = stages.download(
         ResolutionResult("1", (first, second)),
@@ -405,9 +410,7 @@ def test_default_validation_cleans_prior_snapshots_when_later_wheel_fails(
         path.write_bytes(b"stub")
     wheels = cast(
         tuple[DownloadedWheel, ...],
-        (
-            *(SimpleNamespace(path=path) for path in paths),
-        ),
+        (*(SimpleNamespace(path=path) for path in paths),),
     )
 
     with pytest.raises(WheelArchiveValidationError, match="third Wheel is invalid"):
@@ -790,9 +793,7 @@ def test_build_rejects_payload_fields_that_disagree_with_locked_subject(
         payload["requirementFileId"] = "30000000-0000-4000-8000-000000000099"
     elif forgery == "key":
         payload["normalizedObjectKey"] = "requirements/normalized/forged.txt"
-        storage.publish_bytes(
-            "requirements/normalized/forged.txt", BUILD_REQUIREMENTS
-        )
+        storage.publish_bytes("requirements/normalized/forged.txt", BUILD_REQUIREMENTS)
     else:
         target = _target()
         target["profileId"] = "40000000-0000-4000-8000-000000000099"
@@ -921,7 +922,43 @@ def test_build_rejects_oversized_resolution_before_package_audit(
     assert result.status is BuildStatus.FAILED
     assert stages.calls == ["resolve"]
     with repository.engine.connect() as connection:
-        assert connection.scalar(select(func.count()).select_from(resolved_packages)) == 0
+        assert (
+            connection.scalar(select(func.count()).select_from(resolved_packages)) == 0
+        )
+
+
+def test_build_uses_database_package_limit_snapshot(tmp_path: Path) -> None:
+    class TwoPackageStages(RecordingStages):
+        def resolve(
+            self, parsed: object, target: object, workspace: Path
+        ) -> ResolutionResult:
+            self.calls.append("resolve")
+            return ResolutionResult(
+                "1",
+                (
+                    _resolved_package("alpha", "1.0"),
+                    _resolved_package("beta", "1.0"),
+                ),
+            )
+
+    repository, storage, workspaces = _environment(tmp_path)
+    with repository.engine.begin() as connection:
+        connection.execute(
+            insert(system_config).values(
+                config_key="maxPackageCount",
+                config_value=1,
+                description="test package limit",
+                version_no=0,
+            )
+        )
+    _publish_build_inputs(storage)
+    lease = _seed_build(repository)
+    stages = TwoPackageStages()
+
+    result = JobPipeline(repository, storage, workspaces, stages).run(lease)
+
+    assert result.status is BuildStatus.FAILED
+    assert stages.calls == ["resolve"]
 
 
 def test_partial_build_publishes_verified_successes_and_package_audit(
@@ -931,7 +968,8 @@ def test_partial_build_publishes_verified_successes_and_package_audit(
         def __init__(self) -> None:
             super().__init__()
             self.resolution = ResolutionResult(
-                "1", (_resolved_package("alpha", "1.0"), _resolved_package("beta", "2.0"))
+                "1",
+                (_resolved_package("alpha", "1.0"), _resolved_package("beta", "2.0")),
             )
 
         def resolve(
@@ -961,9 +999,7 @@ def test_partial_build_publishes_verified_successes_and_package_audit(
                 sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
                 tags=frozenset({Tag("py3", "none", "any")}),
             )
-            return BuildDownload(
-                (wheel,), (PackageFailure("beta", "no target Wheel"),)
-            )
+            return BuildDownload((wheel,), (PackageFailure("beta", "no target Wheel"),))
 
         def validate(
             self,
@@ -976,7 +1012,9 @@ def test_partial_build_publishes_verified_successes_and_package_audit(
             report = validate_closure(resolution, wheels, target)
             validated = cast(
                 ValidatedWheel,
-                SimpleNamespace(download=wheels[0], report=SimpleNamespace(snapshot=None)),
+                SimpleNamespace(
+                    download=wheels[0], report=SimpleNamespace(snapshot=None)
+                ),
             )
             return BuildValidation((validated,), report)
 
@@ -984,9 +1022,7 @@ def test_partial_build_publishes_verified_successes_and_package_audit(
     _publish_build_inputs(storage)
     lease = _seed_build(repository)
 
-    result = JobPipeline(
-        repository, storage, workspaces, PartialStages()
-    ).run(lease)
+    result = JobPipeline(repository, storage, workspaces, PartialStages()).run(lease)
 
     assert result.status is BuildStatus.PARTIAL_SUCCESS
     assert result.artifact_id is not None
@@ -1101,9 +1137,7 @@ def test_cancellation_at_each_publication_boundary_never_leaves_artifact(
     assert not artifact_directory.exists() or not list(
         artifact_directory.rglob("*.zip")
     )
-    assert not (
-        artifact_directory / lease.subject_id / lease.execution_id
-    ).exists()
+    assert not (artifact_directory / lease.subject_id / lease.execution_id).exists()
     assert not (artifact_directory / lease.subject_id).exists()
     assert not list(workspaces.root.glob("wf-execution-*"))
     assert not list(workspaces.root.glob(".wf-retired-v1-*"))
@@ -1134,9 +1168,7 @@ def test_artifact_file_is_compensated_when_database_publication_rolls_back(
     assert not artifact_directory.exists() or not list(
         artifact_directory.rglob("*.zip")
     )
-    assert not (
-        artifact_directory / lease.subject_id / lease.execution_id
-    ).exists()
+    assert not (artifact_directory / lease.subject_id / lease.execution_id).exists()
     assert not (artifact_directory / lease.subject_id).exists()
 
 
@@ -1181,9 +1213,7 @@ class PrePackageFailureRepository(JobRepository):
         super().advance_build(lease, status, progress, stage, message)
 
 
-def _repository_copy(
-    kind: type[JobRepository], source: JobRepository
-) -> JobRepository:
+def _repository_copy(kind: type[JobRepository], source: JobRepository) -> JobRepository:
     return kind(
         source.engine,
         lease_seconds=source.lease_seconds,
@@ -1324,18 +1354,19 @@ def test_nested_lost_lease_exception_group_is_never_retryable() -> None:
 
 
 def test_mixed_permanent_exception_group_is_not_retryable() -> None:
-    assert pipeline_module._retryable(
-        ExceptionGroup("mixed", [OSError("network"), ValueError("bad archive")])
-    ) is False
+    assert (
+        pipeline_module._retryable(
+            ExceptionGroup("mixed", [OSError("network"), ValueError("bad archive")])
+        )
+        is False
+    )
 
 
 def test_transient_sqlalchemy_failures_are_recursively_retryable() -> None:
     error = ExceptionGroup(
         "database infrastructure",
         [
-            OperationalError(
-                "insert artifact", {}, OSError("connection reset")
-            ),
+            OperationalError("insert artifact", {}, OSError("connection reset")),
             SATimeoutError("pool timeout"),
         ],
     )

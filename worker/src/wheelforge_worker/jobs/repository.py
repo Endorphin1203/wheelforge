@@ -48,6 +48,8 @@ MAX_PACKAGE_AUDIT_BYTES = 4096
 MAX_BUILD_AUDIT_BYTES = 6000
 _AUDIT_SECTION_BYTES = 1600
 _BUILD_AUDIT_SECTION_BYTES = 2600
+_MIB = 1024 * 1024
+_GIB = 1024 * _MIB
 
 requirement_files = Table(
     "requirement_files",
@@ -183,6 +185,47 @@ artifacts = Table(
     Column("version_no", BigInteger, nullable=False, default=0),
 )
 
+system_config = Table(
+    "system_config",
+    metadata,
+    Column("config_key", String(100), primary_key=True),
+    Column("config_value", JSON, nullable=False),
+    Column("description", String(500), nullable=False),
+    Column("version_no", BigInteger, nullable=False, default=0),
+)
+
+
+@dataclass(frozen=True, slots=True)
+class BuildResourceLimits:
+    max_packages: int = 500
+    max_wheel_bytes: int = 512 * _MIB
+    max_total_bytes: int = 2 * _GIB
+    task_timeout_seconds: int = 3600
+    max_candidates_per_requirement: int = 20
+    max_resolution_attempts: int = 100
+    max_archive_entries: int = 10_000
+    max_archive_expansion_ratio: int = 100
+    artifact_retention_days: int = 30
+
+    def __post_init__(self) -> None:
+        _bounded_limit("max_packages", self.max_packages, 500)
+        _bounded_limit("max_wheel_bytes", self.max_wheel_bytes, 512 * _MIB)
+        _bounded_limit("max_total_bytes", self.max_total_bytes, 2 * _GIB)
+        _bounded_limit("task_timeout_seconds", self.task_timeout_seconds, 86_400)
+        _bounded_limit(
+            "max_candidates_per_requirement",
+            self.max_candidates_per_requirement,
+            20,
+        )
+        _bounded_limit("max_resolution_attempts", self.max_resolution_attempts, 100)
+        _bounded_limit("max_archive_entries", self.max_archive_entries, 20_000)
+        _bounded_limit(
+            "max_archive_expansion_ratio",
+            self.max_archive_expansion_ratio,
+            200,
+        )
+        _bounded_limit("artifact_retention_days", self.artifact_retention_days, 3650)
+
 
 @dataclass(frozen=True, slots=True)
 class JobLease:
@@ -264,6 +307,30 @@ class JobRepository:
         self.lease_seconds = lease_seconds
         self._clock = clock
         self._uuid_factory = uuid_factory
+
+    def resource_limits(self) -> BuildResourceLimits:
+        fields = {
+            "maxPackageCount": "max_packages",
+            "maxPackageSizeBytes": "max_wheel_bytes",
+            "maxArtifactSizeBytes": "max_total_bytes",
+            "taskTimeoutSeconds": "task_timeout_seconds",
+            "maxCandidatesPerRequirement": "max_candidates_per_requirement",
+            "maxResolutionAttempts": "max_resolution_attempts",
+            "maxArchiveEntries": "max_archive_entries",
+            "maxArchiveExpansionRatio": "max_archive_expansion_ratio",
+            "artifactRetentionDays": "artifact_retention_days",
+        }
+        with self.engine.connect() as connection:
+            rows = connection.execute(
+                select(system_config.c.config_key, system_config.c.config_value).where(
+                    system_config.c.config_key.in_(fields)
+                )
+            ).all()
+        values: dict[str, int] = {}
+        for key, raw in rows:
+            value = _config_integer(str(key), raw)
+            values[fields[str(key)]] = value
+        return BuildResourceLimits(**values)
 
     def claim_next(self, worker_id: str) -> JobLease | None:
         if not worker_id or len(worker_id) > 100:
@@ -585,8 +652,7 @@ class JobRepository:
                     .select_from(
                         build_tasks.join(
                             requirement_files,
-                            requirement_files.c.id
-                            == build_tasks.c.requirement_file_id,
+                            requirement_files.c.id == build_tasks.c.requirement_file_id,
                         )
                     )
                     .where(build_tasks.c.id == lease.subject_id)
@@ -636,8 +702,7 @@ class JobRepository:
                     build_tasks.c.version_no == row["version_no"],
                     build_tasks.c.status == row["status"],
                     (
-                        build_tasks.c.execution_id
-                        == lease.previous_execution_id
+                        build_tasks.c.execution_id == lease.previous_execution_id
                         if takeover
                         else build_tasks.c.execution_id.is_(None)
                     ),
@@ -881,7 +946,9 @@ class JobRepository:
                 if wheel is None:
                     status = "MISSING"
                     error = download_failures.get(package.name) or (
-                        "; ".join(package_issues) if package_issues else "Wheel is missing"
+                        "; ".join(package_issues)
+                        if package_issues
+                        else "Wheel is missing"
                     )
                 elif package_issues:
                     status = "STATIC_FAILED"
@@ -896,7 +963,9 @@ class JobRepository:
                         resolved_packages.c.normalized_name == package.name,
                     )
                     .values(
-                        wheel_filename=(wheel.filename if wheel else package.wheel_filename),
+                        wheel_filename=(
+                            wheel.filename if wheel else package.wheel_filename
+                        ),
                         wheel_tags=(
                             sorted(str(tag) for tag in wheel.tags) if wheel else None
                         ),
@@ -1073,9 +1142,9 @@ class JobRepository:
         now: datetime | None = None,
     ) -> bool:
         observed_at = self._clock() if now is None else now
-        return connection.scalar(
-            self._owned_job_statement(lease, observed_at)
-        ) is not None
+        return (
+            connection.scalar(self._owned_job_statement(lease, observed_at)) is not None
+        )
 
     @staticmethod
     def _owned_job_statement(
@@ -1257,40 +1326,46 @@ def _bounded(value: str, limit: int) -> str:
 def _package_resolution_audit(
     resolution: ResolutionResult, package: str
 ) -> dict[str, Any]:
-    return _package_resolution_audits(resolution, (package,))[canonicalize_name(package)]
+    return _package_resolution_audits(resolution, (package,))[
+        canonicalize_name(package)
+    ]
 
 
 def _resolution_summary_audit(resolution: ResolutionResult) -> dict[str, Any]:
     attempts = _AuditAccumulator(_BUILD_AUDIT_SECTION_BYTES)
     for attempt in resolution.attempts:
-        attempts.add({
-            "source": attempt.source.value,
-            "failure": attempt.failure.value if attempt.failure else None,
-            "reason": _json_string_prefix(
-                sanitize_text(attempt.reason, limit=1000), 240
-            ),
-            "selectionCount": len(attempt.selections),
-            "selections": [
-                {
-                    "package": _json_string_prefix(
-                        canonicalize_name(selection.package), 120
-                    ),
-                    "version": _json_string_prefix(str(selection.version), 120),
-                }
-                for selection in attempt.selections[:2]
-            ],
-        })
+        attempts.add(
+            {
+                "source": attempt.source.value,
+                "failure": attempt.failure.value if attempt.failure else None,
+                "reason": _json_string_prefix(
+                    sanitize_text(attempt.reason, limit=1000), 240
+                ),
+                "selectionCount": len(attempt.selections),
+                "selections": [
+                    {
+                        "package": _json_string_prefix(
+                            canonicalize_name(selection.package), 120
+                        ),
+                        "version": _json_string_prefix(str(selection.version), 120),
+                    }
+                    for selection in attempt.selections[:2]
+                ],
+            }
+        )
     rejections = _AuditAccumulator(_BUILD_AUDIT_SECTION_BYTES)
     for item in resolution.rejections:
-        rejections.add({
-            "package": _json_string_prefix(canonicalize_name(item.package), 120),
-            "version": _json_string_prefix(item.version, 120),
-            "source": item.source.value,
-            "code": item.code.value,
-            "reason": _json_string_prefix(
-                sanitize_text(item.reason, limit=1000), 240
-            ),
-        })
+        rejections.add(
+            {
+                "package": _json_string_prefix(canonicalize_name(item.package), 120),
+                "version": _json_string_prefix(item.version, 120),
+                "source": item.source.value,
+                "code": item.code.value,
+                "reason": _json_string_prefix(
+                    sanitize_text(item.reason, limit=1000), 240
+                ),
+            }
+        )
     audit: dict[str, Any] = {
         "version": 1,
         "totals": {
@@ -1326,14 +1401,14 @@ def _package_resolution_audits(
             package = canonicalize_name(selection.package)
             if package not in requested:
                 continue
-            attempts[package].add({
+            attempts[package].add(
+                {
                     "source": attempt.source.value,
                     "failure": attempt.failure.value if attempt.failure else None,
-                    "selectedVersion": _json_string_prefix(
-                        str(selection.version), 200
-                    ),
+                    "selectedVersion": _json_string_prefix(str(selection.version), 200),
                     "reason": reason,
-                })
+                }
+            )
     rejections = {
         package: _AuditAccumulator(_AUDIT_SECTION_BYTES) for package in requested
     }
@@ -1341,14 +1416,16 @@ def _package_resolution_audits(
         package = canonicalize_name(item.package)
         if package not in requested:
             continue
-        rejections[package].add({
-            "version": _json_string_prefix(item.version, 200),
-            "source": item.source.value,
-            "code": item.code.value,
-            "reason": _json_string_prefix(
-                sanitize_text(item.reason, limit=1000), 300
-            ),
-        })
+        rejections[package].add(
+            {
+                "version": _json_string_prefix(item.version, 200),
+                "source": item.source.value,
+                "code": item.code.value,
+                "reason": _json_string_prefix(
+                    sanitize_text(item.reason, limit=1000), 300
+                ),
+            }
+        )
     return {
         package: _build_package_resolution_audit(
             package,
@@ -1418,3 +1495,21 @@ def _json_string_prefix(value: str, byte_limit: int) -> str:
 
 def _json_bytes(value: object) -> int:
     return len(json.dumps(value, ensure_ascii=True).encode("utf-8"))
+
+
+def _bounded_limit(name: str, value: int, maximum: int) -> None:
+    if type(value) is not int or not 1 <= value <= maximum:
+        raise ValueError(f"{name} must be a positive integer no greater than {maximum}")
+
+
+def _config_integer(key: str, raw: object) -> int:
+    if type(raw) is int:
+        return raw
+    if isinstance(raw, str):
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"system_config {key} is not valid JSON") from error
+        if type(value) is int:
+            return value
+    raise ValueError(f"system_config {key} must contain an integer")
