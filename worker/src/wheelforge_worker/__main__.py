@@ -36,10 +36,13 @@ def create_consumer(settings: Settings, stop: threading.Event) -> JobConsumer:
     workspaces: WorkspaceManager | None = None
     try:
         storage = RootedLocalStorage(settings.data_root)
-        workspaces = WorkspaceManager(settings.workspace_root)
+        workspaces = WorkspaceManager(
+            settings.workspace_root,
+            allow_portable_external=settings.allow_portable_workspace,
+        )
         if storage.root_identity == workspaces.root_identity:
             raise ValueError("WF_DATA_ROOT and WF_WORKSPACE_ROOT must be different")
-        require_external_workspace_support()
+        require_external_workspace_support(settings.allow_portable_workspace)
         maintenance = MaintenanceService(
             repository,
             storage,

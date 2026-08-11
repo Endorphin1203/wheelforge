@@ -13,6 +13,7 @@ class Settings:
     job_lease_seconds: int
     maintenance_age_seconds: int
     worker_id: str
+    allow_portable_workspace: bool
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -42,6 +43,9 @@ class Settings:
             job_lease_seconds=job_lease_seconds,
             maintenance_age_seconds=maintenance_age_seconds,
             worker_id=cls._required_value("WF_WORKER_ID", "wheelforge-worker-1"),
+            allow_portable_workspace=cls._boolean(
+                "WF_ALLOW_PORTABLE_WORKSPACE", "false"
+            ),
         )
 
     @staticmethod
@@ -81,3 +85,10 @@ class Settings:
         if number <= 0:
             raise ValueError(f"{name} must be positive")
         return number
+
+    @classmethod
+    def _boolean(cls, name: str, default: str) -> bool:
+        value = cls._required_value(name, default).lower()
+        if value not in {"true", "false"}:
+            raise ValueError(f"{name} must be true or false")
+        return value == "true"

@@ -302,7 +302,7 @@ class DefaultBuildStages:
                 ),
                 limits=download_limits,
                 inherited_fds=external.inherited_fds,
-                trusted_fd_bound=True,
+                trusted_fd_bound=bool(external.inherited_fds),
             )
             if self._downloader_factory is None
             else self._downloader_factory(download_root)

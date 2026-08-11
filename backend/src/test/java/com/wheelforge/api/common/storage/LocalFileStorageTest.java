@@ -286,42 +286,59 @@ class LocalFileStorageTest {
   }
 
   @Test
-  void rejectsProviderWithoutCompleteStorageSemanticsBeforeCreatingObjects() throws Exception {
+  void portableProviderPublishesReadsAndDeletesObjects() throws Exception {
     Path root = Files.createDirectory(tempDir.resolve("root"));
-    assertThatThrownBy(() -> ordinaryStorage(root))
-        .isInstanceOf(LocalFileStorage.StorageException.class)
-        .hasMessageContaining("SecureDirectoryStream")
-        .hasMessageContaining("complete storage semantics");
+    String key = "users/user-id/requirements/file-id/original.txt";
+    byte[] content = "portable-content".getBytes(UTF_8);
 
-    try (var entries = Files.list(root)) {
-      assertThat(entries).isEmpty();
+    try (var storage = ordinaryStorage(root)) {
+      var stored = storage.putAtomically(key, new ByteArrayInputStream(content), content.length);
+
+      assertThat(stored.sizeBytes()).isEqualTo(content.length);
+      assertThat(storage.open(key).readAllBytes()).isEqualTo(content);
+
+      storage.deleteIfExists(key);
     }
+
+    assertThat(root.resolve(key)).doesNotExist();
   }
 
   @Test
-  void portableBackendRefusesMutationBeforeReadingInputOrCreatingTemporaryFiles() throws Exception {
-    Path root = Files.createDirectory(tempDir.resolve("portable-root"));
-    var backend = new PortableFileStorageBackend(root.toRealPath());
-    boolean[] inputRead = {false};
-    InputStream input =
-        new ByteArrayInputStream("must-not-be-read".getBytes(UTF_8)) {
-          @Override
-          public synchronized int read(byte[] bytes, int offset, int length) {
-            inputRead[0] = true;
-            return super.read(bytes, offset, length);
-          }
-        };
+  void portableProviderPrunesGeneratedDirectoriesWhenArtifactIsAlreadyMissing() throws Exception {
+    Path root = Files.createDirectory(tempDir.resolve("portable-artifact-root"));
+    String task = "20000000-0000-4000-8000-000000000024";
+    String execution = "10000000-0000-4000-8000-000000000024";
+    String key =
+        "artifacts/" + task + "/" + execution + "/30000000-0000-4000-8000-000000000024.zip";
+    Path executionDirectory = root.resolve("artifacts").resolve(task).resolve(execution);
+    Files.createDirectories(executionDirectory);
 
-    assertThatThrownBy(() -> backend.putAtomically("objects/probe.bin", input, 16))
-        .isInstanceOf(LocalFileStorage.StorageException.class)
-        .hasMessageContaining("complete storage semantics");
-    assertThat(inputRead[0]).isFalse();
-    assertThatThrownBy(() -> backend.deleteIfExists("objects/probe.bin"))
-        .isInstanceOf(LocalFileStorage.StorageException.class)
-        .hasMessageContaining("complete storage semantics");
-    try (var entries = Files.list(root)) {
-      assertThat(entries).isEmpty();
+    try (var storage = ordinaryStorage(root)) {
+      storage.deleteIfExists(key);
     }
+
+    assertThat(executionDirectory).doesNotExist();
+    assertThat(root.resolve("artifacts").resolve(task)).doesNotExist();
+  }
+
+  @Test
+  void portableBackendRejectsSymlinkedParentsForEveryOperation() throws Exception {
+    Path root = Files.createDirectory(tempDir.resolve("portable-root"));
+    Path outside = Files.createDirectory(tempDir.resolve("portable-outside"));
+    Files.createSymbolicLink(root.resolve("objects"), outside);
+    Files.writeString(outside.resolve("probe.bin"), "must-remain");
+    var backend = new PortableFileStorageBackend(root.toRealPath());
+
+    assertThatThrownBy(
+            () ->
+                backend.putAtomically(
+                    "objects/probe.bin", new ByteArrayInputStream(new byte[] {1}), 1))
+        .isInstanceOf(IllegalArgumentException.class);
+    assertThatThrownBy(() -> backend.open("objects/probe.bin"))
+        .isInstanceOf(IllegalArgumentException.class);
+    assertThatThrownBy(() -> backend.deleteIfExists("objects/probe.bin"))
+        .isInstanceOf(IllegalArgumentException.class);
+    assertThat(outside.resolve("probe.bin")).hasContent("must-remain");
   }
 
   @Test
@@ -424,6 +441,7 @@ class LocalFileStorageTest {
               delegate.close();
             }
           };
-        });
+        },
+        true);
   }
 }

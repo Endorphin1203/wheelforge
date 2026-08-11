@@ -90,9 +90,19 @@ The API requires the filesystem provider to expose Java
 `SecureDirectoryStream`. Upload publication, rollback compensation, artifact
 retention, and generated-directory pruning are one complete storage contract;
 the API fails startup when descriptor-relative mutation is unavailable. There
-is no read/write-only portable mode. Confirm this capability on the exact host,
-JDK, and mounted filesystem used in production. Exclusive write permission on
-`WF_DATA_ROOT` remains required in addition to this provider capability.
+is no automatic read/write-only portable fallback. Confirm this capability on
+the exact host, JDK, and mounted filesystem used in production. Exclusive write
+permission on `WF_DATA_ROOT` remains required in addition to this provider
+capability.
+
+For single-user local development on a host such as macOS that lacks
+`SecureDirectoryStream` and Linux `/proc/self/fd`, explicitly set
+`WF_ALLOW_PORTABLE_STORAGE=true` and `WF_ALLOW_PORTABLE_WORKSPACE=true`.
+Portable mode retains normalized-key, ownership, permission, file-identity,
+regular-file, and symbolic-link checks, but it cannot provide Linux's
+descriptor-bound protection against a same-user process replacing a path
+during an operation. Use only private mode-`0700` roots on a trusted local
+machine. Keep both values `false` for production and shared hosts.
 
 The application uses Flyway migrations and Hibernate `ddl-auto: validate`
 against MySQL. Flyway is the only schema owner; do not use Hibernate to create

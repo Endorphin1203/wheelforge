@@ -3300,13 +3300,64 @@ def test_data_probe_requires_cross_directory_no_replace_and_missing_source(
     assert missing_source
 
 
-def test_external_stage_host_without_proc_fd_fails_closed(
-    monkeypatch: pytest.MonkeyPatch,
+def test_external_stage_without_proc_fd_uses_the_validated_workspace_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    root = tmp_path / "workspaces"
+    root.mkdir(mode=0o700)
+    manager = WorkspaceManager(root, allow_portable_external=True)
+    owned = manager.allocate("50000000-0000-4000-8000-000000000091")
     monkeypatch.setattr(storage_module.sys, "platform", "darwin")
 
-    with pytest.raises(RuntimeError, match="Linux /proc/self/fd"):
-        storage_module.require_external_workspace_support()
+    try:
+        external = owned.capability.external()
+
+        assert external.path == owned.path
+        assert external.inherited_fds == ()
+    finally:
+        owned.close()
+        manager.close()
+
+
+def test_portable_external_path_opens_descendants_through_the_workspace_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "workspaces"
+    root.mkdir(mode=0o700)
+    manager = WorkspaceManager(root, allow_portable_external=True)
+    owned = manager.allocate("50000000-0000-4000-8000-000000000092")
+    monkeypatch.setattr(storage_module.sys, "platform", "darwin")
+
+    try:
+        owned.capability.write_bytes("wheel.whl", b"wheel-content")
+        external = owned.capability.external()
+        descriptor = owned.capability.open_external_regular(
+            external.path / "wheel.whl"
+        )
+        try:
+            assert os.read(descriptor, 64) == b"wheel-content"
+        finally:
+            os.close(descriptor)
+    finally:
+        owned.close()
+        manager.close()
+
+
+def test_external_stage_without_proc_fd_fails_closed_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "workspaces"
+    root.mkdir(mode=0o700)
+    manager = WorkspaceManager(root)
+    owned = manager.allocate("50000000-0000-4000-8000-000000000093")
+    monkeypatch.setattr(storage_module.sys, "platform", "darwin")
+
+    try:
+        with pytest.raises(RuntimeError, match="explicit portable workspace opt-in"):
+            owned.capability.external()
+    finally:
+        owned.close()
+        manager.close()
 
 
 def test_publish_cleanup_failure_does_not_replace_writer_error(

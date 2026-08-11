@@ -39,7 +39,9 @@ sudo install -d -o root -g root -m 0700 /etc/wheelforge
 
 `WF_DATA_ROOT` and `WF_WORKSPACE_ROOT` must be different absolute paths and
 must not be symlinks. Do not grant write access to interactive users or other
-services.
+services. Keep `WF_ALLOW_PORTABLE_STORAGE=false` and
+`WF_ALLOW_PORTABLE_WORKSPACE=false` on production hosts so missing
+descriptor-bound filesystem capabilities fail startup.
 
 ## MySQL Setup
 

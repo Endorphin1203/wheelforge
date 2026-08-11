@@ -34,6 +34,28 @@ def test_settings_require_absolute_workspace(monkeypatch, tmp_path: Path) -> Non
     assert settings.job_lease_seconds == 60
     assert settings.maintenance_age_seconds == 86400
     assert settings.worker_id == "wheelforge-worker-1"
+    assert settings.allow_portable_workspace is False
+
+
+def test_settings_parse_explicit_portable_workspace_opt_in(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    configure_environment(monkeypatch, tmp_path)
+    monkeypatch.setenv("WF_ALLOW_PORTABLE_WORKSPACE", "true")
+
+    settings = Settings.from_env()
+
+    assert settings.allow_portable_workspace is True
+
+
+def test_settings_reject_invalid_portable_workspace_flag(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    configure_environment(monkeypatch, tmp_path)
+    monkeypatch.setenv("WF_ALLOW_PORTABLE_WORKSPACE", "sometimes")
+
+    with pytest.raises(ValueError, match="WF_ALLOW_PORTABLE_WORKSPACE must be true or false"):
+        Settings.from_env()
 
 
 def test_settings_reject_relative_roots(monkeypatch, tmp_path: Path) -> None:

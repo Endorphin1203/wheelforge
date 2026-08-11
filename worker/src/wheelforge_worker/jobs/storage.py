@@ -159,11 +159,18 @@ class ExternalWorkspace:
 
 class WorkspaceCapability:
     def __init__(
-        self, name: str, descriptor: int, identity: tuple[int, int]
+        self,
+        name: str,
+        path: Path,
+        descriptor: int,
+        identity: tuple[int, int],
+        allow_portable_external: bool,
     ) -> None:
         self.name = name
+        self._path = path
         self._descriptor: int | None = descriptor
         self._identity = identity
+        self._allow_portable_external = allow_portable_external
 
     def close(self) -> None:
         if self._descriptor is not None:
@@ -235,12 +242,19 @@ class WorkspaceCapability:
             parts = supplied.parts
             prefix = (supplied.anchor, "proc", "self", "fd", str(descriptor))
             if (
-                not sys.platform.startswith("linux")
-                or len(parts) <= len(prefix)
-                or parts[: len(prefix)] != prefix
+                sys.platform.startswith("linux")
+                and len(parts) > len(prefix)
+                and parts[: len(prefix)] == prefix
             ):
-                raise OSError("workspace path is not bound to the owned descriptor")
-            relative = Path(*parts[len(prefix) :])
+                relative = Path(*parts[len(prefix) :])
+            else:
+                self._portable_external_path(())
+                try:
+                    relative = supplied.relative_to(self._path)
+                except ValueError as error:
+                    raise OSError(
+                        "workspace path is not bound to the owned descriptor"
+                    ) from error
         else:
             relative = supplied
         try:
@@ -253,19 +267,39 @@ class WorkspaceCapability:
 
     def external(self, relative: str | Path = Path(".")) -> ExternalWorkspace:
         descriptor = self._require_descriptor()
-        require_external_workspace_support()
-        base = Path(f"/proc/self/fd/{descriptor}")
-        try:
-            status = base.stat()
-        except OSError as error:
-            raise RuntimeError(
-                "external workspace stages require Linux /proc/self/fd support"
-            ) from error
-        if _identity(status) != self._identity:
-            raise RuntimeError("workspace descriptor path identity changed")
+        require_external_workspace_support(self._allow_portable_external)
         parts = _workspace_parts(relative, allow_current=True)
-        path = base.joinpath(*parts) if parts else base
-        return ExternalWorkspace(path, (descriptor,))
+        if sys.platform.startswith("linux"):
+            base = Path(f"/proc/self/fd/{descriptor}")
+            try:
+                status = base.stat()
+            except OSError:
+                pass
+            else:
+                if _identity(status) != self._identity:
+                    raise RuntimeError("workspace descriptor path identity changed")
+                path = base.joinpath(*parts) if parts else base
+                return ExternalWorkspace(path, (descriptor,))
+        return ExternalWorkspace(self._portable_external_path(parts), ())
+
+    def _portable_external_path(self, parts: tuple[str, ...]) -> Path:
+        descriptor = self._open_parent(parts, create=False)
+        path = self._path.joinpath(*parts) if parts else self._path
+        try:
+            status = path.lstat()
+            descriptor_status = os.fstat(descriptor)
+            if (
+                not stat.S_ISDIR(status.st_mode)
+                or stat.S_ISLNK(status.st_mode)
+                or _is_reparse(status)
+                or _identity(status) != _identity(descriptor_status)
+            ):
+                raise RuntimeError("workspace path identity changed")
+            return path
+        except OSError as error:
+            raise RuntimeError("workspace path cannot be validated") from error
+        finally:
+            os.close(descriptor)
 
     def _open_parent(self, parts: tuple[str, ...], *, create: bool) -> int:
         descriptor = os.dup(self._require_descriptor())
@@ -1516,6 +1550,7 @@ class WorkspaceManager:
         uuid_factory: Callable[[], UUID] = uuid4,
         monotonic: Callable[[], float] = time.monotonic,
         clock: Callable[[], datetime] = _utc_now,
+        allow_portable_external: bool = False,
     ) -> None:
         _require_supported_host()
         self._root_descriptor: int | None
@@ -1525,6 +1560,7 @@ class WorkspaceManager:
         self._uuid_factory = uuid_factory
         self._monotonic = monotonic
         self._clock = clock
+        self._allow_portable_external = allow_portable_external
         self._thread_lock = threading.RLock()
         try:
             with _exclusive_descriptor_gate(
@@ -1639,7 +1675,11 @@ class WorkspaceManager:
                     )
                     owned_root_descriptor = os.dup(root_descriptor)
                     capability = WorkspaceCapability(
-                        name, child_descriptor, _identity(status)
+                        name,
+                        path,
+                        child_descriptor,
+                        _identity(status),
+                        self._allow_portable_external,
                     )
                     child_descriptor = None
                     owned = OwnedWorkspace(
@@ -2222,11 +2262,14 @@ def _exclusive_descriptor_gate(
         thread_lock.release()
 
 
-def require_external_workspace_support() -> None:
-    if not sys.platform.startswith("linux") or not Path("/proc/self/fd").is_dir():
+def require_external_workspace_support(allow_portable_external: bool = False) -> None:
+    if sys.platform.startswith("linux") and Path("/proc/self/fd").is_dir():
+        return
+    if not allow_portable_external:
         raise RuntimeError(
-            "external workspace stages require Linux /proc/self/fd support"
+            "external workspace stages require Linux /proc/self/fd or explicit portable workspace opt-in"
         )
+    _require_supported_host()
 
 
 def _open_stable_root(path: Path, label: str) -> tuple[Path, int]:

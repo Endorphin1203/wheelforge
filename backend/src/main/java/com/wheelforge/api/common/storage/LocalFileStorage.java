@@ -19,15 +19,22 @@ public class LocalFileStorage implements AutoCloseable {
   private boolean closed;
 
   @Autowired
-  public LocalFileStorage(@Value("${wheelforge.storage.data-root}") String root) {
-    this(Path.of(root));
+  public LocalFileStorage(
+      @Value("${wheelforge.storage.data-root}") String root,
+      @Value("${wheelforge.storage.allow-portable-fallback:false}") boolean allowPortableFallback) {
+    this(Path.of(root), Files::newDirectoryStream, allowPortableFallback);
   }
 
   public LocalFileStorage(Path root) {
-    this(root, Files::newDirectoryStream);
+    this(root, Files::newDirectoryStream, false);
   }
 
   LocalFileStorage(Path root, DirectoryStreamOpener directoryStreamOpener) {
+    this(root, directoryStreamOpener, false);
+  }
+
+  LocalFileStorage(
+      Path root, DirectoryStreamOpener directoryStreamOpener, boolean allowPortableFallback) {
     if (!root.isAbsolute()) {
       throw new IllegalArgumentException("Storage root must be an absolute path");
     }
@@ -45,8 +52,11 @@ public class LocalFileStorage implements AutoCloseable {
       } else {
         openedDirectory.close();
         openedDirectory = null;
-        throw new StorageException(
-            "Local storage requires SecureDirectoryStream for complete storage semantics", null);
+        if (!allowPortableFallback) {
+          throw new StorageException(
+              "Local storage requires SecureDirectoryStream for complete storage semantics", null);
+        }
+        backend = new PortableFileStorageBackend(realRoot);
       }
     } catch (IOException exception) {
       throw new StorageException("Could not initialize local storage", exception);

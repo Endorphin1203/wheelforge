@@ -14,7 +14,7 @@ class LocalFileStorageContextTest {
   @TempDir Path tempDir;
 
   @Test
-  void applicationContextRefusesAProviderWithoutCompleteStorageSemantics() throws Exception {
+  void applicationContextRefusesPortableStorageByDefault() throws Exception {
     Path root = Files.createDirectory(tempDir.resolve("root"));
     var contextRunner =
         new ApplicationContextRunner()
@@ -34,6 +34,20 @@ class LocalFileStorageContextTest {
     try (var entries = Files.list(root)) {
       assertThat(entries).isEmpty();
     }
+  }
+
+  @Test
+  void applicationContextAllowsExplicitPortableStorage() throws Exception {
+    Path root = Files.createDirectory(tempDir.resolve("portable-root"));
+    var contextRunner =
+        new ApplicationContextRunner()
+            .withBean(
+                LocalFileStorage.class,
+                () ->
+                    new LocalFileStorage(
+                        root.toAbsolutePath(), ignored -> ordinaryStream(root), true));
+
+    contextRunner.run(context -> assertThat(context).hasSingleBean(LocalFileStorage.class));
   }
 
   private static DirectoryStream<Path> ordinaryStream(Path root) throws IOException {
