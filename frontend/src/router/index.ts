@@ -4,6 +4,7 @@ import type { Pinia } from 'pinia'
 
 import AppShell from '@/layouts/AppShell.vue'
 import { useAuthStore } from '@/stores/auth'
+import BuildView from '@/views/BuildView.vue'
 import ForbiddenView from '@/views/ForbiddenView.vue'
 import LoginView from '@/views/LoginView.vue'
 import NotFoundView from '@/views/NotFoundView.vue'
@@ -23,7 +24,7 @@ const routes: RouteRecordRaw[] = [
     meta: { requiresAuth: true },
     children: [
       { path: '', redirect: '/build/new' },
-      { path: 'build/new', component: placeholder('新建构建') },
+      { path: 'build/new', component: BuildView },
       { path: 'tasks', component: placeholder('构建任务') },
       { path: 'tasks/:id', component: placeholder('任务详情') },
       { path: 'artifacts', component: placeholder('产物管理') },
