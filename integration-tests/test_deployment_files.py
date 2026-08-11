@@ -62,6 +62,7 @@ def test_deployment_environment_has_placeholders_not_live_secrets() -> None:
         "WF_AUTH_TOKEN_SECRET",
         "WF_DATA_ROOT",
         "WF_WORKSPACE_ROOT",
+        "WF_FRONTEND_ROOT",
     }
     keys = {
         line.split("=", 1)[0]
@@ -74,6 +75,19 @@ def test_deployment_environment_has_placeholders_not_live_secrets() -> None:
     assert "wheelforge_local" not in content
     assert "/var/lib/wheelforge/data" in content
     assert "/var/lib/wheelforge/work" in content
+    assert "WF_FRONTEND_ROOT=/opt/wheelforge/frontend/dist" in content
+
+
+def test_frontend_is_included_in_native_smoke_and_release_docs() -> None:
+    smoke = (DEPLOY / "smoke.sh").read_text(encoding="utf-8")
+    operations = (ROOT / "docs" / "operations.md").read_text(encoding="utf-8")
+    acceptance = (ROOT / "docs" / "v1-acceptance.md").read_text(encoding="utf-8")
+
+    assert "frontend_url" in smoke
+    assert "WheelForge" in smoke
+    assert "npm --prefix frontend ci" in operations
+    assert "frontend/dist" in operations
+    assert "frontend" in acceptance.lower()
 
 
 def test_shell_entrypoints_are_syntax_checked_executable_and_do_not_leak_passwords() -> None:

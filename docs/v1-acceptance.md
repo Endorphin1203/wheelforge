@@ -46,12 +46,16 @@ operator check. Automated evidence uses repository test node IDs or commands.
 | systemd unit syntax and sandbox compatibility | Operator runs `systemd-analyze verify` and starts both units on the Linux release host |
 | MySQL plus local Artifact backup and restore | Operator performs the documented restore drill and verifies one downloaded Artifact checksum |
 | Static-validation wording on every target | Operator checks UI, README, manifest, and delivery notes state that no target installation was executed |
+| Frontend login, build, results, artifacts, admin, and mobile navigation | `npm --prefix frontend run test:e2e` |
+| Frontend type safety, component tests, and production build | `make frontend-verify` |
+| Spring Boot serves the root-owned frontend while API routes stay protected | `backend/src/test/java/com/wheelforge/api/security/StaticAssetSecurityTest.java` and `integration-tests/test_deployment_files.py::test_frontend_is_included_in_native_smoke_and_release_docs` |
 | Docker, Redis, and MinIO are absent from V1 runtime | `integration-tests/test_deployment_files.py::test_operations_and_acceptance_docs_cover_release_duties`; operator inspects installed service dependencies |
 
 ## Release Commands
 
 ```sh
 make verify
+npm --prefix frontend run test:e2e
 WF_TEST_JDBC_URL='jdbc:mysql://127.0.0.1:3306/wheelforge_test?connectionTimeZone=UTC' \
 WF_TEST_DATABASE_USER='wheelforge_test' \
 WF_TEST_DATABASE_PASSWORD='test-password' \

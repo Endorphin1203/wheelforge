@@ -2,8 +2,9 @@
 
 ## Supported Topology
 
-WheelForge V1 runs on one Linux host with native MySQL 8.4, Java 21, and a
-Python 3.12 virtual environment. The Spring Boot API and Python Worker run as
+WheelForge V1 runs on one Linux host with native MySQL 8.4, Java 21, Node.js 24,
+and a Python 3.12 virtual environment. Node.js is required only to build the
+reviewed frontend release, not while the service runs. The Spring Boot API and Python Worker run as
 the same dedicated `wheelforge` account and share only the local data root.
 The Worker also owns a separate disposable workspace root.
 
@@ -21,7 +22,7 @@ the UI, delivery notes, and customer-facing build reports.
 
 ## Host Preparation
 
-Install MySQL 8.4, Java 21, Python 3.12, `curl`, `mysql-client`, `tar`, and a
+Install MySQL 8.4, Java 21, Node.js 24, Python 3.12, `curl`, `mysql-client`, `tar`, and a
 POSIX shell. Python 3.9 through 3.13 are target selectors; the host only needs
 Python 3.12 for the Worker. Python 3.9 is retained for V1 compatibility even
 though that Python line is end-of-life.
@@ -62,6 +63,8 @@ Build and install from a reviewed release checkout:
 
 ```sh
 ./mvnw -q -pl backend clean package -DskipTests
+npm --prefix frontend ci
+npm --prefix frontend run build
 python3.12 -m venv worker/.venv
 worker/.venv/bin/python -m pip install --upgrade pip
 worker/.venv/bin/python -m pip install ./worker
@@ -69,8 +72,12 @@ worker/.venv/bin/python -m pip install ./worker
 sudo install -o root -g root -m 0644 \
   backend/target/wheelforge-api-0.1.0-SNAPSHOT.jar \
   /opt/wheelforge/wheelforge-api.jar
+sudo install -d -o root -g root -m 0755 /opt/wheelforge/frontend/dist
+sudo cp -a frontend/dist/. /opt/wheelforge/frontend/dist/
 sudo cp -a worker docs scripts deploy /opt/wheelforge/
 sudo chown -R root:root /opt/wheelforge
+sudo find /opt/wheelforge/frontend/dist -type d -exec chmod 0755 {} \;
+sudo find /opt/wheelforge/frontend/dist -type f -exec chmod 0644 {} \;
 ```
 
 Install and edit the shared environment file. The SQLAlchemy URL must use a
@@ -88,6 +95,10 @@ sudo systemctl daemon-reload
 
 The environment file must remain `root:root` mode `0600`; systemd reads it
 before dropping privileges. On the release host, validate both units:
+
+`WF_FRONTEND_ROOT` must point to the absolute, root-owned Vite `dist` directory.
+The API only reads these files. Keep the directory outside the writable data and
+workspace roots.
 
 ```sh
 systemd-analyze verify /etc/systemd/system/wheelforge-api.service \
@@ -183,7 +194,7 @@ check and inspect `journalctl` after every credential rotation.
 
 ## Release Checks
 
-Run `make verify` on every build. On a disposable native MySQL database, run
-`make verify-mysql`. On a Linux release host with the services running, run
+Run `make verify` and `npm --prefix frontend run test:e2e` on every build. On a
+disposable native MySQL database, run `make verify-mysql`. On a Linux release host with the services running, run
 the complete integration suite, `systemd-analyze verify`, and
 `deploy/smoke.sh`. Keep the resulting command output with the release record.

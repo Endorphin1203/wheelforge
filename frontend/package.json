@@ -8,6 +8,7 @@
     "typecheck": "vue-tsc --noEmit",
     "test": "vitest",
     "test:run": "vitest run",
+    "test:e2e": "playwright test",
     "build": "npm run typecheck && vite build"
   },
   "dependencies": {
