@@ -8,6 +8,9 @@ import BuildView from '@/views/BuildView.vue'
 import ArtifactsView from '@/views/ArtifactsView.vue'
 import TaskDetailView from '@/views/TaskDetailView.vue'
 import TasksView from '@/views/TasksView.vue'
+import ConfigView from '@/views/admin/ConfigView.vue'
+import SourcesView from '@/views/admin/SourcesView.vue'
+import UsersView from '@/views/admin/UsersView.vue'
 import ForbiddenView from '@/views/ForbiddenView.vue'
 import LoginView from '@/views/LoginView.vue'
 import NotFoundView from '@/views/NotFoundView.vue'
@@ -31,9 +34,9 @@ const routes: RouteRecordRaw[] = [
       { path: 'tasks', component: TasksView },
       { path: 'tasks/:id', component: TaskDetailView },
       { path: 'artifacts', component: ArtifactsView },
-      { path: 'admin/users', component: placeholder('用户管理'), meta: { adminOnly: true } },
-      { path: 'admin/sources', component: placeholder('下载源'), meta: { adminOnly: true } },
-      { path: 'admin/config', component: placeholder('系统配置'), meta: { adminOnly: true } },
+      { path: 'admin/users', component: UsersView, meta: { adminOnly: true } },
+      { path: 'admin/sources', component: SourcesView, meta: { adminOnly: true } },
+      { path: 'admin/config', component: ConfigView, meta: { adminOnly: true } },
     ],
   },
   { path: '/:pathMatch(.*)*', component: NotFoundView },
