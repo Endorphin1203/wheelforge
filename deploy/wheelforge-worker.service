@@ -1,0 +1,50 @@
+[Unit]
+Description=WheelForge Python Worker
+Documentation=/opt/wheelforge/docs/operations.md
+Wants=network-online.target
+After=network-online.target mysql.service wheelforge-api.service
+
+[Service]
+Type=simple
+User=wheelforge
+Group=wheelforge
+EnvironmentFile=/etc/wheelforge/wheelforge.env
+WorkingDirectory=/opt/wheelforge/worker
+ExecStartPre=/usr/bin/test -x /opt/wheelforge/worker/.venv/bin/python
+ExecStartPre=/usr/bin/test -d /var/lib/wheelforge/data
+ExecStartPre=/usr/bin/test -d /var/lib/wheelforge/work
+ExecStart=/opt/wheelforge/worker/.venv/bin/python -m wheelforge_worker
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=45s
+KillMode=mixed
+UMask=0077
+StateDirectory=wheelforge
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/wheelforge/data /var/lib/wheelforge/work
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+TasksMax=512
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

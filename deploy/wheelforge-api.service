@@ -1,0 +1,47 @@
+[Unit]
+Description=WheelForge API
+Documentation=/opt/wheelforge/docs/operations.md
+Wants=network-online.target
+After=network-online.target mysql.service
+
+[Service]
+Type=simple
+User=wheelforge
+Group=wheelforge
+EnvironmentFile=/etc/wheelforge/wheelforge.env
+WorkingDirectory=/opt/wheelforge
+ExecStartPre=/usr/bin/test -r /opt/wheelforge/wheelforge-api.jar
+ExecStartPre=/usr/bin/test -d /var/lib/wheelforge/data
+ExecStart=/usr/bin/java -XX:MaxRAMPercentage=70 -jar /opt/wheelforge/wheelforge-api.jar
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+UMask=0077
+StateDirectory=wheelforge
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/wheelforge/data
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+TasksMax=256
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
