@@ -54,6 +54,8 @@ EXPECTED_WHEELS = {
     "missing-demo": {
         "missing_demo-1.2.3-cp311-cp311-manylinux2014_x86_64.whl"
     },
+    "partial-demo": {"partial_demo-1.0.0-py3-none-any.whl"},
+    "slow-demo": {"slow_demo-1.0.0-py3-none-any.whl"},
     "unchanged-demo": {
         "unchanged_demo-1.2.3-cp311-cp311-manylinux2014_aarch64.whl"
     },
@@ -567,11 +569,14 @@ def test_checked_in_index_matches_a_fresh_offline_build(generated_index: Path) -
 def test_requirement_projects_cover_all_fixture_outcomes() -> None:
     project_files = {path.name for path in PROJECT_ROOT.glob("*.txt")}
     assert project_files == {
+        "changes.txt",
         "compatibility.txt",
         "conflict.txt",
         "downgrade.txt",
         "malicious.txt",
         "missing.txt",
+        "partial.txt",
+        "slow.txt",
         "success.txt",
         "unchanged.txt",
         "upgrade.txt",

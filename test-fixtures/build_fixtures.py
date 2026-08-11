@@ -52,6 +52,8 @@ SPECS = (
     WheelSpec("downgrade-demo", "1.2.2", "cp311-cp311-manylinux2014_aarch64"),
     WheelSpec("downgrade-demo", "1.2.3", "cp311-cp311-manylinux2014_x86_64"),
     WheelSpec("missing-demo", "1.2.3", "cp311-cp311-manylinux2014_x86_64"),
+    WheelSpec("partial-demo", "1.0.0", "py3-none-any"),
+    WheelSpec("slow-demo", "1.0.0", "py3-none-any"),
     WheelSpec("unchanged-demo", "1.2.3", "cp311-cp311-manylinux2014_aarch64"),
     WheelSpec("upgrade-demo", "1.2.3", "cp311-cp311-manylinux2014_x86_64"),
     WheelSpec("upgrade-demo", "1.2.4", "cp311-cp311-manylinux2014_aarch64"),

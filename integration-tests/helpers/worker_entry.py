@@ -9,27 +9,38 @@ import wheelforge_worker.resolver.pip_report as pip_report_module
 from wheelforge_worker.sources import PackageSource
 
 
-def _fixture_url() -> str:
-    value = os.environ.pop("WF_TEST_FIXTURE_INDEX_URL", "")
+_SLUGS = {
+    PackageSource.TSINGHUA: "tsinghua",
+    PackageSource.ALIYUN: "aliyun",
+    PackageSource.PYPI: "pypi",
+}
+
+
+def _fixture_base_url() -> str:
+    value = os.environ.pop("WF_TEST_FIXTURE_BASE_URL", "")
     parsed = urlsplit(value)
     if (
         parsed.scheme != "http"
         or parsed.hostname not in {"127.0.0.1", "::1", "localhost"}
         or parsed.query
         or parsed.fragment
-        or not parsed.path.rstrip("/").endswith("/simple")
+        or parsed.path.rstrip("/")
     ):
-        raise ValueError("WF_TEST_FIXTURE_INDEX_URL must be a local /simple HTTP URL")
+        raise ValueError("WF_TEST_FIXTURE_BASE_URL must be a local root HTTP URL")
     return value.rstrip("/")
 
 
 def main() -> int:
-    fixture = _fixture_url()
-    pip_report_module.resolver_source_url = lambda _source: fixture
-    wheels_module.source_url = lambda _source: fixture
-    metadata_root = fixture.removesuffix("/simple") + "/pypi"
+    fixture = _fixture_base_url()
+
+    def simple_url(source: str | PackageSource) -> str:
+        identity = PackageSource(source)
+        return f"{fixture}/{_SLUGS[identity]}/simple"
+
+    pip_report_module.resolver_source_url = simple_url
+    wheels_module.source_url = simple_url
     pipeline_module._INDEX_JSON_BASES = {
-        source: metadata_root for source in PackageSource
+        source: f"{fixture}/{_SLUGS[source]}/pypi" for source in PackageSource
     }
 
     from wheelforge_worker.__main__ import main as worker_main

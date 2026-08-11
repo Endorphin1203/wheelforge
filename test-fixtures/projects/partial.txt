@@ -1,0 +1,2 @@
+demo-direct==1.0.0
+partial-demo==1.0.0

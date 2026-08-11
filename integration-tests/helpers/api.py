@@ -122,10 +122,23 @@ class ApiClient:
     def build_task(self, task_id: str) -> JsonObject:
         return self._json("GET", f"/api/build-tasks/{task_id}")
 
+    def cancel_build(self, task_id: str) -> JsonObject:
+        return self._json("POST", f"/api/build-tasks/{task_id}/cancel")
+
+    def retry_build(self, task_id: str) -> JsonObject:
+        return self._json("POST", f"/api/build-tasks/{task_id}/retry")
+
     def wait_for_terminal(self, task_id: str) -> JsonObject:
         return self._wait(
             lambda: self.build_task(task_id),
             lambda result: result.get("status") in _TERMINAL,
+            lambda result: str(result.get("status")),
+        )
+
+    def wait_for_stage(self, task_id: str, stage: str) -> JsonObject:
+        return self._wait(
+            lambda: self.build_task(task_id),
+            lambda result: result.get("status") == stage,
             lambda result: str(result.get("status")),
         )
 

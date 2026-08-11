@@ -94,7 +94,7 @@ def artifact_reader() -> type[ArtifactReader]:
     return ArtifactReader
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture()
 def native_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[NativeStack]:
     if not sys.platform.startswith("linux"):
         pytest.skip("native Worker integration requires Linux /proc/self/fd support")
@@ -124,19 +124,18 @@ def native_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[NativeSta
             "fixture-index",
             [
                 str(WORKER_PYTHON),
-                "-m",
-                "http.server",
-                str(fixture_port),
-                "--bind",
-                "127.0.0.1",
-                "--directory",
+                str(Path(__file__).parent / "helpers" / "fixture_server.py"),
                 str(ROOT / "test-fixtures" / "index"),
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(fixture_port),
             ],
             isolated_environment(os.environ, {"PYTHONUNBUFFERED": "1"}),
             (),
         )
         processes.append(fixture)
-        _wait_http(f"{fixture_url}/simple/", fixture)
+        _wait_http(f"{fixture_url}/tsinghua/simple/", fixture)
 
         api_port = _free_port()
         username = "wheelforge-integration"
@@ -172,7 +171,7 @@ def native_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[NativeSta
         processes.append(api_process)
         base_url = f"http://127.0.0.1:{api_port}"
         _wait_http(f"{base_url}/actuator/health/readiness", api_process, timeout=90)
-        _seed_target_and_sources(database, f"{fixture_url}/simple")
+        _seed_target_and_sources(database, fixture_url)
 
         api = ApiClient(base_url, timeout=90, poll_interval=0.1)
         api.login(username, password)
@@ -188,7 +187,7 @@ def native_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[NativeSta
                 "WF_QUEUE_POLL_SECONDS": "1",
                 "WF_JOB_LEASE_SECONDS": "60",
                 "WF_MAINTENANCE_AGE_SECONDS": "3600",
-                "WF_TEST_FIXTURE_INDEX_URL": f"{fixture_url}/simple",
+                "WF_TEST_FIXTURE_BASE_URL": fixture_url,
             },
         )
         worker_process = _start(
@@ -323,7 +322,7 @@ def _clean_database(settings: DatabaseSettings) -> None:
         connection.commit()
 
 
-def _seed_target_and_sources(settings: DatabaseSettings, index_url: str) -> None:
+def _seed_target_and_sources(settings: DatabaseSettings, fixture_url: str) -> None:
     with _connect(settings) as connection:
         with connection.cursor() as cursor:
             cursor.execute(
@@ -355,7 +354,7 @@ def _seed_target_and_sources(settings: DatabaseSettings, index_url: str) -> None
                         f"10000000-0000-4000-8000-{priority:012d}",
                         code,
                         f"Fixture {code}",
-                        index_url,
+                        f"{fixture_url}/{code.lower()}/simple",
                         priority,
                     ),
                 )

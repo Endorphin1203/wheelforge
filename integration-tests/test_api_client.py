@@ -94,3 +94,23 @@ def test_wait_for_parse_times_out_with_last_status() -> None:
         api = ApiClient(url, token="token", poll_interval=0.01, timeout=0.03)
         with pytest.raises(TimeoutError, match="PENDING"):
             api.wait_for_parse("file", "PARSED")
+
+
+def test_cancel_and_retry_use_public_task_commands() -> None:
+    cancelled = {"id": "task", "status": "CANCELLED"}
+    retried = {"id": "retry-task", "sourceTaskId": "task", "status": "QUEUED"}
+    downloading = {"id": "retry-task", "status": "DOWNLOADING"}
+    with _server((200, cancelled), (201, retried), (200, downloading)) as (
+        url,
+        handler,
+    ):
+        api = ApiClient(url, token="token")
+        assert api.cancel_build("task") == cancelled
+        assert api.retry_build("task") == retried
+        assert api.wait_for_stage("retry-task", "DOWNLOADING") == downloading
+
+    assert [(method, path) for method, path, _body in handler.requests] == [
+        ("POST", "/api/build-tasks/task/cancel"),
+        ("POST", "/api/build-tasks/task/retry"),
+        ("GET", "/api/build-tasks/retry-task"),
+    ]
