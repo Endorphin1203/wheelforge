@@ -63,7 +63,7 @@ class TaskFiveMigrationUpgradeTest {
         assertThat(builtIns.next()).isFalse();
       }
     }
-    assertThat(latest.info().current().getVersion().getVersion()).isEqualTo("3");
+    assertThat(latest.info().current().getVersion().getVersion()).isEqualTo("4");
   }
 
   @Test
@@ -126,7 +126,7 @@ class TaskFiveMigrationUpgradeTest {
         assertThat(config.getLong("version_no")).isEqualTo(7);
       }
     }
-    assertThat(latest.info().current().getVersion().getVersion()).isEqualTo("3");
+    assertThat(latest.info().current().getVersion().getVersion()).isEqualTo("4");
   }
 
   private org.flywaydb.core.api.configuration.FluentConfiguration configure() {

@@ -25,6 +25,7 @@ from wheelforge_worker.jobs.repository import (
     build_logs,
     build_tasks,
     claim_candidate_statement,
+    expired_claim_candidate_statement,
     metadata,
     requirement_files,
     resolved_packages,
@@ -389,15 +390,28 @@ def test_retry_clears_ownership_and_exhaustion_is_terminal() -> None:
 
 
 def test_mysql_claim_query_uses_row_lock_skip_locked() -> None:
-    sql = str(
+    ready_sql = str(
         claim_candidate_statement(NOW).compile(
             dialect=mysql.dialect(), compile_kwargs={"literal_binds": True}
         )
     ).upper()
+    expired_sql = str(
+        expired_claim_candidate_statement(NOW).compile(
+            dialect=mysql.dialect(), compile_kwargs={"literal_binds": True}
+        )
+    ).upper()
 
-    assert "FOR UPDATE SKIP LOCKED" in sql
-    assert "AVAILABLE_AT <=" in sql
-    assert "LEASE_EXPIRES_AT <=" in sql
+    assert "FOR UPDATE SKIP LOCKED" in ready_sql
+    assert "AVAILABLE_AT <=" in ready_sql
+    assert "LEASE_EXPIRES_AT <=" not in ready_sql
+    assert "FROM BUILD_JOBS FORCE INDEX (IX_JOB_READY)" in ready_sql
+    assert (
+        "ORDER BY BUILD_JOBS.PRIORITY_NO, BUILD_JOBS.CREATED_AT, BUILD_JOBS.ID"
+        in ready_sql
+    )
+    assert "FOR UPDATE SKIP LOCKED" in expired_sql
+    assert "LEASE_EXPIRES_AT <=" in expired_sql
+    assert "AVAILABLE_AT <=" not in expired_sql
 
 
 def test_owned_subject_operations_lock_the_exact_unexpired_job_row() -> None:

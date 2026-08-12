@@ -71,7 +71,7 @@ class BaselineMigrationTest {
       }
     }
 
-    assertThat(flyway.info().current().getVersion().getVersion()).isEqualTo("3");
+    assertThat(flyway.info().current().getVersion().getVersion()).isEqualTo("4");
   }
 
   private boolean tableExists(Connection connection, String tableName) throws SQLException {

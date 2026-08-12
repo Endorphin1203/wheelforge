@@ -4,7 +4,7 @@ import json
 import hashlib
 import os
 import re
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Barrier, Event
@@ -52,9 +52,13 @@ pytestmark = pytest.mark.skipif(
 )
 NOW = datetime(2026, 8, 1, 8, 0, 0)
 MYSQL_REQUIREMENTS = b"demo==1.0\n"
-MIGRATION = (
-    Path(__file__).parents[3]
-    / "backend/src/main/resources/db/migration/V1__baseline.sql"
+MIGRATIONS = tuple(
+    sorted(
+        (
+            Path(__file__).parents[3]
+            / "backend/src/main/resources/db/migration"
+        ).glob("V*.sql")
+    )
 )
 TABLES = (
     "system_config",
@@ -115,9 +119,10 @@ def mysql_engine() -> Iterator[Engine]:
     engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=5)
     _drop_known_tables(engine)
     with engine.begin() as connection:
-        for statement in MIGRATION.read_text().split(";"):
-            if statement.strip():
-                connection.execute(text(statement))
+        for migration in MIGRATIONS:
+            for statement in migration.read_text().split(";"):
+                if statement.strip():
+                    connection.execute(text(statement))
     try:
         yield engine
     finally:
@@ -304,12 +309,10 @@ def test_mysql_expired_job_cannot_be_reclaimed_during_audit_transaction(
             )
             assert insert_started.wait(5)
             clock[0] = NOW + timedelta(seconds=61)
-            takeover = executor.submit(repository.claim_next, "worker-b")
-            with pytest.raises(FutureTimeoutError):
-                takeover.result(timeout=0.2)
+            assert repository.claim_next("worker-b") is None
             release_insert.set()
             persistence.result(timeout=5)
-            successor = takeover.result(timeout=5)
+            successor = repository.claim_next("worker-b")
     finally:
         release_insert.set()
         event.remove(mysql_engine, "before_cursor_execute", pause_audit_insert)
@@ -377,7 +380,10 @@ def test_mysql_transient_artifact_failure_compensates_then_retry_publishes_once(
     mysql_engine: Engine, tmp_path: Path
 ) -> None:
     _job_id, task_id = _seed_build(mysql_engine, ordinal=8)
-    repository = JobRepository(mysql_engine, lease_seconds=60, clock=lambda: NOW)
+    clock = [NOW]
+    repository = JobRepository(
+        mysql_engine, lease_seconds=60, clock=lambda: clock[0]
+    )
     first = repository.claim_next("worker-a")
     assert first is not None
     root = tmp_path / "data"
@@ -427,6 +433,8 @@ def test_mysql_transient_artifact_failure_compensates_then_retry_publishes_once(
             assert connection.scalar(select(build_jobs.c.status)) == "READY"
             assert connection.scalar(select(build_tasks.c.status)) == "QUEUED"
 
+        assert repository.claim_next("worker-b") is None
+        clock[0] += timedelta(seconds=5)
         second = repository.claim_next("worker-b")
         assert second is not None
         second_result = JobPipeline(
@@ -562,7 +570,7 @@ def _resolved(name: str, version: str) -> ResolvedPackage:
 def _drop_known_tables(engine: Engine) -> None:
     with engine.begin() as connection:
         connection.execute(text("set foreign_key_checks=0"))
-        for table in TABLES:
+        for table in (*TABLES, "flyway_schema_history"):
             connection.execute(text(f"drop table if exists `{table}`"))
         connection.execute(text("set foreign_key_checks=1"))
 

@@ -19,12 +19,9 @@ from sqlalchemy import (
     MetaData,
     String,
     Table,
-    and_,
-    case,
     delete,
     func,
     insert,
-    or_,
     select,
     update,
 )
@@ -271,22 +268,35 @@ class LostLeaseError(RuntimeError):
 
 
 def claim_candidate_statement(now: datetime) -> Select[tuple[Any, ...]]:
-    due = or_(
-        and_(build_jobs.c.status == "READY", build_jobs.c.available_at <= now),
-        and_(
-            build_jobs.c.status == "RUNNING",
-            build_jobs.c.lease_expires_at <= now,
-        ),
-    )
     return (
         select(build_jobs)
-        .where(due)
+        .with_hint(
+            build_jobs,
+            "FORCE INDEX (ix_job_ready)",
+            dialect_name="mysql",
+        )
+        .where(
+            build_jobs.c.status == "READY",
+            build_jobs.c.available_at <= now,
+        )
         .order_by(
-            case((build_jobs.c.status == "READY", 0), else_=1),
             build_jobs.c.priority_no,
             build_jobs.c.created_at,
             build_jobs.c.id,
         )
+        .limit(1)
+        .with_for_update(skip_locked=True)
+    )
+
+
+def expired_claim_candidate_statement(now: datetime) -> Select[tuple[Any, ...]]:
+    return (
+        select(build_jobs)
+        .where(
+            build_jobs.c.status == "RUNNING",
+            build_jobs.c.lease_expires_at <= now,
+        )
+        .order_by(build_jobs.c.lease_expires_at, build_jobs.c.id)
         .limit(1)
         .with_for_update(skip_locked=True)
     )
@@ -343,6 +353,12 @@ class JobRepository:
                     .mappings()
                     .first()
                 )
+                if row is None:
+                    row = (
+                        connection.execute(expired_claim_candidate_statement(now))
+                        .mappings()
+                        .first()
+                    )
                 if row is None:
                     return None
                 if row["attempts"] >= row["max_attempts"]:
